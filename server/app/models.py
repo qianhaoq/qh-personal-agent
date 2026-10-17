@@ -59,10 +59,28 @@ class Device(Base):
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
     name: Mapped[str] = mapped_column(String(128), default="")
     platform: Mapped[str] = mapped_column(String(32), default="android")
-    refresh_token_hash: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
-    # 上一枚 refresh 的哈希：仅用于检测轮换后的复用（复用即吊销设备）
-    prev_refresh_token_hash: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class RefreshToken(Base):
+    """设备的 refresh 凭据，一行一枚（threads5 P1-2，INV-8）。
+
+    devices 行不再存 refresh 哈希：同设备同账号并发登录各自追加一行、
+    互不覆盖——每个成功响应返回的 token 在过期/被显式作废（轮换、设备
+    吊销、登出）或被每设备 5 枚上限挤出（见 app/api/auth.py 的修剪）
+    之前都有效。轮换只作废被轮换的那一行；被轮换的行保留（revoked_at
+    非空）供复用检测（重放即吊销整台设备）。
+    """
+
+    __tablename__ = "refresh_tokens"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    device_id: Mapped[str] = mapped_column(ForeignKey("devices.id"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    token_hash: Mapped[str] = mapped_column(String(128), unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 

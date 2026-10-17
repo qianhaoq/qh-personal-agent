@@ -237,7 +237,7 @@ mem0 版本钉死：`server/requirements-mem0.txt` 写 `mem0ai==2.2.1`（4c1c9be
 - **登录只追加**：每次成功登录 INSERT 一行新 token（不覆盖任何既有行），同一事务内修剪：每设备至多保留 **5 枚**未过期未作废的 token，修剪条件**排除本行**（按 `created_at DESC, id DESC` 保留最新的 4 枚其他行）——本次返回的 token 一定幸存；同设备并发登录在 device 行 upsert 的行锁上串行化（锁序 device → refresh_tokens，见 INV-1）。
 - **refresh 轮换只作废被轮换的那一枚**：条件 `UPDATE refresh_tokens SET revoked_at=now WHERE id=:row AND revoked_at IS NULL AND expires_at>now`，**rowcount==1 才**发新 token（追加一行新 TTL）并修剪；rowcount==0（并发请求已先轮换）→ 按复用处理（吊销设备，与既有语义一致）。
 - **重放已作废（被轮换/吊销）的 token** → 401 `refresh_reused` + 吊销**整台设备**（`devices.revoked_at` + 作废其全部 token；既有语义保留）。被 5 枚上限挤出（行已删除）的 token 重放只能得到普通 401（无法关联设备）——上限本身是显式作废策略的一种，写入已知取舍。
-- **logout** → 作废该设备全部 token（不吊销设备行，access 到期自然失效，既有语义）。
+- **logout** → 清除（DELETE）该设备全部 token 行（不吊销设备行，access 到期自然失效；登出后的重放按既有语义得普通 401，不触发复用吊销）。
 - 过期 token（`expires_at<=now`，未作废）→ 401 unauthorized（TTL 首次真正强制）。
 
 **陈述 3（device 原子 upsert，修 C1，保留）**：登录对 device 的写入仍是**单条** `INSERT … ON CONFLICT (id) DO UPDATE … WHERE devices.user_id = EXCLUDED.user_id`（原子完成「存在性检查 + 归属检查 + 复活/刷新」，不再写任何 hash 列）：
