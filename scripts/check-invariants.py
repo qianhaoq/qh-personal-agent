@@ -12,10 +12,10 @@ Source of truth: docs/server-invariants.md (lands with PR #2; its rules win).
 Rationale and examples: docs/agent-pitfalls.md.
 
 Rules (checker id -> docs/server-invariants.md id):
-  INV-SEQ-LAST     [INV-1 锁顺序] ERROR only for allocate_seq evaluated inside
-                   update(...).values() that also writes business columns.
-                   WARNING (never fails CI; source-order heuristic, no control-flow
-                   analysis): in the transaction that calls allocate_seq(sess), no DB write
+  INV-SEQ-LAST     [INV-1 锁顺序] WARNING only (never fails CI; name resolution and
+                   ordering are heuristics): allocate_seq evaluated inside
+                   update(...).values() that also writes business columns; and (source
+                   order, no control-flow analysis) in the transaction that calls allocate_seq(sess), no DB write
                    on that same session after it: sess.add/add_all/merge/delete/
                    execute(...) (except an UPDATE that only sets change_seq/
                    updated_at), or enqueue(sess, ...). Scope ends at sess.commit()/
@@ -217,7 +217,7 @@ def check_seq_last(tree, path, parents) -> list[Finding]:
                     extra = sorted({k.arg for k in p.keywords if k.arg} - SEQ_COLUMNS)
                     if extra:
                         out.append(Finding(path, seq.lineno, "INV-SEQ-LAST",
-                            f"{SEQ_FUNC}() inside an UPDATE that also writes {extra}: sequence lock taken before the row lock"))
+                            f"{SEQ_FUNC}() inside an UPDATE that also writes {extra}: sequence lock taken before the row lock", warning=True))
                     break
             txn = next((p for p in _ancestors(seq, parents)
                         if isinstance(p, (ast.With, ast.AsyncWith)) and "begin" in " ".join(ast.unparse(i) for i in p.items)), None)

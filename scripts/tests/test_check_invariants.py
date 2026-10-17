@@ -69,6 +69,10 @@ class SeqLast(unittest.TestCase):
         async def patch(session):
             await session.execute(update(Note).values(text=t, change_seq=await allocate_seq(session)))
         """), [("INV-SEQ-LAST", 3)])
+        self.assertEqual(errors("""
+        async def patch(session):
+            await session.execute(update(Note).values(text=t, change_seq=await allocate_seq(session)))
+        """), [])  # warning only: name resolution is heuristic
 
     def test_correct_order_ok(self):
         self.assertEqual(rules("""
