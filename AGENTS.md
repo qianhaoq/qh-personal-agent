@@ -15,13 +15,7 @@
 - 代码改动默认交给本地 **`coding glm`**，模型用用户指定的 **GLM 5.3**。
 - 前端 / UI（Android 界面、交互、样式）交给 **`coding kimi`**。
 - 每个改动一个分支、一个 PR；不直接推 `main`（受保护）。
-- 先读后写的状态变更（乐观锁、token 轮换、计数、状态机）必须锁行（SELECT … FOR UPDATE）或用条件更新（UPDATE … WHERE 旧值），并配并发测试。
-- 数据库写事务的加锁顺序全局固定：**先锁业务行**（条件 UPDATE / FOR UPDATE，业务行之间按 note → reminders → device … 的顺序），全部写完后再调用 `allocate_seq`（server/app/common.py，须紧贴提交），change_seq 用其后的第二条 UPDATE 写入；绝不允许先 `allocate_seq` 再去锁业务行——PG 上会与其他路径构成 AB-BA 死锁（PATCH 与 organize 写回曾因此死锁）。不得依赖 ORM autoflush 隐式落序：业务行写完显式 flush 后才分配 seq。
 - 改服务端前先读 [docs/server-invariants.md](docs/server-invariants.md)，改动不得违反其中不变量；新增状态变更需同步更新该文档与对应测试。
-- 事务边界里不得有 LLM / mem0 / 网络调用；鉴权等只读依赖用**独立短会话**完成即还连接（server/app/deps.py），不得把请求级会话/事务带进秒级外部调用。
-- 字符串入参一律拒绝 NUL（\x00）：schemas 层统一用 `NoNulStr`/`reject_nul`（server/app/schemas.py）校验成 422，而不是等 PG 编码错误变 500。
-- 异步 job 的收尾必须带租约条件（`WHERE status='running' AND locked_by=:me AND locked_at=:claimed`，见 server/app/jobs/queue.py 的 `finalize_claim`）：任务被回收换主后旧 worker 的收尾一律放弃。
-- 生产（postgresql）默认值要安全：LLM/记忆后端配错启动即拒（不静默回落假实现）、`ENABLE_DOCS=false`、CORS 默认不启用、容器非 root、运行时镜像不装测试依赖（见 server/Dockerfile、requirements-app.txt）。
 
 ## 评审与修复
 
@@ -37,6 +31,34 @@
 - 由 **个人助理开发** 合并；需要人工把关的 PR 打 `no-auto-merge`。
 - 不得绕过分支保护（不用管理员合并、不关保护再开）。
 - 详见 [docs/MERGE_GATES.md](docs/MERGE_GATES.md)。
+
+## 改 server 前必读 / 自检清单
+
+改 `server/` 之前（含修 review 意见），先读完以下两份：
+- [docs/server-invariants.md](docs/server-invariants.md)：服务端不变量 INV-1..INV-10，事实来源（随 PR #2 落地）；冲突时以它为准。
+- [docs/agent-pitfalls.md](docs/agent-pitfalls.md)：反复踩的坑和正反例。
+
+提交前逐条自检：
+
+- [ ] 并发敏感的改动（锁、条件更新、job、sync）配了能在 **PostgreSQL** 上跑的并发测试（`PG Tests` job），缺失按 P1。
+- [ ] **按类修，不按行修**：一个 review 发现修好后，用 `rg` 把同一类模式在整个 `server/` 里排查一遍，并在线程回复里写清排查了哪些地方。
+- [ ] **同一类 P1 第二次出现时**，先更新 docs/server-invariants.md，再改代码。
+- [ ] 本地跑 `python3 scripts/check-invariants.py`。豁免只有一种写法：`# invariant-ok: <RULE-ID> <理由>`。
+- [ ] 单个 PR 的代码改动超过 **约 800 行**（不计 docs、tests、生成文件）时先拆分。
+
+## Review guidelines
+
+Codex / 评审 bot 评审本仓 PR 时：
+
+- 以 docs/server-invariants.md（INV-1..INV-10，随 #2 落地）为准检查 server 改动。发现违反时注明 INV 编号，并检查同一类模式在 diff 之外是否还有。
+- 重点看 docs/agent-pitfalls.md 的高发类别。
+- 分级口径与 .github/copilot-instructions.md 一致：
+  - CI 红灯为 P1（造成生产事故时才算 P0）；
+  - 并发敏感的改动缺 PG 并发测试为 P1。
+- `scripts/check-invariants.py` 是 **best-effort 启发式，精确优先于召回**。
+  - 漏检（控制流、别名、依赖注入参数等）不算 P0/P1，按 `P2: defer — heuristic checker; PG concurrency tests + human/Codex review are the backstop` Resolve。
+  - 只有误报或检查器崩溃，才算针对检查器的 P1。
+  - 不要为补全覆盖面继续扩 AST 规则。
 
 ## 交接
 
