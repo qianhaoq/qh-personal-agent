@@ -13,6 +13,8 @@
 
 ## 非必需
 
+- `PG Tests (PostgreSQL 16, non-required)` — `ci.yml` 里单独的 `pg-tests` job：起 `postgres:16` 服务容器（带 `pg_isready` 健康检查），导出 `TEST_DATABASE_URL=postgresql+asyncpg://…`，让 `server/tests` 在真实 PG 上再跑一遍（`test_concurrency.py` 的行锁/条件更新只有 PG 才有意义）。`server/` 没有测试时由前置的 `pg-detect` job 判定并跳过整个 job（不拉起 PG）。devflow-gates 的 reusable CI 不支持 `services`，所以放在调用方；稳定后再决定是否设为必需检查。
+
 - `acceptance / Acceptance Gate` — M1 仅观察：在 PR 置顶评论里报告测试/覆盖率、改源码须改测试（`no-test-needed` + 理由豁免）、PR 规模、依赖、验收小节、Codex 结论，不阻断。配置 `.github/acceptance.yml`。
 
 ## 自动合入
