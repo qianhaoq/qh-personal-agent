@@ -71,6 +71,9 @@ class Settings(BaseSettings):
 
     # 记忆层：只接受这两个值，未知值启动即报错（而不是静默退化丢记忆）
     memory_backend: Literal["inmemory", "mem0"] = "inmemory"
+    # 仅测试用：生产（postgresql）+ inmemory 默认拒绝启动，跑 PG 测试套件
+    # 的 CI/本地环境显式置 true 放行（生产环境不要设置）
+    allow_inmemory_in_prod: bool = False
     # mem0 的 embedding 单独配置（可以和 LLM 不同源）
     mem0_embedding_base_url: str = ""
     mem0_embedding_model: str = ""
@@ -120,6 +123,26 @@ class Settings(BaseSettings):
                 + "；".join(problems)
                 + "。请用随机值生成，如 `python -c \"import secrets;"
                   "print(secrets.token_urlsafe(48))\"` 或 `openssl rand -hex 32`"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _reject_inmemory_memory_backend_in_production(self) -> "Settings":
+        """P1：生产（postgresql）下 MEMORY_BACKEND=inmemory 会静默丢记忆
+        ——uvicorn 多 worker 与独立 worker 进程各持一份进程内状态，互相
+        不可见且重启即失忆。启动即拒绝；仅在测试 PG 的 CI/本地环境可用
+        ALLOW_INMEMORY_IN_PROD=true 显式放行。
+        """
+        if (
+            self.database_url.startswith("postgresql")
+            and self.memory_backend == "inmemory"
+            and not self.allow_inmemory_in_prod
+        ):
+            raise ValueError(
+                "生产环境（DATABASE_URL 以 postgresql 开头）不允许 "
+                "MEMORY_BACKEND=inmemory（多进程/重启即丢记忆）：请改为 "
+                "mem0（pgvector 与业务库同一个 PostgreSQL 实例）。"
+                "仅在跑 PG 测试套件的 CI/本地环境可设 ALLOW_INMEMORY_IN_PROD=true 放行"
             )
         return self
 

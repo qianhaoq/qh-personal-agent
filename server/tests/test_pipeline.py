@@ -534,3 +534,148 @@ async def test_failed_finalize_skips_note_patched_after_enqueue(client, user, mo
     assert note.rev == 3  # PATCH +1，新任务整理再 +1
     assert note.text == "用户改过的最新内容"
     assert note.llm_calls == 1  # 只有新任务真正调用了 LLM
+
+
+# ---------------------------------------------------------------------------
+# P1：删除后记忆不复活——_sync_memory 的 add 后复查 + 幂等 cleanup_memory job
+# ---------------------------------------------------------------------------
+
+
+async def test_delete_during_memory_sync_does_not_resurrect(client, user, monkeypatch, run_jobs):
+    """P1：删除落在 _sync_memory 的 delete_by_note 与 add 之间：add 后的
+    复查发现 deleted_at 非空，把刚写入的记忆再删掉，最终 search 搜不到。
+
+    旧实现 add 完就直接置 memory_synced：删除请求的清理先跑、add 后落
+    的话，已删笔记的记忆就“复活”了。两个库都跑：交错用 store 钩子模拟
+    （worker 在 add 内让 DELETE 请求先完成），不依赖真实并发时序。
+    """
+    from sqlalchemy import select
+
+    from app.db import get_sessionmaker
+    from app.jobs.queue import enqueue
+    from app.memory.inmemory import InMemoryStore
+    from app.models import Job, Note
+    from tests.conftest import auth_headers
+
+    # SQLite 测试库文件跨测试复用：先排空残留 job
+    await run_jobs()
+
+    headers = auth_headers(user)
+    note_text = "这条笔记会在记忆写入途中被删除"
+    r = await client.post(
+        "/v1/notes",
+        json={"client_note_id": str(uuid.uuid4()), "text": note_text},
+        headers=headers,
+    )
+    note_id = r.json()["note_id"]
+
+    class DeleteRacingStore(InMemoryStore):
+        """add 真正写入前，先让 DELETE /v1/notes 完成（含它提交后的
+        delete_by_note）：删除恰好落在 _sync_memory 的 delete 与 add 之间。"""
+
+        def __init__(self):
+            super().__init__()
+            self.hooked = False
+
+        async def add(self, user_id, text, note_id=None):
+            if note_id == target_note_id and not self.hooked:
+                self.hooked = True
+                resp = await client.delete(f"/v1/notes/{note_id}", headers=headers)
+                assert resp.status_code == 204, resp.text
+            return await super().add(user_id, text, note_id=note_id)
+
+    store = DeleteRacingStore()
+    target_note_id = note_id
+    monkeypatch.setattr("app.pipeline.organize.get_memory_store", lambda: store)
+    monkeypatch.setattr("app.api.notes.get_memory_store", lambda: store)
+
+    # 只跑一个 job（organize，先入队）：删除发生在它执行中，此刻删除
+    # 入队的 cleanup_memory 还是 pending——先单独验证 add 后复查本身
+    # 把记忆清掉了，不靠 cleanup job 兜底掩盖复查失效
+    from app.pipeline.runner import run_pending_jobs
+
+    processed = await run_pending_jobs(limit=1)
+    assert processed == 1
+
+    async with get_sessionmaker()() as session:
+        note = await session.get(Note, note_id)
+        cleanups = (
+            await session.execute(
+                select(Job).where(
+                    Job.kind == "cleanup_memory", Job.payload_json.contains(note_id)
+                )
+            )
+        ).scalars().all()
+    assert note.deleted_at is not None  # 删除生效
+    assert note.memory_synced is False  # 复查发现已删，不再置位
+    assert len(cleanups) == 1 and cleanups[0].status == "pending"  # 还没轮到兜底
+    # organize 已完成而 cleanup 未跑的中间态：已删笔记的记忆不存在、搜不到
+    assert [m for m in await store.list(user["user_id"]) if m.note_id == note_id] == []
+    assert [m for m in await store.search(user["user_id"], note_text) if m.note_id == note_id] == []
+
+    # 兜底任务随后正常完成
+    await run_jobs()
+    async with get_sessionmaker()() as session:
+        organize = (
+            await session.execute(
+                select(Job).where(Job.kind == "organize_note", Job.payload_json.contains(note_id))
+            )
+        ).scalar_one()
+        cleanups = (
+            await session.execute(
+                select(Job).where(
+                    Job.kind == "cleanup_memory", Job.payload_json.contains(note_id)
+                )
+            )
+        ).scalars().all()
+    assert organize.status == "done"  # 整理任务未被删除交错打断
+    assert {j.status for j in cleanups} == {"done"}
+
+    # cleanup_memory 幂等：再手动入队一次并执行，仍正常完成、无副作用
+    async with get_sessionmaker()() as session:
+        await enqueue(session, "cleanup_memory", {"note_id": note_id, "user_id": user["user_id"]})
+        await session.commit()
+    await run_jobs()
+    async with get_sessionmaker()() as session:
+        again = (
+            await session.execute(
+                select(Job).where(Job.kind == "cleanup_memory", Job.payload_json.contains(note_id))
+            )
+        ).scalars().all()
+    assert {j.status for j in again} == {"done"}
+    assert [m for m in await store.list(user["user_id"]) if m.note_id == note_id] == []
+
+
+async def test_cleanup_memory_job_skips_live_note(client, user, run_jobs):
+    """cleanup_memory 只清已删笔记：笔记未删除时跳过，不误删在用记忆。"""
+    from sqlalchemy import select
+
+    from app.db import get_sessionmaker
+    from app.jobs.queue import enqueue
+    from app.memory.base import get_memory_store
+    from app.models import Job
+
+    r = await client.post(
+        "/v1/notes",
+        json={"client_note_id": str(uuid.uuid4()), "text": "还活着的笔记不该被清记忆"},
+        headers=auth_headers(user),
+    )
+    note_id = r.json()["note_id"]
+    await run_jobs()  # 正常整理：记忆已写入
+    store = get_memory_store()
+    assert [m for m in await store.list(user["user_id"]) if m.note_id == note_id]
+
+    async with get_sessionmaker()() as session:
+        await enqueue(session, "cleanup_memory", {"note_id": note_id, "user_id": user["user_id"]})
+        await session.commit()
+    await run_jobs()
+
+    # 笔记未删除：job 完成但记忆原样保留
+    assert [m for m in await store.list(user["user_id"]) if m.note_id == note_id]
+    async with get_sessionmaker()() as session:
+        job = (
+            await session.execute(
+                select(Job).where(Job.kind == "cleanup_memory", Job.payload_json.contains(note_id))
+            )
+        ).scalar_one()
+    assert job.status == "done"

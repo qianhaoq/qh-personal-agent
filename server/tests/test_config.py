@@ -1,5 +1,5 @@
-"""jwt_secret 生产校验：postgresql 下必须是 >=32 字节随机值的编码，
-占位值/人类可读口令/低熵值即拒绝，SQLite 不受影响。"""
+"""jwt_secret 与记忆后端的生产校验：postgresql 下 secret 必须是 >=32
+字节随机值的编码、MEMORY_BACKEND 不能是 inmemory，SQLite 不受影响。"""
 import base64
 import pathlib
 import secrets
@@ -14,14 +14,26 @@ PG_URL = "postgresql+asyncpg://u:p@localhost/db"
 GOOD_HEX = bytes(range(32)).hex()
 
 
+def _pg_settings(**kwargs) -> Settings:
+    """生产形态（postgresql）的合法基线：强 secret + mem0 记忆后端。
+
+    不带 memory_backend 的话会先撞上“生产拒绝 inmemory”的校验（PG 跑
+    测试时 conftest 还设置了 ALLOW_INMEMORY_IN_PROD，行为随运行方式
+    漂移），显式固定住。
+    """
+    kwargs.setdefault("jwt_secret", GOOD_HEX)
+    kwargs.setdefault("memory_backend", "mem0")
+    return Settings(database_url=PG_URL, **kwargs)
+
+
 def test_production_default_secret_rejected():
     with pytest.raises(ValidationError, match="JWT_SECRET"):
-        Settings(database_url=PG_URL, jwt_secret=DEFAULT_JWT_SECRET)
+        _pg_settings(jwt_secret=DEFAULT_JWT_SECRET)
 
 
 def test_production_env_example_placeholder_rejected():
     with pytest.raises(ValidationError, match="JWT_SECRET"):
-        Settings(database_url=PG_URL, jwt_secret=ENV_EXAMPLE_JWT_PLACEHOLDER)
+        _pg_settings(jwt_secret=ENV_EXAMPLE_JWT_PLACEHOLDER)
 
 
 def test_env_example_placeholder_matches_template():
@@ -38,7 +50,7 @@ def test_env_example_placeholder_matches_template():
 def test_production_insecure_substring_rejected():
     for bad in ("a" * 40 + "-change-me", "Example" + "x" * 40, "PLACEHOLDER" + "y" * 40):
         with pytest.raises(ValidationError, match="JWT_SECRET"):
-            Settings(database_url=PG_URL, jwt_secret=bad)
+            _pg_settings(jwt_secret=bad)
 
 
 def test_production_human_readable_passwords_rejected():
@@ -52,57 +64,57 @@ def test_production_human_readable_passwords_rejected():
         "Change_Me_To_A_Long_Random_Secret_123!",
     ):
         with pytest.raises(ValidationError, match="JWT_SECRET"):
-            Settings(database_url=PG_URL, jwt_secret=bad)
+            _pg_settings(jwt_secret=bad)
 
 
 def test_production_short_secret_rejected():
     with pytest.raises(ValidationError, match="JWT_SECRET"):
-        Settings(database_url=PG_URL, jwt_secret="short")
+        _pg_settings(jwt_secret="short")
 
 
 def test_production_single_char_secret_rejected():
     # 长度够但字符多样性不足：暴力枚举空间太小
     with pytest.raises(ValidationError, match="JWT_SECRET"):
-        Settings(database_url=PG_URL, jwt_secret="a" * 40)
+        _pg_settings(jwt_secret="a" * 40)
 
 
 def test_production_token_urlsafe_secret_ok():
     secret = secrets.token_urlsafe(48)
-    assert Settings(database_url=PG_URL, jwt_secret=secret).jwt_secret == secret
+    assert _pg_settings(jwt_secret=secret).jwt_secret == secret
 
 
 def test_production_token_hex_secret_ok():
     # openssl rand -hex 32 / secrets.token_hex(32) 的形态
     secret = secrets.token_hex(32)
-    assert Settings(database_url=PG_URL, jwt_secret=secret).jwt_secret == secret
+    assert _pg_settings(jwt_secret=secret).jwt_secret == secret
 
 
 def test_production_std_base64_secret_ok():
     # openssl rand -base64 32 的形态（带 padding 的标准 base64）
     secret = base64.b64encode(secrets.token_bytes(32)).decode()
-    assert Settings(database_url=PG_URL, jwt_secret=secret).jwt_secret == secret
+    assert _pg_settings(jwt_secret=secret).jwt_secret == secret
 
 
 def test_production_fixed_strong_hex_ok():
-    assert Settings(database_url=PG_URL, jwt_secret=GOOD_HEX).jwt_secret == GOOD_HEX
+    assert _pg_settings(jwt_secret=GOOD_HEX).jwt_secret == GOOD_HEX
 
 
 def test_production_all_zero_hex_secret_rejected():
     # "00"*32 是 64 个 hex 字符（32 字节），但只有 1 种字节取值
     with pytest.raises(ValidationError, match="JWT_SECRET"):
-        Settings(database_url=PG_URL, jwt_secret="00" * 32)
+        _pg_settings(jwt_secret="00" * 32)
 
 
 def test_production_31_byte_hex_secret_rejected():
     # 62 个 hex 字符：既不满 hex 的 64 字符要求，也不允许被当成 base64 放行
     with pytest.raises(ValidationError, match="JWT_SECRET"):
-        Settings(database_url=PG_URL, jwt_secret=secrets.token_hex(31))
+        _pg_settings(jwt_secret=secrets.token_hex(31))
 
 
 def test_production_undecodable_secret_rejected():
     # 不属于 hex / base64 / base64url 任何一种编码
     with pytest.raises(ValidationError, match="JWT_SECRET"):
-        Settings(database_url=PG_URL, jwt_secret="this is not an encoding!?" * 2)
+        _pg_settings(jwt_secret="this is not an encoding!?" * 2)
 
 
 def test_sqlite_default_secret_ok():
@@ -118,6 +130,45 @@ def test_memory_backend_only_accepts_known_values():
     assert Settings(memory_backend="mem0").memory_backend == "mem0"
     with pytest.raises(ValidationError, match="memory_backend"):
         Settings(memory_backend="redis")
+
+
+def test_production_inmemory_memory_backend_rejected():
+    """P1：生产（postgresql）+ inmemory 静默丢记忆，启动即拒绝。
+
+    显式传 allow_inmemory_in_prod=False：PG 跑测试时 conftest 会把该
+    环境变量设为 true，不压住的话这条用例在不同运行方式下行为漂移。
+    """
+    with pytest.raises(ValidationError, match="MEMORY_BACKEND"):
+        _pg_settings(memory_backend="inmemory", allow_inmemory_in_prod=False)
+
+
+def test_production_inmemory_with_explicit_test_flag_allowed():
+    """ALLOW_INMEMORY_IN_PROD=true 只为跑 PG 测试套件放行（生产不要设）。"""
+    settings = _pg_settings(memory_backend="inmemory", allow_inmemory_in_prod=True)
+    assert settings.memory_backend == "inmemory"
+
+
+def test_production_mem0_memory_backend_ok():
+    assert _pg_settings(memory_backend="mem0").memory_backend == "mem0"
+
+
+def test_sqlite_inmemory_memory_backend_ok():
+    # SQLite 开发/测试环境不受生产校验影响
+    settings = Settings(database_url="sqlite+aiosqlite:///./app.sqlite3", memory_backend="inmemory")
+    assert settings.memory_backend == "inmemory"
+
+
+def test_env_example_defaults_to_mem0_backend():
+    """P1：部署模板默认 mem0（pgvector + OpenAI 兼容 embedding/LLM），
+    inmemory 只留给单进程开发/测试。"""
+    env_example = (
+        pathlib.Path(__file__).resolve().parent.parent / ".env.example"
+    ).read_text(encoding="utf-8")
+    lines = [ln.strip() for ln in env_example.splitlines()]
+    assert "MEMORY_BACKEND=mem0" in lines
+    # mem0 的 embedding/LLM OpenAI 兼容配置有占位说明
+    assert any(ln.startswith("# MEM0_EMBEDDING_BASE_URL=") for ln in lines)
+    assert any(ln.startswith("# MEM0_EMBEDDING_MODEL=") for ln in lines)
 
 
 def test_get_memory_store_unknown_backend_raises(monkeypatch):

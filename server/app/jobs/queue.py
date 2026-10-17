@@ -178,21 +178,27 @@ async def mark_note_failed_if_rev(session: AsyncSession, payload: dict) -> bool:
 
     条件更新（P1-C）：rowcount=0 说明用户已 PATCH（rev 变化，重新入队的
     任务会负责）或已删除，此时不动 note，避免过期任务的失败覆盖新版本。
-    先分配 seq 再更新：未命中时多分配的 seq 只留下空洞，不影响 cursor
-    的单调性（seq 只被 > since 比较，从不要求连续）。
+    加锁顺序（全局规则见 app.common.allocate_seq）：先条件更新业务行，
+    命中后才 allocate_seq、用第二条 UPDATE 写 change_seq——未命中时也
+    不会白分配 seq 留空洞。
     """
     note_id = payload.get("note_id")
     enqueued_rev = payload.get("rev")
     if not note_id or enqueued_rev is None:
         return False
-    seq = await allocate_seq(session)
     result = await session.execute(
         update(Note)
         .where(Note.id == note_id, Note.rev == enqueued_rev, Note.deleted_at.is_(None))
-        .values(status="failed", change_seq=seq, updated_at=utcnow())
+        .values(status="failed", updated_at=utcnow())
         .execution_options(synchronize_session=False)
     )
-    return result.rowcount > 0
+    if result.rowcount == 0:
+        return False
+    seq = await allocate_seq(session)
+    await session.execute(
+        update(Note).where(Note.id == note_id).values(change_seq=seq)
+    )
+    return True
 
 
 async def mark_done(session: AsyncSession, job: Job) -> None:

@@ -108,5 +108,10 @@ async def execute_job(kind: str, payload: dict) -> None:
         from app.pipeline.organize import organize_note
 
         await organize_note(payload["note_id"], enqueued_rev=payload.get("rev"))
+    elif kind == "cleanup_memory":
+        # 删除笔记时入队的幂等清理任务：笔记仍处于已删除才清记忆
+        from app.pipeline.organize import cleanup_note_memory
+
+        await cleanup_note_memory(payload["note_id"], payload["user_id"])
     else:
         raise ValueError(f"unknown job kind: {kind}")

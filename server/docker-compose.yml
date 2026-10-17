@@ -21,6 +21,9 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://personal:${POSTGRES_PASSWORD}@postgres:5432/personal_agent
+      # inmemory 仅单进程开发/测试：api 是多 worker、worker 是独立进程，
+      # 各自一份内存会静默丢记忆，生产固定 mem0（config 校验会拒绝 inmemory）
+      MEMORY_BACKEND: mem0
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
@@ -37,6 +40,8 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://personal:${POSTGRES_PASSWORD}@postgres:5432/personal_agent
+      # 同 api：独立进程不能用进程内记忆，生产固定 mem0
+      MEMORY_BACKEND: mem0
     command: python -m app.jobs.worker
     depends_on:
       postgres:

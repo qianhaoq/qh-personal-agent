@@ -1,6 +1,6 @@
 """鉴权接口：邀请码 + 设备注册、refresh 轮换、登出。"""
 from fastapi import APIRouter, Depends
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.tokens import (
@@ -37,16 +37,45 @@ async def login(body: LoginRequest, session: AsyncSession = Depends(get_db_sessi
     if invite is None or (invite.expires_at is not None and as_utc(invite.expires_at) <= now):
         raise ApiError(403, "invalid_invite", "邀请码不存在或已过期")
 
-    # 首次使用：创建账号（used 只计注册次数，之后同码登录复用同一账号）
+    # 首次使用：创建账号（used 只计注册次数，之后同码登录复用同一账号）。
+    # 首用抢占用条件 UPDATE 原子完成（只有把 owner_user_id 从 NULL 置为
+    # 本事务用户 id 的事务才创建账号）：并发首登同一码时，其余事务
+    # rowcount=0 后复查，按“同码后续登录复用同一账号”的既有语义登录
+    # 先占到的人——同一邀请码不会创建出多个用户。加锁顺序上这是唯一
+    # 要锁的业务行之一（invite → user/device，本接口不碰 sequences）
     user_id = invite.owner_user_id
     if user_id is None:
         if invite.used >= invite.max_uses:
             raise ApiError(403, "invalid_invite", "邀请码已用完")
         user_id = new_id("usr")
-        session.add(User(id=user_id))
-        invite.owner_user_id = user_id
-        invite.used += 1
-        await session.flush()
+        claimed = await session.execute(
+            update(InviteCode)
+            .where(
+                InviteCode.code == body.invite_code,
+                InviteCode.owner_user_id.is_(None),
+                InviteCode.used < InviteCode.max_uses,
+                or_(InviteCode.expires_at.is_(None), InviteCode.expires_at > now),
+            )
+            .values(owner_user_id=user_id, used=InviteCode.used + 1)
+            .execution_options(synchronize_session=False)
+        )
+        if claimed.rowcount == 0:
+            # 并发首登被别的事务抢走（或恰好过期/用尽）：回滚后重读已提交
+            # 状态。owner 已有值 → 登录该 owner（保持既有语义，而不是 403：
+            # 拿着同一个码的设备本就该落到同一个账号）；仍无 owner 或已
+            # 过期 → 按无效邀请码处理
+            await session.rollback()
+            invite = await session.get(InviteCode, body.invite_code)
+            if (
+                invite is None
+                or invite.owner_user_id is None
+                or (invite.expires_at is not None and as_utc(invite.expires_at) <= now)
+            ):
+                raise ApiError(403, "invalid_invite", "邀请码不存在或已过期")
+            user_id = invite.owner_user_id
+        else:
+            session.add(User(id=user_id))
+            await session.flush()
 
     device = await session.get(Device, body.device_id)
     if device is not None and device.user_id != user_id:

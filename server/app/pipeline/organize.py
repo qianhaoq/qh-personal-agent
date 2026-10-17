@@ -12,11 +12,16 @@
 3. 短写事务：锁 note（PG：FOR UPDATE；SQLite 无行锁跳过）并复查——
    已删除，或 rev != 入队 rev（LLM 调用期间被 PATCH，会重新入队）则
    放弃本次结果，job 视为完成；否则清旧产物、写 note 与建议提醒。
-   allocate_seq 放在事务末尾（写入前一次性批量分配），sequences 行锁
-   只持有到提交
+   业务行的 UPDATE/INSERT 全部 flush 之后才 allocate_seq（全局加锁
+   顺序规则，见 app.common.allocate_seq：sequences 必须是事务里最后
+   一把锁），change_seq 由其后的第二条 UPDATE 写回
 4. 写事务提交后再写 MemoryStore（mem0 内部还会调 LLM/embedding）：
-   先 delete_by_note 再 add。失败抛异常交给 job 队列重试；重试时按
-   第 1 步的判定只补写记忆，不再调 LLM，保证记忆最终写入且不重复
+   先 delete_by_note 再 add，add 之后复查 note（新事务）：期间笔记
+   被删除（防“删除后记忆复活”：删除路径的清理与本次 add 交错）或
+   rev 又变了（被 PATCH，本次整理已作废）就把刚写入的记忆再删掉。
+   失败抛异常交给 job 队列重试；重试时按第 1 步的判定只补写记忆，
+   不再调 LLM，保证记忆最终写入且不重复。删除路径另有幂等的
+   cleanup_memory job 兜底（见 cleanup_note_memory）
 
 相对时间以 note.recorded_at（及其时区）为参照；早于参照时间或早于
 服务器当前时间的 fire_at 都不生成建议提醒。
@@ -167,8 +172,10 @@ async def organize_note(note_id: str, enqueued_rev: int | None = None) -> None:
         if await _apply_extraction(maker, note_id, enqueued_rev, snapshot, extraction):
             return
 
-    # 4. 记忆写入在写事务提交之后
-    await _sync_memory(maker, snapshot)
+    # 4. 记忆写入在写事务提交之后。expected_rev 是本次整理落库后的期望
+    # rev（apply 路径 snapshot.rev+1；补写路径不变），_sync_memory 用它
+    # 复查“add 之后笔记是否又被删除/修改”
+    await _sync_memory(maker, snapshot, snapshot.rev + (0 if memory_only else 1))
 
 
 async def _apply_extraction(
@@ -215,14 +222,7 @@ async def _apply_extraction(
                 continue
             fresh.append((r["title"], fire_at))
 
-        # —— 以上是本事务的全部读取/校验；从这里到提交只做内存变更与
-        # 一次 flush，sequences 行锁的持有时间压缩到最短 ——
-        # 一次批量分配，展开成各行独占的 seq（共用同一个值时，分页切在
-        # 组中间会让剩余行被 `> cursor` 永久跳过）
-        total = 1 + len(stale) + len(fresh)
-        last_seq = await allocate_seq(session, count=total)
-        seqs = iter(range(last_seq - total + 1, last_seq + 1))
-
+        # —— 以上是本事务的全部读取/校验；从这里到提交只做内存变更 ——
         note.title = extraction["title"] or None
         note.tags = extraction["tags"]
         note.todos = extraction["todos"]
@@ -231,40 +231,69 @@ async def _apply_extraction(
         note.llm_calls += 1
         note.memory_synced = False  # 记忆要等提交后由 _sync_memory 写入
         note.updated_at = now
-        note.change_seq = next(seqs)
         for r in stale:
             r.deleted_at = now
-            r.change_seq = next(seqs)
+        fresh_rows: list[Reminder] = []
         for title, fire_at in fresh:
-            session.add(
-                Reminder(
-                    id=new_id("rmd"),
-                    user_id=note.user_id,
-                    note_id=note.id,
-                    title=title,
-                    fire_at=fire_at,
-                    status="suggested",
-                    change_seq=next(seqs),
-                )
+            row = Reminder(
+                id=new_id("rmd"),
+                user_id=note.user_id,
+                note_id=note.id,
+                title=title,
+                fire_at=fire_at,
+                status="suggested",
             )
+            session.add(row)
+            fresh_rows.append(row)
+        # 业务行（note → reminders）的 UPDATE/INSERT 全部先 flush 落定、
+        # 拿到行锁，之后才 allocate_seq：sequences 必须是本事务最后一把
+        # 锁（全局加锁顺序规则，见 app.common.allocate_seq）。反过来
+        # （先 allocate_seq 再锁 note）会与 PATCH 的“先条件 UPDATE note”
+        # 构成 AB-BA 死锁
+        await session.flush()
+        # 一次批量分配，展开成各行独占的 seq（共用同一个值时，分页切在
+        # 组中间会让剩余行被 `> cursor` 永久跳过）；change_seq 用第二条
+        # UPDATE 写回，行锁已在上一条 flush 里拿到
+        total = 1 + len(stale) + len(fresh_rows)
+        last_seq = await allocate_seq(session, count=total)
+        seqs = iter(range(last_seq - total + 1, last_seq + 1))
+        note.change_seq = next(seqs)
+        for r in stale:
+            r.change_seq = next(seqs)
+        for row in fresh_rows:
+            row.change_seq = next(seqs)
         await session.flush()
     return False
 
 
-async def _sync_memory(maker: async_sessionmaker[AsyncSession], snapshot: _NoteSnapshot) -> None:
+async def _sync_memory(
+    maker: async_sessionmaker[AsyncSession], snapshot: _NoteSnapshot, expected_rev: int
+) -> None:
     """把笔记写入 MemoryStore（在写事务提交之后），成功后置 memory_synced。
 
     mem0 内部还会调 LLM/embedding，同样不能放进数据库事务。失败抛给
     job 队列重试：重试时 note 已 organized 且 memory_synced=False，只走
     补写路径（不再调 LLM）。先 delete_by_note 再 add，重放不会产生
     重复记忆；标记本身失败也只需再补写一次。
+
+    add 之后复查（新事务读 note）：期间笔记被删除——delete 的清理与
+    本次 add 交错会让已删笔记的记忆“复活”——或 rev 又变了（被 PATCH，
+    本次整理已作废，重新入队的任务会重写）时，把刚写入的记忆再删掉
+    且不置 memory_synced。删除路径另有幂等的 cleanup_memory job 兜底
+    （见 cleanup_note_memory）：即使复查读到的是删除提交前的快照，
+    较晚落定的那一方也会把记忆清掉。
     """
     store = get_memory_store()
     await store.delete_by_note(snapshot.user_id, snapshot.note_id)
     await store.add(snapshot.user_id, snapshot.text, note_id=snapshot.note_id)
+    async with maker() as session:
+        note = await session.get(Note, snapshot.note_id)
+    if note is None or note.deleted_at is not None or note.rev != expected_rev:
+        await store.delete_by_note(snapshot.user_id, snapshot.note_id)
+        return
     async with maker() as session, session.begin():
-        # 条件更新：期间被 PATCH（status 回到 uploaded，记忆已作废）或
-        # 删除时不置位，交给重新入队的任务
+        # 条件更新：期间被 PATCH（status 回到 uploaded，记忆已作废）、
+        # 删除或 rev 再变时不置位，交给重新入队的任务
         await session.execute(
             update(Note)
             .where(
@@ -272,9 +301,28 @@ async def _sync_memory(maker: async_sessionmaker[AsyncSession], snapshot: _NoteS
                 Note.deleted_at.is_(None),
                 Note.status == "organized",
                 Note.memory_synced.is_(False),
+                Note.rev == expected_rev,
             )
             .values(memory_synced=True)
+            .execution_options(synchronize_session=False)
         )
+
+
+async def cleanup_note_memory(note_id: str, user_id: str) -> None:
+    """cleanup_memory job 的实现：清掉已删笔记在 MemoryStore 的残留。
+
+    幂等：只有笔记仍处于已删除（或行已不存在）才执行 delete_by_note；
+    未删除则跳过，避免误删在用记忆。与 organize 的 _sync_memory 交错时
+    （job 先跑、add 后落，或反之），_sync_memory 的 add 后复查与本 job
+    中较晚执行的一方会把已删笔记的记忆清掉，防“删除后记忆复活”。
+    """
+    maker = get_sessionmaker()
+    async with maker() as session:
+        note = await session.get(Note, note_id)
+    if note is not None and note.deleted_at is None:
+        return
+    store = get_memory_store()
+    await store.delete_by_note(user_id, note_id)
 
 
 def _parse_fire_at(value, tzname: str):

@@ -16,6 +16,7 @@
 - 前端 / UI（Android 界面、交互、样式）交给 **`coding kimi`**。
 - 每个改动一个分支、一个 PR；不直接推 `main`（受保护）。
 - 先读后写的状态变更（乐观锁、token 轮换、计数、状态机）必须锁行（SELECT … FOR UPDATE）或用条件更新（UPDATE … WHERE 旧值），并配并发测试。
+- 数据库写事务的加锁顺序全局固定：**先锁业务行**（条件 UPDATE / FOR UPDATE，业务行之间按 note → reminders → device … 的顺序），全部写完后再调用 `allocate_seq`（server/app/common.py，须紧贴提交），change_seq 用其后的第二条 UPDATE 写入；绝不允许先 `allocate_seq` 再去锁业务行——PG 上会与其他路径构成 AB-BA 死锁（PATCH 与 organize 写回曾因此死锁）。
 
 ## 评审与修复
 

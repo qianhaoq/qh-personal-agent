@@ -18,6 +18,10 @@ _DB_FILE.unlink(missing_ok=True)
 _TEST_DB_URL = os.environ.get("TEST_DATABASE_URL")
 if _TEST_DB_URL:
     os.environ["DATABASE_URL"] = _TEST_DB_URL
+    # PG（生产形态）下 config 会拒绝 MEMORY_BACKEND=inmemory：测试套件
+    # 显式放行（生产环境不允许，见 config._reject_inmemory_memory_backend_
+    # in_production），记忆后端仍统一用进程内假实现
+    os.environ["ALLOW_INMEMORY_IN_PROD"] = "true"
 else:
     os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{_DB_FILE}"
 # 随机生成的合法密钥形态（64 位 hex = 32 字节）：PG 测试运行（生产形态

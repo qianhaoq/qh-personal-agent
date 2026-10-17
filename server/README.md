@@ -74,7 +74,7 @@ docker compose exec api python -m app.cli create-invite
 | `JWT_SECRET` | HS256 签名密钥：>=32 字节随机值的编码。生成任选其一：`python -c "import secrets;print(secrets.token_urlsafe(48))"`、`openssl rand -hex 32`。生产（postgresql）启动时校验：hex 需 >=64 字符，或 base64/base64url（允许无 padding）解码 >=32 字节且解码后 >=16 种字节取值；占位值与人类可读口令（含 secret/password 字样、无法解码的字符串）会被拒绝 |
 | `LLM_PROVIDER` | `mock`（默认，确定性规则）或 `openai`（OpenAI 兼容接口） |
 | `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | DeepSeek 示例 `https://api.deepseek.com`；腾讯混元 OpenAI 兼容地址示例见 `.env.example`。**地址与型号需按官网核实** |
-| `MEMORY_BACKEND` | `inmemory`（测试）或 `mem0`（生产，`pip install -r requirements-mem0.txt`）。只接受这两个值，未知值启动即报错；配置 `mem0` 但未安装 mem0ai 时也直接报错，不静默退化 |
+| `MEMORY_BACKEND` | `inmemory`（仅单进程开发/测试）或 `mem0`（生产，`pip install -r requirements-mem0.txt`）。只接受这两个值，未知值启动即报错；配置 `mem0` 但未安装 mem0ai 时也直接报错，不静默退化。生产（postgresql）配置 `inmemory` 会拒绝启动（多 worker/独立 worker 进程各一份内存、重启即丢）；跑 PG 测试套件的 CI/本地可设 `ALLOW_INMEMORY_IN_PROD=true` 放行 |
 
 ## 测试
 

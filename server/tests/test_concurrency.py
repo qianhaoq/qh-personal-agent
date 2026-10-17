@@ -115,6 +115,14 @@ async def test_concurrent_first_allocate_seq_no_unique_violation():
 # 这些测试：PG 验证真实行锁语义，SQLite 单写者下若仍持有事务写锁（旧
 # 实现），这里的并发请求同样会因 database is locked 超时。
 # ---------------------------------------------------------------------------
+# P1：同一 note 上 PATCH 与 organize 写回的加锁顺序（防 AB-BA 死锁）
+#
+# 旧 PATCH 把 allocate_seq 写在条件更新的 .values() 里（先锁 sequences
+# 再锁 note），organize 写回先 FOR UPDATE note 再 allocate_seq：两者在
+# 同一 note 上重叠时 PG 报 DeadlockDetected（SQLite 无行锁、单写者串行，
+# 构造不出这个环，故仅 PG 运行）。现在全仓统一为“先锁业务行（note →
+# reminders），最后才 allocate_seq，change_seq 用第二条 UPDATE 写回”。
+# ---------------------------------------------------------------------------
 
 
 def _slow_llm(monkeypatch, entered: asyncio.Event, release: asyncio.Event) -> dict:
@@ -265,3 +273,118 @@ async def test_other_user_writes_during_llm_and_memory_sync(client, user, monkey
             assert note.memory_synced is True, note_id
     items = [m for m in await store.list(user["user_id"]) if m.note_id == user1_note_id]
     assert len(items) == 1
+
+
+@requires_postgres
+async def test_patch_and_organize_writeback_overlap_no_deadlock(client, user, monkeypatch):
+    """P1：同一 note 上 PATCH 与 organize 写回重叠不产生 AB-BA 死锁。
+
+    用 Event 让 organize 写回停在“已持有 note 行锁、即将请求 sequences
+    锁”的位置（allocate_seq 前的业务行已全部 flush），此时发起 PATCH 并
+    留出它在自己的第一把锁上阻塞的时间，再放行 organize：旧代码 PATCH
+    会先抢到 sequences 锁再等 note，organize 反向等 sequences → PG
+    DeadlockDetected（organize 事务被 abort、任务失败、PATCH 200 落在
+    回滚后的旧 rev 上）；新代码 PATCH 只等 note 锁，organize 顺利提交，
+    PATCH 复查 rev 得到确定的 409，状态一致。
+    """
+    from sqlalchemy import select
+
+    from app.db import get_sessionmaker
+    from app.models import Job, Note
+    from app.pipeline import organize as organize_mod
+    from app.pipeline.runner import run_pending_jobs
+
+    headers = auth_headers(user)
+    r = await client.post(
+        "/v1/notes",
+        json={"client_note_id": str(uuid.uuid4()), "text": "第一版内容"},
+        headers=headers,
+    )
+    note_id = r.json()["note_id"]
+
+    organize_holds_note = asyncio.Event()
+    release_organize = asyncio.Event()
+    real_allocate_seq = organize_mod.allocate_seq
+
+    async def allocate_seq_paused(session, name="global", count=1):
+        # 走到这里说明 organize 已 flush 完全部业务行（持有 note 行锁），
+        # 正要请求 sequences 锁
+        organize_holds_note.set()
+        await release_organize.wait()
+        return await real_allocate_seq(session, name=name, count=count)
+
+    monkeypatch.setattr(organize_mod, "allocate_seq", allocate_seq_paused)
+
+    worker = asyncio.create_task(run_pending_jobs())
+    await asyncio.wait_for(organize_holds_note.wait(), timeout=5)
+
+    patch_task = asyncio.create_task(
+        client.patch(
+            f"/v1/notes/{note_id}", json={"text": "并发写入的新内容", "rev": 1}, headers=headers
+        )
+    )
+    await asyncio.sleep(0.3)  # 让 PATCH 走到它需要的第一把锁（note 行）上阻塞
+    assert not patch_task.done(), "PATCH 应阻塞在 organize 持有的 note 行锁上"
+
+    release_organize.set()
+    patched = await asyncio.wait_for(patch_task, timeout=5)
+    await asyncio.wait_for(worker, timeout=10)
+
+    # organize 先提交（rev 1→2），PATCH 的条件更新不再命中 → 409（不是
+    # DeadlockDetected 引发的 500），最终状态一致
+    assert patched.status_code == 409, patched.text
+    assert patched.json()["error"]["code"] == "conflict"
+    async with get_sessionmaker()() as session:
+        note = await session.get(Note, note_id)
+        job = (
+            await session.execute(
+                select(Job).where(Job.kind == "organize_note", Job.payload_json.contains(note_id))
+            )
+        ).scalar_one()
+    assert note.status == "organized"
+    assert note.rev == 2
+    assert note.text == "第一版内容"  # 409 的 PATCH 没有落库
+    assert note.memory_synced is True
+    assert job.status == "done"  # 整理任务没有被死锁打断
+
+
+async def test_concurrent_first_login_same_invite_single_user(client, invite_code):
+    """P1：5 个并发首登同一邀请码，只创建 1 个用户。
+
+    PG 下各请求独立会话/连接真实并发：旧“先读 owner 再创建”会让多个
+    请求同时看到 owner IS NULL 而各建账号（同一码多个用户、used 乱计）。
+    现在条件 UPDATE 抢占，抢不到的复查后登录先占到的人。SQLite 单写者
+    下请求天然串行，本测试退化为验证同一语义（仍只 1 个用户）。
+    """
+    from sqlalchemy import select
+
+    from app.db import get_sessionmaker
+    from app.models import InviteCode, User
+
+    results = await asyncio.gather(
+        *[
+            client.post(
+                "/v1/auth/login",
+                json={
+                    "invite_code": invite_code,
+                    "device_id": f"dev_invite_race_{i}",
+                    "device_name": "race",
+                },
+            )
+            for i in range(5)
+        ]
+    )
+    assert all(r.status_code == 200 for r in results), [r.text for r in results]
+    user_ids = {r.json()["user_id"] for r in results}
+    assert len(user_ids) == 1, f"同一邀请码不应创建多个用户：{user_ids}"
+
+    async with get_sessionmaker()() as session:
+        # SQLite 测试库跨测试复用（靠随机 ID 隔离），不能数全表 user：
+        # 只数本次邀请码落定的那个
+        users = (
+            await session.execute(select(User).where(User.id.in_(user_ids)))
+        ).scalars().all()
+        invite = await session.get(InviteCode, invite_code)
+    assert len(users) == 1
+    assert invite.used == 1  # 只计一次注册
+    assert invite.owner_user_id == user_ids.pop()
