@@ -33,26 +33,31 @@
 
 ## 改 server 前必读 / 自检清单
 
-改 `server/` 之前（含修 review 意见），先读完：[docs/server-invariants.md](docs/server-invariants.md)（服务端不变量，事实来源；随 PR #2 落地，落地前以 #2 的本文件「写代码」各条为准）和 [docs/agent-pitfalls.md](docs/agent-pitfalls.md)（反复踩的坑和正反例）。提交前逐条自检：
+改 `server/` 之前（含修 review 意见），先读完以下两份：
+- [docs/server-invariants.md](docs/server-invariants.md)：服务端不变量，事实来源。随 PR #2 落地，落地前以 #2 中本文件「写代码」各条为准；冲突时以它为准。
+- [docs/agent-pitfalls.md](docs/agent-pitfalls.md)：反复踩的坑和正反例。
 
-- [ ] 改动涉及并发（锁、条件更新、job、sync、记忆同步）时，配了能在 **PostgreSQL** 上跑的并发测试（`PG Tests` job），不能只在 SQLite 上过。
+提交前逐条自检：
+
+- [ ] 并发敏感的改动（锁、条件更新、job、sync）配了能在 **PostgreSQL** 上跑的并发测试（`PG Tests` job），缺失按 P1。
 - [ ] **按类修，不按行修**：一个 review 发现修好后，用 `rg` 把同一类模式在整个 `server/` 里排查一遍，并在线程回复里写清排查了哪些地方。
-- [ ] **同一类 P1 第二次出现时**，先更新 docs/server-invariants.md（必要时加上 `scripts/check-invariants.py` 的检查），再改代码。
-- [ ] 本地跑 `python3 scripts/check-invariants.py` 通过；豁免必须写 `# invariant-ok[<规则id>]: <理由>`。
-- [ ] 单个 PR 改动超过 **约 800 行**时先拆分；评审轮次多，往往是因为一次改动的面太大。
+- [ ] **同一类 P1 第二次出现时**，先更新 docs/server-invariants.md，再改代码。
+- [ ] 本地跑 `python3 scripts/check-invariants.py`。豁免只有一种写法：`# invariant-ok: <RULE-ID> <理由>`。
+- [ ] 单个 PR 的代码改动超过 **约 800 行**（不计 docs、tests、生成文件）时先拆分。
 
 ## Review guidelines
 
 Codex / 评审 bot 评审本仓 PR 时：
 
-- 以 docs/server-invariants.md 为准检查 server 改动；发现违反时注明是哪一条不变量，并检查同一类模式在 diff 之外是否还有。
-- 重点看 docs/agent-pitfalls.md 里列出的高发类别：先读后写竞态、加锁顺序 / allocate_seq 位置、job 收尾租约、提交后副作用、外部输入 NUL / 配置校验、静默回落假实现、多进程启动 DDL。
-- 并发相关改动没有 PG 并发测试，按 P1 报。
-- 豁免标记 `# invariant-ok:` 后面的理由站不住时，按违反不变量处理。
-
-### `scripts/check-invariants.py` 是 best-effort 启发式
-
-该检查器的目标是抓住高发、可机械识别的违规（见 docs/agent-pitfalls.md），**不是**形式化证明代码满足不变量。漏检（遗漏的控制流路径、别名、依赖注入的 path 参数、函数外构造假实现、注释解析边角情况等）**不算 P0/P1**，按 `P2: defer — heuristic checker; PG concurrency tests + human/Codex review are the backstop` Resolve。只有**误报**（把合法代码判错并挡住合并）或 CI job 本身坏了，才算针对检查器的 P1。不要为补全覆盖面继续扩 AST 检查。
+- 以 docs/server-invariants.md（随 #2 落地）为准检查 server 改动。发现违反时注明是哪一条，并检查同一类模式在 diff 之外是否还有。
+- 重点看 docs/agent-pitfalls.md 的高发类别。
+- 分级口径与 .github/copilot-instructions.md 一致：
+  - CI 红灯为 P1（造成生产事故时才算 P0）；
+  - 并发敏感的改动缺 PG 并发测试为 P1。
+- `scripts/check-invariants.py` 是 **best-effort 启发式，精确优先于召回**。
+  - 漏检（控制流、别名、依赖注入参数等）不算 P0/P1，按 `P2: defer — heuristic checker; PG concurrency tests + human/Codex review are the backstop` Resolve。
+  - 只有误报或检查器崩溃，才算针对检查器的 P1。
+  - 不要为补全覆盖面继续扩 AST 规则。
 
 ## 交接
 

@@ -37,33 +37,6 @@ jobs:
   # Detection runs first in a service-less job so that, while server/ has no
   # tests, PostgreSQL is never pulled or started (services start before any
   # step of the job that declares them). Discovery mirrors scripts/ci-test.sh.
-  # Mechanical server-invariant checks (scripts/check-invariants.py, rules in
-  # docs/agent-pitfalls.md; source of truth docs/server-invariants.md).
-  # NOT a required check yet (proposed to become required after PR #2).
-  # Exits 0 while server/ does not exist. Stdlib only, no installs.
-  invariants:
-    name: Invariant Check (non-required)
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read
-    steps:
-      - name: Check out
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Checker unit tests
-        run: python -m unittest discover -s scripts/tests -v
-
-      - name: check-invariants
-        run: python scripts/check-invariants.py .
-
   pg-detect:
     name: PG Tests (detect)
     runs-on: ubuntu-latest

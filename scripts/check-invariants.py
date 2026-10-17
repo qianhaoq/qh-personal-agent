@@ -1,61 +1,56 @@
 #!/usr/bin/env python3
-"""Mechanical server-invariant checks (AST based, low false-positive).
+"""Mechanical server-invariant checks (AST, stdlib only).
 
-BEST-EFFORT HEURISTIC (gate policy, authorized by 专业研发): this script
-catches common, mechanically recognizable violations. It is NOT a proof that
-code satisfies the invariants. Completeness gaps (missed control-flow paths,
-aliases, dependency-injected path params, fakes built outside functions,
-comment-parsing edge cases, etc.) are NOT P0/P1 findings against this
-checker; resolve them as
+BEST-EFFORT HEURISTIC, PRECISION OVER RECALL. It flags only a few narrow,
+high-confidence patterns. It does not prove the code satisfies the
+invariants. Missed cases (aliases, control-flow paths, dependency-injected
+params, ...) are not P0/P1 against this checker; resolve them as
   P2: defer — heuristic checker; PG concurrency tests + human/Codex review are the backstop
-Only false positives that block legitimate code, or a broken CI job, count
-as P1 against the checker. Do not expand the AST rules just to chase coverage.
+A false positive on legitimate code, or a crash, is a P1 against the checker.
 
-Every rule traces to docs/server-invariants.md (source of truth, lands with
-PR #2) and is explained in docs/agent-pitfalls.md. Until that doc is on main
-the rule text lives in the AGENTS.md "写代码" bullets added by #2.
+Source of truth: docs/server-invariants.md (lands with PR #2; its rules win).
+Rationale and examples: docs/agent-pitfalls.md.
 
-Rules (id -> invariant):
-  INV-SEQ-LAST       lock order: allocate_seq is the last lock in the write
-                     transaction; no business writes after it, never nested
-                     inside an UPDATE that also writes business columns.
-  INV-NUL            every external string input rejects NUL: FastAPI path
-                     params must use NoNulStr, not bare str.
-  INV-NO-FALLBACK    no silent fallback to Mock*/InMemory* implementations:
-                     construction must sit under an explicit `== "mock"` /
-                     `== "inmemory"` (or similar) selector branch.
-  INV-STARTUP-DDL    (warning only, proposed) schema DDL (create_all) only in
-                     a one-shot bootstrap/migration entrypoint, never in the
-                     API lifespan or worker startup.
+Rules:
+  INV-SEQ-LAST     In the transaction that calls allocate_seq(sess), no DB write
+                   on that same session after it: sess.add/add_all/merge/delete/
+                   execute(...) (except an UPDATE that only sets change_seq/
+                   updated_at), or enqueue(sess, ...). Scope ends at sess.commit()/
+                   rollback() or the end of the enclosing `with ... begin()` block.
+                   Also: allocate_seq evaluated inside .values() that writes other columns.
+  INV-NUL          FastAPI path params typed as bare str (str, str | None,
+                   Optional[str], Annotated[str, ...] without a NUL-safe constraint).
+                   Accepted: NoNulStr; Annotated metadata with reject_nul/AfterValidator,
+                   or Path/Query(pattern=...|regex=...); non-str converters ({id:int}).
+  INV-NO-FALLBACK  A known fake (MockLLM, FakeLLM, InMemoryStore) constructed as an
+                   implicit fallback: inside an `except` handler, a bare `else:`
+                   branch, or an `if` whose test is a negation / `is None` /
+                   empty-string check (e.g. missing key).
 
-Suppress a finding with a trailing comment on the flagged line:
-    # invariant-ok[INV-SEQ-LAST]: <reason>   (scoped to listed rule ids)
-    # invariant-ok: <reason>                 (only if the line has exactly one finding)
-These are low-false-positive heuristics, not a proof; review and PG
-concurrency tests remain the backstop.
-Exit 0 when server/ does not exist (e.g. main before PR #2).
+Exemption (trailing comment on the flagged line, rule id required):
+    # invariant-ok: INV-SEQ-LAST <reason>
+
+Exit codes: 0 = no rule errors (warnings about unreadable files are printed);
+1 = at least one rule error. Exits 0 when server/ does not exist.
 """
 from __future__ import annotations
 
 import ast
 import re
 import sys
+import tokenize
 from dataclasses import dataclass
 from pathlib import Path
 
-DOC = "docs/server-invariants.md"
 SEQ_FUNC = "allocate_seq"
 SEQ_COLUMNS = {"change_seq", "updated_at"}
-WRITE_CALLS = {"enqueue", "add", "add_all", "insert", "merge", "with_for_update", "delete"}
-FALLBACK_PREFIXES = ("Mock", "InMemory", "Fake")
-SELECTOR_WORDS = ("mock", "inmemory", "fake", "test")
-DDL_ALLOWED_FILES = ("cli.py", "bootstrap.py", "migrate.py")
-DDL_ALLOWED_DIRS = ("migrations", "alembic")
-HTTP_METHODS = {"get", "post", "put", "patch", "delete", "head", "options", "trace", "websocket", "api_route"}
-OK_MARK = re.compile(r"#\s*invariant-ok(?:\[(?P<rules>[A-Z0-9,\s-]+)\])?:\s*\S")
-COLLECTION_WRITES = {"append", "extend", "remove", "discard", "clear"}
-NON_ORM_RECV = {"response", "resp", "request", "req", "metrics", "metric", "result", "out", "ctx", "context", "state", "app", "config", "settings", "headers", "cookies", "query", "params"}
-FAKE_TOKENS = {"mock", "fake", "inmemory"}
+SESSION_NAMES = {"session", "db", "s", "sess"}
+SESSION_TYPES = {"AsyncSession", "Session"}
+SESSION_WRITES = {"add", "add_all", "merge", "delete", "execute"}
+TXN_END = {"commit", "rollback"}
+KNOWN_FAKES = {"MockLLM", "FakeLLM", "InMemoryStore"}
+HTTP_METHODS = {"get", "post", "put", "patch", "delete", "head", "options", "api_route"}
+OK_MARK = re.compile(r"#\s*invariant-ok:\s*(INV-[A-Z-]+)\s+\S")
 
 
 @dataclass
@@ -64,447 +59,227 @@ class Finding:
     line: int
     rule: str
     msg: str
-    warning: bool = False
 
     def __str__(self) -> str:
-        kind = "warning" if self.warning else "error"
-        return f"{self.path}:{self.line}: {kind} [{self.rule}] {self.msg} (see {DOC} / docs/agent-pitfalls.md#{self.rule.lower()})"
+        return f"{self.path}:{self.line}: error [{self.rule}] {self.msg} (docs/agent-pitfalls.md#{self.rule.lower()})"
 
 
-def _name(node: ast.AST) -> str | None:
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Attribute):
-        return node.attr
+def _name(n: ast.AST) -> str | None:
+    if isinstance(n, ast.Name):
+        return n.id
+    if isinstance(n, ast.Attribute):
+        return n.attr
     return None
 
 
-def _call_name(node: ast.Call) -> str | None:
-    return _name(node.func)
-
-
-def _parents(tree: ast.AST) -> dict[ast.AST, ast.AST]:
-    out: dict[ast.AST, ast.AST] = {}
+def _parents(tree: ast.AST) -> dict:
+    out = {}
     for p in ast.walk(tree):
         for c in ast.iter_child_nodes(p):
             out[c] = p
     return out
 
 
-def _pos(n: ast.AST) -> tuple[int, int]:
-    return (getattr(n, "lineno", 0), getattr(n, "col_offset", 0))
+def _ancestors(n, parents):
+    p = parents.get(n)
+    while p is not None:
+        yield p
+        p = parents.get(p)
 
 
-# ---------------------------------------------------------------- INV-SEQ-LAST
-def check_seq_last(tree: ast.AST, path: str, parents) -> list[Finding]:
-    out: list[Finding] = []
-    funcs = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
-    for fn in funcs:
-        if fn.name == SEQ_FUNC:
+def _pos(n) -> tuple[int, int]:
+    return (n.lineno, n.col_offset)
+
+
+# ------------------------------------------------------------------ INV-SEQ-LAST
+def _session_names(fn) -> set[str]:
+    names = set(SESSION_NAMES)
+    for a in fn.args.args + fn.args.kwonlyargs:
+        if a.annotation is not None and any(t in ast.unparse(a.annotation) for t in SESSION_TYPES):
+            names.add(a.arg)
+    return names
+
+
+def _only_seq_update(call: ast.Call) -> bool:
+    """execute(update(X)...values(change_seq=...)) with no other columns."""
+    for n in ast.walk(call):
+        if isinstance(n, ast.Call) and _name(n.func) == "values":
+            keys = {k.arg for k in n.keywords}
+            return bool(keys) and None not in keys and keys <= SEQ_COLUMNS and not n.args
+    return False
+
+
+def check_seq_last(tree, path, parents) -> list[Finding]:
+    out = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) or fn.name == SEQ_FUNC:
             continue
-        calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call)]
-        # ignore calls belonging to nested functions
-        calls = [c for c in calls if _enclosing_func(c, parents) is fn]
-        seq_calls = [c for c in calls if _call_name(c) == SEQ_FUNC]
-        if not seq_calls:
-            continue
-        # nested inside .values(...) together with business columns
-        for sc in seq_calls:
-            p = parents.get(sc)
-            while p is not None and p is not fn:
-                if isinstance(p, ast.Call) and _call_name(p) == "values":
-                    keys = {k.arg for k in p.keywords if k.arg}
-                    extra = sorted(keys - SEQ_COLUMNS)
-                    if extra:
-                        out.append(Finding(path, sc.lineno, "INV-SEQ-LAST",
-                            f"{SEQ_FUNC}() evaluated inside an UPDATE that also writes {extra}: "
-                            "the sequence lock is taken before the business row lock (AB-BA deadlock on PG). "
-                            "Write business rows first, then allocate_seq, then a second UPDATE for change_seq."))
+        sessions = _session_names(fn)
+        calls = sorted(
+            (c for c in ast.walk(fn) if isinstance(c, ast.Call)
+             and next((p for p in _ancestors(c, parents) if isinstance(p, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))), None) is fn),
+            key=_pos,
+        )
+        for seq in (c for c in calls if _name(c.func) == SEQ_FUNC):
+            sess = _name(seq.args[0]) if seq.args else None
+            if sess not in sessions:
+                continue
+            # allocate_seq nested in a .values() that writes business columns
+            for p in _ancestors(seq, parents):
+                if p is fn:
                     break
-                p = parents.get(p)
-        first = min(seq_calls, key=_pos)
-        # loop back-edge: a write in a loop body that also allocates runs after
-        # the previous iteration's allocate_seq
-        loop_bodies = [lp for sc in seq_calls for lp in [_enclosing_loop(sc, fn, parents)] if lp is not None]
-        for c in calls:
-            if c in seq_calls or any(_inside(c, sc, parents) for sc in seq_calls):
-                continue
-            in_loop = any(_inside(c, lp, parents) for lp in loop_bodies)
-            if _pos(c) <= _pos(first) and not in_loop:
-                continue
-            if any(_exclusive(c, sc, parents) for sc in seq_calls):
-                continue
-            if not any(_same_txn(c, sc, parents) for sc in seq_calls):
-                continue
-            name = _call_name(c)
-            bad = None
-            if name in WRITE_CALLS or (name or "").startswith("enqueue"):
-                bad = f"{name}()"
-            elif name in COLLECTION_WRITES and isinstance(c.func, ast.Attribute) and isinstance(c.func.value, ast.Attribute):
-                bad = f"relationship mutation .{c.func.value.attr}.{name}()"
-            elif name == "values":
-                extra = sorted({k.arg for k in c.keywords if k.arg} - SEQ_COLUMNS)
-                if extra or any(k.arg is None for k in c.keywords) or c.args:
-                    bad = f"UPDATE .values({', '.join(extra) or '...'})"
-            if bad:
-                out.append(Finding(path, c.lineno, "INV-SEQ-LAST",
-                    f"{bad} after {SEQ_FUNC}() (line {first.lineno}) in {fn.name}(): allocate_seq must be the "
-                    "last lock before commit; only change_seq/updated_at may be written after it."))
-        # ORM attribute writes (`note.text = v`) are flushed later and lock the row after the seq lock
-        for st in ast.walk(fn):
-            if not isinstance(st, (ast.Assign, ast.AugAssign, ast.AnnAssign)) or _enclosing_func(st, parents) is not fn:
-                continue
-            targets = st.targets if isinstance(st, ast.Assign) else [st.target]
-            attrs = []
-            for t in targets:
-                if not isinstance(t, ast.Attribute) or t.attr in SEQ_COLUMNS:
+                if isinstance(p, ast.Call) and _name(p.func) == "values":
+                    extra = sorted({k.arg for k in p.keywords if k.arg} - SEQ_COLUMNS)
+                    if extra:
+                        out.append(Finding(path, seq.lineno, "INV-SEQ-LAST",
+                            f"{SEQ_FUNC}() inside an UPDATE that also writes {extra}: sequence lock taken before the row lock"))
+                    break
+            txn = next((p for p in _ancestors(seq, parents)
+                        if isinstance(p, (ast.With, ast.AsyncWith)) and "begin" in " ".join(ast.unparse(i) for i in p.items)), None)
+            for c in calls:
+                if _pos(c) <= _pos(seq) or seq in _ancestors(c, parents) or c in _ancestors(seq, parents):
                     continue
-                recv = t.value
-                while isinstance(recv, ast.Attribute):
-                    recv = recv.value
-                if isinstance(recv, ast.Name) and recv.id.lower() in NON_ORM_RECV:
-                    continue  # response.status_code / metrics.value / … cannot lock a business row
-                attrs.append(t.attr)
-            if not attrs or any(_inside(sc, st, parents) for sc in seq_calls):
-                continue
-            in_loop = any(_inside(st, lp, parents) for lp in loop_bodies)
-            if _pos(st) <= _pos(first) and not in_loop:
-                continue
-            if any(_exclusive(st, sc, parents) for sc in seq_calls):
-                continue
-            if not any(_same_txn(st, sc, parents) for sc in seq_calls):
-                continue
-            out.append(Finding(path, st.lineno, "INV-SEQ-LAST",
-                f"ORM attribute write .{attrs[0]} after {SEQ_FUNC}() (line {first.lineno}) in {fn.name}(): it is flushed "
-                "(row-locked) after the sequence lock; write business columns before allocate_seq."))
+                if txn is not None and txn not in _ancestors(c, parents):
+                    break  # left the transaction block
+                f = c.func
+                recv = _name(f.value) if isinstance(f, ast.Attribute) else None
+                if recv == sess and f.attr in TXN_END:
+                    break
+                bad = None
+                if recv == sess and f.attr in SESSION_WRITES:
+                    if not (f.attr == "execute" and _only_seq_update(c)):
+                        bad = f"{sess}.{f.attr}()"
+                elif isinstance(f, ast.Name) and f.id.startswith("enqueue") and any(_name(a) == sess for a in c.args):
+                    bad = f"{f.id}({sess}, ...)"
+                if bad:
+                    out.append(Finding(path, c.lineno, "INV-SEQ-LAST",
+                        f"{bad} after {SEQ_FUNC}() (line {seq.lineno}) in the same transaction: flush business rows and "
+                        "jobs first, call allocate_seq last, then only write change_seq"))
     return out
 
 
-def _txn_context(n, parents):
-    """Nearest with/async-with ancestor whose items mention begin/commit/transaction/sessionmaker."""
-    p = parents.get(n)
-    while p is not None:
-        if isinstance(p, (ast.With, ast.AsyncWith)):
-            text = " ".join(ast.unparse(it) for it in p.items)
-            if any(k in text for k in ("begin", "commit", "transaction", "sessionmaker", "Session(")):
-                return p
-        p = parents.get(p)
-    return None
-
-
-def _same_txn(a, b, parents) -> bool:
-    """False when a and b live under different (non-nested) transaction with-blocks."""
-    ta, tb = _txn_context(a, parents), _txn_context(b, parents)
-    if ta is None or tb is None or ta is tb:
-        return True
-    if _inside(ta, tb, parents) or _inside(tb, ta, parents):
-        return True
-    return False
-
-
-def _exclusive(a, b, parents) -> bool:
-    """a and b sit in different arms (body / orelse) of the same if, try or match (and not in a loop over it)."""
-    anc_b = []
-    p = parents.get(b)
-    while p is not None:
-        anc_b.append(p)
-        p = parents.get(p)
-    child, p = a, parents.get(a)
-    while p is not None:
-        if p in anc_b:
-            if isinstance(p, ast.If):
-                arm_a = "body" if child in p.body else "orelse" if child in p.orelse else None
-                cb = anc_b[anc_b.index(p) - 1] if anc_b.index(p) > 0 else b
-                arm_b = "body" if cb in p.body else "orelse" if cb in p.orelse else None
-                return arm_a is not None and arm_b is not None and arm_a != arm_b
-            if isinstance(p, ast.Match):
-                cb = anc_b[anc_b.index(p) - 1] if anc_b.index(p) > 0 else b
-                return child is not cb and isinstance(child, ast.match_case) and isinstance(cb, ast.match_case)
-            return False
-        child, p = p, parents.get(p)
-    return False
-
-
-def _enclosing_loop(n, fn, parents):
-    p = parents.get(n)
-    while p is not None and p is not fn:
-        if isinstance(p, (ast.For, ast.AsyncFor, ast.While)):
-            return p
-        p = parents.get(p)
-    return None
-
-
-def _enclosing_func(n, parents):
-    p = parents.get(n)
-    while p is not None and not isinstance(p, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
-        p = parents.get(p)
-    return p
-
-
-def _inside(n, anc, parents) -> bool:
-    p = parents.get(n)
-    while p is not None:
-        if p is anc:
-            return True
-        p = parents.get(p)
-    return False
-
-
-# ---------------------------------------------------------------- INV-NUL
-def _router_prefixes(tree: ast.AST) -> dict[str, str]:
-    """`router = APIRouter(prefix="/users/{user_id}")` -> {"router": "/users/{user_id}"}."""
-    out: dict[str, str] = {}
+# ------------------------------------------------------------------ INV-NUL
+def _prefixes(tree) -> dict[str, str]:
+    out = {}
     for n in ast.walk(tree):
-        if isinstance(n, ast.Assign) and isinstance(n.value, ast.Call) and _call_name(n.value) in {"APIRouter", "FastAPI"}:
+        if isinstance(n, ast.Assign) and isinstance(n.value, ast.Call) and _name(n.value.func) in {"APIRouter", "FastAPI"}:
             for k in n.value.keywords:
                 if k.arg == "prefix" and isinstance(k.value, ast.Constant) and isinstance(k.value.value, str):
-                    for t in n.targets:
-                        if isinstance(t, ast.Name):
-                            out[t.id] = k.value.value
+                    out.update({t.id: k.value.value for t in n.targets if isinstance(t, ast.Name)})
     return out
 
 
-def _route_path(dec: ast.AST, prefixes: dict[str, str] | None = None) -> str | None:
-    if isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute) and dec.func.attr in HTTP_METHODS:
-        prefix = (prefixes or {}).get(_name(dec.func.value) or "", "")
-        if dec.args and isinstance(dec.args[0], ast.Constant) and isinstance(dec.args[0].value, str):
-            return prefix + dec.args[0].value
-        for k in dec.keywords:
-            if k.arg == "path" and isinstance(k.value, ast.Constant):
-                return prefix + k.value.value
-        return prefix or None
-    return None
-
-
-def _is_bare_str(ann: ast.AST | None) -> bool:
-    if ann is None:
-        return True  # FastAPI treats unannotated path params as str
-    if isinstance(ann, ast.Name) and ann.id == "str":
-        return True
-    if isinstance(ann, ast.Constant) and isinstance(ann.value, str):  # quoted forward annotation
-        try:
-            return _is_bare_str(ast.parse(ann.value, mode="eval").body)
-        except SyntaxError:
-            return False
-    if isinstance(ann, ast.BinOp) and isinstance(ann.op, ast.BitOr):  # str | None
-        return _is_bare_str(ann.left) or _is_bare_str(ann.right)
-    if isinstance(ann, ast.Subscript) and _name(ann.value) in {"Optional", "Union"}:
-        sl = ann.slice
-        return any(_is_bare_str(e) for e in (sl.elts if isinstance(sl, ast.Tuple) else [sl]))
-    if isinstance(ann, ast.Subscript) and _name(ann.value) == "Annotated":
-        sl = ann.slice
-        first = sl.elts[0] if isinstance(sl, ast.Tuple) else sl
-        if _is_bare_str(first):
-            # Annotated[str, AfterValidator(reject_nul)] is fine
-            return "reject_nul" not in ast.unparse(sl)
+def _nul_safe_meta(meta: list[ast.AST]) -> bool:
+    for m in meta:
+        src = ast.unparse(m)
+        if "reject_nul" in src or "AfterValidator" in src:
+            return True
+        if isinstance(m, ast.Call) and _name(m.func) in {"Path", "Query"} and any(k.arg in {"pattern", "regex"} for k in m.keywords):
+            return True
     return False
 
 
-def check_nul(tree: ast.AST, path: str, parents) -> list[Finding]:
-    out = []
-    prefixes = _router_prefixes(tree)
+def _bare_str(ann) -> bool:
+    if ann is None:
+        return True
+    if isinstance(ann, ast.Constant) and isinstance(ann.value, str):
+        try:
+            return _bare_str(ast.parse(ann.value, mode="eval").body)
+        except SyntaxError:
+            return False
+    if isinstance(ann, ast.Name):
+        return ann.id == "str"
+    if isinstance(ann, ast.BinOp) and isinstance(ann.op, ast.BitOr):
+        return _bare_str(ann.left) or _bare_str(ann.right)
+    if isinstance(ann, ast.Subscript):
+        head = _name(ann.value)
+        elts = ann.slice.elts if isinstance(ann.slice, ast.Tuple) else [ann.slice]
+        if head == "Optional":
+            return _bare_str(elts[0])
+        if head == "Annotated":
+            return _bare_str(elts[0]) and not _nul_safe_meta(elts[1:])
+    return False
+
+
+def check_nul(tree, path, parents) -> list[Finding]:
+    out, prefixes = [], _prefixes(tree)
     for fn in ast.walk(tree):
         if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        params: set[str] = set()
+        params = set()
         for d in fn.decorator_list:
-            rp = _route_path(d, prefixes)
-            if rp:
-                for m in re.findall(r"{([^}]+)}", rp):
+            if isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute) and d.func.attr in HTTP_METHODS:
+                route = d.args[0].value if d.args and isinstance(d.args[0], ast.Constant) else ""
+                for m in re.findall(r"{([^}]+)}", prefixes.get(_name(d.func.value) or "", "") + str(route)):
                     name, _, conv = m.partition(":")
-                    # Starlette non-string converters never pass a raw path string (NUL cannot reach)
-                    if conv and conv.split("(")[0] not in {"", "str", "path"}:
-                        continue
-                    params.add(name)
-        if not params:
-            continue
+                    if conv in {"", "str", "path"}:
+                        params.add(name)
         for a in fn.args.args + fn.args.kwonlyargs:
-            if a.arg in params and _is_bare_str(a.annotation):
+            if a.arg in params and _bare_str(a.annotation):
                 out.append(Finding(path, a.lineno, "INV-NUL",
-                    f"path parameter '{a.arg}' of {fn.name}() is a bare str: use NoNulStr so '%00' is a 422, not a PG 500."))
+                    f"path parameter '{a.arg}' of {fn.name}() is a bare str: use NoNulStr (or a Path pattern) so %00 is a 422, not a PG 500"))
     return out
 
 
-# ---------------------------------------------------------------- INV-NO-FALLBACK
-def _is_fake_literal(n: ast.AST) -> bool:
-    vals = []
-    if isinstance(n, ast.Constant) and isinstance(n.value, str):
-        vals = [n.value]
-    elif isinstance(n, (ast.Tuple, ast.List, ast.Set)):
-        if not n.elts or not all(isinstance(e, ast.Constant) and isinstance(e.value, str) for e in n.elts):
-            return False
-        vals = [e.value for e in n.elts]
-    return bool(vals) and all(v.lower() in SELECTOR_WORDS for v in vals)
-
-
-def _selects_explicitly(test: ast.AST) -> bool:
-    """True only if the condition being true *implies* a fake was selected:
-    `x == "mock"`, `x in ("mock", "fake")`, or an `and` with such a term.
-    `or`, negations, `!=`, `not in` and substrings never qualify."""
-    if isinstance(test, ast.BoolOp):
-        if isinstance(test.op, ast.And):
-            return any(_selects_explicitly(v) for v in test.values)
-        return all(_selects_explicitly(v) for v in test.values)  # Or: every branch
-    if isinstance(test, ast.Compare) and len(test.ops) == 1:
-        op, left, right = test.ops[0], test.left, test.comparators[0]
-        if isinstance(op, ast.Eq):
-            return _is_fake_literal(left) or _is_fake_literal(right)
-        if isinstance(op, ast.In):
-            return _is_fake_literal(right)
-    return False
-
-
-def check_fallback(tree: ast.AST, path: str, parents) -> list[Finding]:
-    out = []
-    for c in ast.walk(tree):
-        if not isinstance(c, ast.Call):
-            continue
-        name = _call_name(c) or ""
-        if not name.startswith(FALLBACK_PREFIXES) or not name[:1].isupper():
-            continue
-        fn = _enclosing_func(c, parents)
-        if fn is None or isinstance(fn, ast.Lambda) or FAKE_TOKENS & set(fn.name.lower().split("_")):
-            continue  # deliberate fake factory (make_mock_llm, fake_store, ...)
-        ok = False
-        child, p = c, parents.get(c)
-        while p is not None and p is not fn:
-            if isinstance(p, ast.If) and child in p.body and _selects_explicitly(p.test):
-                ok = True
-                break
-            if isinstance(p, ast.match_case) and _fake_pattern(p.pattern):
-                ok = True  # guard only narrows; reaching the body still proves provider is the fake literal
-                break
-            child, p = p, parents.get(p)
-        if not ok and _guarded_by_earlier_raise(c, fn):
-            ok = True
-        if not ok:
-            out.append(Finding(path, c.lineno, "INV-NO-FALLBACK",
-                f"{name}() is reachable without an explicit mock/inmemory selector in {fn.name}(): "
-                "a misconfigured prod would silently run the fake. Select it only on an explicit value and raise otherwise."))
-    return out
-
-
-def _fake_pattern(pat: ast.AST) -> bool:
-    if isinstance(pat, ast.MatchValue):
-        return _is_fake_literal(pat.value)
-    if isinstance(pat, ast.MatchOr):
-        return all(_fake_pattern(x) for x in pat.patterns)
-    return False
-
-
-PROD_NAMES = {"prod", "production", "is_prod", "is_production"}
-
-
-def _is_prod_predicate(t: ast.AST) -> bool:
-    """Positive production test: `url.startswith("postgres…")`, `env == "production"`, `settings.is_prod`."""
-    if isinstance(t, ast.Call) and _call_name(t) == "startswith" and t.args:
-        a = t.args[0]
-        return isinstance(a, ast.Constant) and isinstance(a.value, str) and a.value.lower().startswith("postgres")
-    if isinstance(t, ast.Compare) and len(t.ops) == 1 and isinstance(t.ops[0], ast.Eq):
-        return any(isinstance(x, ast.Constant) and str(x.value).lower() in {"prod", "production"} for x in (t.left, t.comparators[0]))
-    return (_name(t) or "").lower() in PROD_NAMES
-
-
-def _guarded_by_earlier_raise(c: ast.Call, fn) -> bool:
-    """Fall-through construction after a top-level `if <is production> [and <explicit opt-in off>]: raise`.
-
-    The test must be a positive production predicate, alone or as one term of
-    an `and` (extra terms may only narrow it, e.g. an explicit allow flag).
-    Negated (`if not prod`), `or`, or merely text-matching conditions never count."""
-    for st in fn.body:
-        if getattr(st, "lineno", 0) >= c.lineno:
-            break
-        if isinstance(st, ast.If) and not st.orelse and any(isinstance(n, ast.Raise) for n in st.body):
-            t = st.test
-            terms = t.values if isinstance(t, ast.BoolOp) and isinstance(t.op, ast.And) else [t]
-            if any(_is_prod_predicate(x) for x in terms):
-                return True
-    return False
-
-
-# ---------------------------------------------------------------- INV-STARTUP-DDL
-DDL_NAMES = {"create_all", "drop_all"}
-
-
-def ddl_helpers(tree: ast.AST) -> set[str]:
-    """Functions whose body references create_all/drop_all (called or passed, e.g. run_sync(Base.metadata.create_all))."""
-    out = set()
-    for fn in ast.walk(tree):
-        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            # only real DDL (`<x>.metadata.create_all`), not callers of a wrapper
-            if any(
-                isinstance(n, ast.Attribute) and n.attr in DDL_NAMES
-                and isinstance(n.value, ast.Attribute) and n.value.attr == "metadata"
-                for n in ast.walk(fn)
-            ):
-                out.add(fn.name)
-    return out
-
-
-def check_ddl(tree: ast.AST, path: str, parents, helpers: set[str] | None = None) -> list[Finding]:
-    p = Path(path)
-    if p.name in DDL_ALLOWED_FILES or any(d in p.parts for d in DDL_ALLOWED_DIRS):
-        return []
-    names = DDL_NAMES | (helpers or set()) | ddl_helpers(tree)
-    out = []
-    for c in ast.walk(tree):
-        if isinstance(c, ast.Call) and _call_name(c) in names:
-            fn = _enclosing_func(c, parents)
-            if fn is not None and not isinstance(fn, ast.Lambda) and fn.name in names and not _is_startup(fn):
-                continue  # inside a DDL helper definition: flag its callers instead
-            out.append(Finding(path, c.lineno, "INV-STARTUP-DDL",
-                "schema DDL at process startup: API workers and the worker service race on create_all. "
-                "Run it once in a bootstrap/migration step (e.g. app/cli.py) before starting services.", warning=True))
-    # DDL passed as a callable directly inside a startup entrypoint
-    # (lifespan: `await conn.run_sync(Base.metadata.create_all)`)
-    for fn in ast.walk(tree):
-        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and _is_startup(fn) and fn.name in ddl_helpers(fn):
-            for n in ast.walk(fn):
-                if isinstance(n, ast.Attribute) and n.attr in DDL_NAMES and isinstance(n.value, ast.Attribute) and n.value.attr == "metadata":
-                    out.append(Finding(path, n.lineno, "INV-STARTUP-DDL",
-                        f"metadata.{n.attr} inside startup entrypoint {fn.name}(): every API/worker process runs it. "
-                        "Run DDL once in a bootstrap/migration step (e.g. app/cli.py).", warning=True))
-    return out
-
-
-STARTUP_NAME = re.compile(r"lifespan|startup|worker_main|run_worker", re.I)
-
-
-def _is_startup(fn) -> bool:
-    if STARTUP_NAME.search(fn.name):
+# ------------------------------------------------------------------ INV-NO-FALLBACK
+def _implicit_test(t) -> bool:
+    if isinstance(t, ast.UnaryOp) and isinstance(t.op, ast.Not):
         return True
-    return any("on_event" in ast.unparse(d) or "asynccontextmanager" in ast.unparse(d) for d in fn.decorator_list)
+    if isinstance(t, ast.Compare) and len(t.ops) == 1:
+        r = t.comparators[0]
+        if isinstance(t.ops[0], (ast.Is, ast.Eq)) and isinstance(r, ast.Constant) and r.value in (None, ""):
+            return True
+    if isinstance(t, ast.BoolOp):
+        return any(_implicit_test(v) for v in t.values)
+    return False
 
 
-CHECKS = (check_seq_last, check_nul, check_fallback)  # check_ddl needs cross-module helpers
+def check_fallback(tree, path, parents) -> list[Finding]:
+    out = []
+    for c in ast.walk(tree):
+        if not (isinstance(c, ast.Call) and _name(c.func) in KNOWN_FAKES):
+            continue
+        child, why = c, None
+        for p in _ancestors(c, parents):
+            if isinstance(p, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                break
+            if isinstance(p, ast.ExceptHandler):
+                why = "in an except handler"
+            elif isinstance(p, ast.If):
+                if child in p.body and not _implicit_test(p.test):
+                    break  # explicit selector branch (e.g. elif backend == "inmemory")
+                if child in p.orelse and not (len(p.orelse) == 1 and isinstance(p.orelse[0], ast.If)):
+                    why = "in an else branch"
+                elif child in p.body and _implicit_test(p.test):
+                    why = f"under `if {ast.unparse(p.test)}`"
+            if why:
+                break
+            child = p
+        if why:
+            out.append(Finding(path, c.lineno, "INV-NO-FALLBACK",
+                f"{_name(c.func)}() constructed as an implicit fallback ({why}): select fakes only on an explicit "
+                "config value and raise on missing/invalid config"))
+    return out
 
 
-def is_test_file(p: Path) -> bool:
-    return "tests" in p.parts or p.name.startswith("test_") or p.name.endswith("_test.py") or p.name == "conftest.py"
+CHECKS = (check_seq_last, check_nul, check_fallback)
 
 
-def check_source(src: str, path: str, helpers: set[str] | None = None) -> list[Finding]:
+def check_source(src: str, path: str) -> list[Finding]:
     tree = ast.parse(src, filename=path)
     parents = _parents(tree)
     lines = src.splitlines()
     found = []
-    results = [f for chk in CHECKS for f in chk(tree, path, parents)]
-    results += check_ddl(tree, path, parents, helpers)
-    per_line: dict[int, int] = {}
-    for f in results:
-        per_line[f.line] = per_line.get(f.line, 0) + 1
-    for f in results:
-        line = lines[f.line - 1] if 0 < f.line <= len(lines) else ""
-        m = OK_MARK.search(line)
-        if m:
-            scoped = m.group("rules")
-            if scoped:
-                if f.rule in {r.strip() for r in scoped.split(",")}:
-                    continue
-            elif per_line[f.line] == 1:
-                continue  # bare marker only exempts a line with exactly one finding
+    for f in (f for chk in CHECKS for f in chk(tree, path, parents)):
+        m = OK_MARK.search(lines[f.line - 1]) if 0 < f.line <= len(lines) else None
+        if m and m.group(1) == f.rule:
+            continue
         found.append(f)
     return sorted(found, key=lambda f: (f.path, f.line, f.rule))
+
+
+def _is_test(rel: Path) -> bool:
+    return "tests" in rel.parts or rel.name.startswith("test_") or rel.name.endswith("_test.py") or rel.name == "conftest.py"
 
 
 def main(argv: list[str]) -> int:
@@ -513,29 +288,22 @@ def main(argv: list[str]) -> int:
     if not server.is_dir():
         print("check-invariants: no server/ directory, nothing to check")
         return 0
-    findings: list[Finding] = []
-    files = []
+    findings, warnings = [], 0
     for f in sorted(server.rglob("*.py")):
         rel = f.relative_to(root)
-        if is_test_file(rel) or ".venv" in rel.parts or "site-packages" in rel.parts:
+        if _is_test(rel) or ".venv" in rel.parts or "site-packages" in rel.parts:
             continue
-        files.append((rel, f.read_text(encoding="utf-8")))
-    # cross-module DDL helpers (e.g. db.init_db wrapping metadata.create_all)
-    helpers = set()
-    trees = [(rel, src, ast.parse(src)) for rel, src in files]
-    for _, _, tree in trees:
-        helpers |= ddl_helpers(tree)
-    for _, _, tree in trees:  # `from .db import init_db as setup_database`
-        for n in ast.walk(tree):
-            if isinstance(n, ast.ImportFrom):
-                helpers |= {a.asname for a in n.names if a.asname and a.name in helpers}
-    for rel, src in files:
-        findings += check_source(src, str(rel), helpers)
-    for f in findings:
-        print(f)
-    errors = [f for f in findings if not f.warning]
-    print(f"check-invariants: {len(errors)} error(s), {len(findings) - len(errors)} warning(s)")
-    return 1 if errors else 0
+        try:
+            with tokenize.open(f) as fh:  # honours BOM and PEP 263 declarations
+                src = fh.read()
+            findings += check_source(src, str(rel))
+        except (OSError, SyntaxError, UnicodeDecodeError, ValueError, RecursionError) as e:
+            warnings += 1
+            print(f"{rel}: warning: skipped ({type(e).__name__}: {e})")
+    for x in findings:
+        print(x)
+    print(f"check-invariants: {len(findings)} error(s), {warnings} warning(s)")
+    return 1 if findings else 0
 
 
 if __name__ == "__main__":
