@@ -1,6 +1,6 @@
 """鉴权接口：邀请码 + 设备注册、refresh 轮换、登出。"""
 from fastapi import APIRouter, Depends
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.tokens import (
@@ -12,6 +12,7 @@ from app.common import new_id
 from app.db import get_db_session
 from app.deps import get_auth
 from app.errors import ApiError
+from app.jobs.queue import is_postgres
 from app.models import Device, InviteCode, User
 from app.schemas import LoginRequest, RefreshRequest
 from app.timeutil import as_utc, utcnow
@@ -75,13 +76,39 @@ async def refresh(body: RefreshRequest, session: AsyncSession = Depends(get_db_s
     if current is not None:
         if current.revoked_at is not None:
             raise ApiError(401, "unauthorized", "device revoked")
-        # 正常轮换
+        # PG 下先锁行串行化轮换（锁后复查吊销态）；SQLite 无行锁，仅靠条件更新
+        if is_postgres():
+            locked = (
+                await session.execute(
+                    select(Device)
+                    .where(Device.id == current.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            if locked is not None and locked.revoked_at is not None:
+                raise ApiError(401, "unauthorized", "device revoked")
+        # 轮换本身用条件更新原子完成：同一枚 token 并发刷新时只有一个能命中
         result = _token_pair(current.user_id, current.id)
-        current.prev_refresh_token_hash = current.refresh_token_hash
-        current.refresh_token_hash = hash_refresh_token(result["refresh_token"])
-        current.last_seen = utcnow()
-        await session.commit()
-        return result
+        rotated = await session.execute(
+            update(Device)
+            .where(
+                Device.id == current.id,
+                Device.refresh_token_hash == h,
+                Device.revoked_at.is_(None),
+            )
+            .values(
+                prev_refresh_token_hash=h,
+                refresh_token_hash=hash_refresh_token(result["refresh_token"]),
+                last_seen=utcnow(),
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if rotated.rowcount == 1:
+            await session.commit()
+            return result
+        # rowcount==0：token 已被并发请求换掉 → 落入下面的复用检测
+        await session.rollback()
 
     # 复用检测：匹配到上一枚 refresh → 吊销设备
     previous = (

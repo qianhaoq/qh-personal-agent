@@ -18,13 +18,19 @@ async def sync(
     session: AsyncSession = Depends(get_db_session),
     limit: int = Query(default=100, ge=1, le=500),
 ):
-    """返回 cursor 之后变化的 notes/reminders 与被删除的 id。cursor 为全局单调序列。"""
+    """返回 cursor 之后变化的 notes/reminders 与被删除的 id。cursor 为全局单调序列。
+
+    notes 与 reminders（含软删墓碑）合并为按 change_seq 升序的单一流分页：
+    两张表各取 limit+1 条，归并后统一截断到 limit，多出的那条只用来判断
+    has_more。若按表各自截断，一张表的热更新会把另一张表的变更挤出本页，
+    客户端按 cursor 续拉时会漏数据。
+    """
     notes = (
         await session.execute(
             select(Note)
             .where(Note.user_id == user_id, Note.change_seq > since)
             .order_by(Note.change_seq)
-            .limit(limit)
+            .limit(limit + 1)
         )
     ).scalars().all()
     reminders = (
@@ -32,23 +38,29 @@ async def sync(
             select(Reminder)
             .where(Reminder.user_id == user_id, Reminder.change_seq > since)
             .order_by(Reminder.change_seq)
-            .limit(limit)
+            .limit(limit + 1)
         )
     ).scalars().all()
 
-    deleted_notes = [n.id for n in notes if n.deleted_at is not None]
-    deleted_reminders = [r.id for r in reminders if r.deleted_at is not None]
-    live_notes = [note_to_dict(n) for n in notes if n.deleted_at is None]
-    live_reminders = [reminder_to_dict(r) for r in reminders if r.deleted_at is None]
+    # 合并流：(change_seq, 表序) 排序；表序只用于同 seq 时保持稳定顺序
+    merged = sorted(
+        [(n.change_seq, 0, n) for n in notes] + [(r.change_seq, 1, r) for r in reminders],
+        key=lambda t: (t[0], t[1]),
+    )
+    has_more = len(merged) > limit
+    page = merged[:limit]
 
-    max_seq = since
-    for item in (*notes, *reminders):
-        max_seq = max(max_seq, item.change_seq)
+    deleted_notes = [row.id for _, tag, row in page if tag == 0 and row.deleted_at is not None]
+    deleted_reminders = [row.id for _, tag, row in page if tag == 1 and row.deleted_at is not None]
+    live_notes = [note_to_dict(row) for _, tag, row in page if tag == 0 and row.deleted_at is None]
+    live_reminders = [
+        reminder_to_dict(row) for _, tag, row in page if tag == 1 and row.deleted_at is None
+    ]
 
     return {
-        "cursor": max_seq,
+        "cursor": page[-1][0] if page else since,
         "notes": live_notes,
         "reminders": live_reminders,
         "deleted": {"notes": deleted_notes, "reminders": deleted_reminders},
-        "has_more": len(notes) >= limit or len(reminders) >= limit,
+        "has_more": has_more,
     }

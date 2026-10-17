@@ -6,6 +6,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # 明显的占位符，只允许配合 SQLite 开发/测试使用
 DEFAULT_JWT_SECRET = "dev-insecure-secret-change-me"
+# .env.example 里的占位值（测试会读取 .env.example 校验与此常量一致）
+ENV_EXAMPLE_JWT_PLACEHOLDER = "change-me-to-a-long-random-secret"
+# 明显的占位/示例字样，出现在生产密钥里即拒绝（大小写不敏感）
+_INSECURE_SUBSTRINGS = ("change-me", "changeme", "example", "placeholder")
+# 生产密钥的最低强度：长度与不同字符数
+_MIN_SECRET_LENGTH = 32
+_MIN_SECRET_DISTINCT_CHARS = 16
 
 
 class Settings(BaseSettings):
@@ -49,14 +56,26 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _reject_insecure_jwt_secret_in_production(self) -> "Settings":
-        """生产（postgresql）禁止默认/过短 JWT_SECRET；SQLite 开发测试不受影响。"""
-        if self.database_url.startswith("postgresql") and (
-            self.jwt_secret == DEFAULT_JWT_SECRET or len(self.jwt_secret) < 32
-        ):
+        """生产（postgresql）下 JWT_SECRET 必须是强随机值；SQLite 开发测试不受影响。"""
+        if not self.database_url.startswith("postgresql"):
+            return self
+        secret = self.jwt_secret
+        problems: list[str] = []
+        if secret in (DEFAULT_JWT_SECRET, ENV_EXAMPLE_JWT_PLACEHOLDER):
+            problems.append("使用了默认/模板占位值")
+        lowered = secret.lower()
+        if any(word in lowered for word in _INSECURE_SUBSTRINGS):
+            problems.append("包含 change-me/changeme/example/placeholder 等占位字样")
+        if len(secret) < _MIN_SECRET_LENGTH:
+            problems.append(f"长度不足（{len(secret)} < {_MIN_SECRET_LENGTH}）")
+        if len(set(secret)) < _MIN_SECRET_DISTINCT_CHARS:
+            problems.append(f"不同字符数不足（{len(set(secret))} < {_MIN_SECRET_DISTINCT_CHARS}）")
+        if problems:
             raise ValueError(
-                "生产环境（DATABASE_URL 以 postgresql 开头）禁止使用默认或过短（<32 字节）"
-                f"的 JWT_SECRET（当前长度 {len(self.jwt_secret)}）："
-                "请设置 JWT_SECRET 环境变量为至少 32 字节的随机值（如 `openssl rand -hex 32`）"
+                "生产环境（DATABASE_URL 以 postgresql 开头）的 JWT_SECRET 不安全："
+                + "；".join(problems)
+                + "。请设置 JWT_SECRET 为随机值（如 `python -c \"import secrets;"
+                  "print(secrets.token_urlsafe(48))\"`）"
             )
         return self
 

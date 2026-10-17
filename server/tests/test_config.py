@@ -1,11 +1,15 @@
-"""jwt_secret 生产校验：postgresql 下默认值/过短即拒绝，SQLite 不受影响。"""
+"""jwt_secret 生产校验：postgresql 下占位/弱值即拒绝，SQLite 不受影响。"""
+import pathlib
+import secrets
+
 import pytest
 from pydantic import ValidationError
 
-from app.config import DEFAULT_JWT_SECRET, Settings
+from app.config import DEFAULT_JWT_SECRET, ENV_EXAMPLE_JWT_PLACEHOLDER, Settings
 
 PG_URL = "postgresql+asyncpg://u:p@localhost/db"
-GOOD_SECRET = "x" * 32  # 满足 HS256 建议的最短长度
+# 长度与不同字符数都达标，且不含占位字样
+GOOD_SECRET = "0123456789abcdefghijklmnopqrstuvwxyzAB"
 
 
 def test_production_default_secret_rejected():
@@ -13,12 +17,45 @@ def test_production_default_secret_rejected():
         Settings(database_url=PG_URL, jwt_secret=DEFAULT_JWT_SECRET)
 
 
+def test_production_env_example_placeholder_rejected():
+    with pytest.raises(ValidationError, match="JWT_SECRET"):
+        Settings(database_url=PG_URL, jwt_secret=ENV_EXAMPLE_JWT_PLACEHOLDER)
+
+
+def test_env_example_placeholder_matches_template():
+    """ENV_EXAMPLE_JWT_PLACEHOLDER 必须与 server/.env.example 里的占位值一致。"""
+    env_example = pathlib.Path(__file__).resolve().parent.parent / ".env.example"
+    for line in env_example.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line.startswith("JWT_SECRET="):
+            assert line.split("=", 1)[1] == ENV_EXAMPLE_JWT_PLACEHOLDER
+            return
+    pytest.fail(".env.example 中未找到 JWT_SECRET 行")
+
+
+def test_production_insecure_substring_rejected():
+    for bad in ("a" * 40 + "-change-me", "Example" + "x" * 40, "PLACEHOLDER" + "y" * 40):
+        with pytest.raises(ValidationError, match="JWT_SECRET"):
+            Settings(database_url=PG_URL, jwt_secret=bad)
+
+
 def test_production_short_secret_rejected():
     with pytest.raises(ValidationError, match="JWT_SECRET"):
         Settings(database_url=PG_URL, jwt_secret="short")
 
 
-def test_production_strong_secret_ok():
+def test_production_single_char_secret_rejected():
+    # 长度够但字符多样性不足：暴力枚举空间太小
+    with pytest.raises(ValidationError, match="JWT_SECRET"):
+        Settings(database_url=PG_URL, jwt_secret="a" * 40)
+
+
+def test_production_token_urlsafe_secret_ok():
+    secret = secrets.token_urlsafe(48)
+    assert Settings(database_url=PG_URL, jwt_secret=secret).jwt_secret == secret
+
+
+def test_production_fixed_strong_secret_ok():
     assert Settings(database_url=PG_URL, jwt_secret=GOOD_SECRET).jwt_secret == GOOD_SECRET
 
 

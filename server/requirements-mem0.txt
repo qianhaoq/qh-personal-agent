@@ -1,2 +1,3 @@
-# 可选：mem0 记忆后端。未安装时系统自动退化为 inmemory，不影响其他功能。
+# mem0 记忆后端（生产必装，Dockerfile 已在镜像里安装）。
+# MEMORY_BACKEND=mem0 而未安装 mem0ai 时启动会直接报 ImportError，不静默退化。
 mem0ai>=0.1.0

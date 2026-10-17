@@ -1,7 +1,7 @@
 """mem0 后端适配器。
 
-- mem0ai 的 import 放在函数/构造内，未安装时 app.memory.base 会退化为 InMemoryStore，
-  不影响其他代码。
+- mem0ai 的 import 放在构造内：MEMORY_BACKEND=mem0 而未安装 mem0ai 时，
+  构造直接抛 ImportError（生产配置错误应当暴露，见 app.memory.base）。
 - 向量库 pgvector 与业务库同一个 PostgreSQL 实例；mem0 内部的 LLM/embedding 走
   OpenAI 兼容配置。
 - mem0 是同步库，这里用 asyncio.to_thread 包一层。
@@ -97,10 +97,11 @@ class Mem0Store:
         return True
 
     async def delete_by_note(self, user_id: str, note_id: str) -> int:
+        # list() 返回 MemoryItem（dataclass），按属性访问而不是 dict
         count = 0
         for item in await self.list(user_id):
-            if item.get("note_id") == note_id:
-                await self.delete(user_id, item["id"])
+            if item.note_id == note_id:
+                await self.delete(user_id, item.id)
                 count += 1
         return count
 

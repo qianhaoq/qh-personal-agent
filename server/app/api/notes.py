@@ -2,7 +2,7 @@
 import json
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common import allocate_seq, new_id
@@ -108,19 +108,45 @@ async def patch_note(
     user_id: str = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_db_session),
 ):
+    # 先读只做存在性/归属检查；真正的乐观锁靠下面的条件更新原子完成，
+    # 避免“读到 rev → 修改 → 写回”两步之间被并发请求插队
     note = await _get_owned_note(session, user_id, note_id)
-    if body.rev != note.rev:
+    if body.text is None or body.text == note.text:
+        return {"note": note_to_dict(note), "rev": note.rev}
+
+    result = await session.execute(
+        update(Note)
+        .where(
+            Note.id == note_id,
+            Note.user_id == user_id,
+            Note.rev == body.rev,
+            Note.deleted_at.is_(None),
+        )
+        .values(
+            text=body.text,
+            rev=Note.rev + 1,
+            status="uploaded",
+            change_seq=await allocate_seq(session),
+            updated_at=utcnow(),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount == 0:
+        await session.rollback()
+        # 复查区分 404（被并发删除/不存在）与 409（rev 已被并发修改）
+        current = (
+            await session.execute(select(Note).where(Note.id == note_id, Note.user_id == user_id))
+        ).scalar_one_or_none()
+        if current is None or current.deleted_at is not None:
+            raise ApiError(404, "not_found", "笔记不存在")
         raise ApiError(409, "conflict", "版本冲突，请拉取最新版本后重试")
-    if body.text is not None and body.text != note.text:
-        note.text = body.text
-        note.rev += 1
-        note.status = "uploaded"
-        note.change_seq = await allocate_seq(session)
-        note.updated_at = utcnow()
-        # 旧的整理产物作废，重新入队
-        await _invalidate_outputs(session, note)
-        await enqueue(session, "organize_note", {"note_id": note.id})
-        await session.commit()
+
+    # 旧的整理产物作废，重新入队（带最新 rev，整理侧据此丢弃过期任务）
+    await _invalidate_outputs(session, note)
+    await enqueue(session, "organize_note", {"note_id": note_id, "rev": body.rev + 1})
+    await session.commit()
+    # expire_on_commit=False：显式刷新让 note_to_dict 读到条件更新后的行
+    await session.refresh(note)
     return {"note": note_to_dict(note), "rev": note.rev}
 
 

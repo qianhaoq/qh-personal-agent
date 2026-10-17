@@ -43,15 +43,11 @@ def get_memory_store() -> MemoryStore:
 
         backend = get_settings().memory_backend
         if backend == "mem0":
-            try:
-                from app.memory.mem0_store import Mem0Store
+            # mem0ai 未安装时这里直接抛 ImportError：配置成 mem0 的环境静默退化
+            # 成 inmemory 会让记忆悄悄丢失，错误必须暴露出来
+            from app.memory.mem0_store import Mem0Store
 
-                _store = Mem0Store()
-            except ImportError:
-                # mem0ai 未安装：退化为内存实现，保证其他功能可用
-                from app.memory.inmemory import InMemoryStore
-
-                _store = InMemoryStore()
+            _store = Mem0Store()
         else:
             from app.memory.inmemory import InMemoryStore
 
