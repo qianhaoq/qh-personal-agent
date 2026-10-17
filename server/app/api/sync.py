@@ -66,7 +66,8 @@ async def _page_keys(
 
 @router.get("")
 async def sync(
-    since: int = Query(default=0, ge=0),
+    # change_seq 是 int8：上界钉住，超大整数绑定 SQL 会 OverflowError → 500
+    since: int = Query(default=0, ge=0, le=2**63 - 1),
     user_id: str = Depends(get_current_user_id),
     limit: int = Query(default=100, ge=1, le=500),
 ):

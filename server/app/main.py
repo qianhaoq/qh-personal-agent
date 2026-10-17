@@ -11,6 +11,7 @@ from app.errors import (
     ApiError,
     api_error_handler,
     http_exception_handler,
+    recursion_error_handler,
     unhandled_exception_handler,
     validation_exception_handler,
 )
@@ -50,6 +51,8 @@ def create_app() -> FastAPI:
     app.add_exception_handler(ApiError, api_error_handler)
     app.add_exception_handler(StarletteHTTPException, http_exception_handler)
     app.add_exception_handler(RequestValidationError, validation_exception_handler)
+    # 超深嵌套 JSON 解析期的 RecursionError → 422（见 app.errors）
+    app.add_exception_handler(RecursionError, recursion_error_handler)
     app.add_exception_handler(Exception, unhandled_exception_handler)
 
     # NUL 拒绝中间件（INV-7）：path/query 解码后含 \x00 → 422，不进路由

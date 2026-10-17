@@ -114,7 +114,8 @@ async def list_notes(
     user_id: str = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_db_session),
     limit: int = Query(default=20, ge=1, le=100),
-    cursor: int = Query(default=0, ge=0),
+    # change_seq 是 int8：上界钉住，超大整数绑定 SQL 会 OverflowError → 500
+    cursor: int = Query(default=0, ge=0, le=2**63 - 1),
 ):
     rows = (
         await session.execute(

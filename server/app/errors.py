@@ -41,3 +41,13 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     return JSONResponse(status_code=500, content=error_body("internal_error", "internal server error"))
+
+
+async def recursion_error_handler(request: Request, exc: RecursionError) -> JSONResponse:
+    """超深嵌套的 JSON 在解析阶段就炸掉解释器递归栈（json 的 C scanner
+    递归下降，schema 层的深度限制根本没机会看到）：拦成 422 而不是 500
+    （4c1c9be P2-4）。常规深度由 schemas 的 _MAX_ASR_DEPTH 拒绝，这里是
+    恶意超深体的兜底。"""
+    return JSONResponse(
+        status_code=422, content=error_body("validation_error", "请求体嵌套过深")
+    )

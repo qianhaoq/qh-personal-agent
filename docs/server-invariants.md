@@ -176,30 +176,40 @@ mem0 版本钉死：`server/requirements-mem0.txt` 写 `mem0ai==2.2.1`（4c1c9be
 - `test_extract_finalize_marks_failed_only_at_enqueued_rev`
 - `test_memory_sync_finalize_failure_marks_memory_status_not_note_status`
 
-### INV-7 所有外部输入拒绝 NUL
+### INV-7 外部输入硬化：NUL 拒绝 + 病态输入一律 4xx
 
-**陈述**：任何可能进入数据库（或被拼进 LLM prompt / JSON 序列化）的外部字符串，含 `\x00` 时必须得到 422，而不是 PG 编码错误 500。统一方案 = **中间件 + schemas 双层**：
+**陈述**：任何可能进入数据库（或被拼进 LLM prompt / JSON 序列化）的外部输入，含 `\x00` 时必须得到 422，而不是 PG 编码错误 500。同类「编码/绑定/换算必炸」的病态输入也不允许 500（4c1c9be P2-4，全部拦成 400/422）：lone surrogate（UTF-8 编码失败）、非法 UTF-8 请求体（解码失败）、超深嵌套 JSON（解析器递归栈炸裂）、超大整数（SQL 绑定 OverflowError）、换算/本地化成 UTC 越界的极端日期（astimezone OverflowError）。统一方案 = **中间件 + schemas + 异常兜底三层**：
 
-1. **中间件**（新 `app/middleware.py`，注册于 `create_app`）：对每个请求的 URL path 与 query string **解码后**检查 `\x00`（`request.url.path` 与 `query_params` 各值），命中直接返回 422 `{"error":{"code":"validation_error",...}}`，不进入路由。覆盖所有路由的 path/query 参数。
-2. **schemas**（既有 `NoNulStr`/`reject_nul` 保留）：所有请求体字符串字段；path/query 参数声明处再加 `Annotated[NoNulStr, ...]`（如 `note_id`）作第二道防线。
+1. **中间件**（`app/middleware.py`，注册于 `create_app`）：对每个请求的 URL path 与 query string **解码后**检查 `\x00`（`request.url.path` 与 `query_params` 各值），命中直接返回 422 `{"error":{"code":"validation_error",...}}`，不进入路由。覆盖所有路由的 path/query 参数。
+2. **schemas**（既有 `NoNulStr`/`reject_nul` 保留）：所有请求体字符串字段；path/query 参数声明处再加 `Annotated[NoNulStr, ...]`（如 `note_id`）作第二道防线。在此之上：typed str 字段的 lone surrogate 由 pydantic 自带拒绝（string_unicode）；`NoteCreate.asr` 走 `_reject_invalid_unicode_everywhere` 递归（NUL + surrogate + 嵌套深度 ≤ `_MAX_ASR_DEPTH=16`）；`SafeDatetime`（`NoteCreate.recorded_at`/`AskRequest.client_time`）保证 aware 换算 UTC、naive 按最坏 IANA 偏移（±14h）本地化后仍可表示；`NotePatch.rev` 约束在 int4 范围。
+3. **异常兜底**（`app/errors.py::recursion_error_handler`，注册于 `create_app`）：超深嵌套在 json 解析阶段就 RecursionError（schema 校验根本看不到），拦成 422；非法 UTF-8 请求体由 Starlette 解码失败路径返回 400。
 
 **覆盖面清单**：
 
 | 入口 | 机制 |
 | --- | --- |
-| body：LoginRequest/RefreshRequest/NoteCreate/NotePatch/AskRequest 全部字符串字段 | schemas `NoNulStr`（既有） |
-| body：NoteCreate.asr（dict 任意层级键/值） | `_reject_nul_everywhere` 递归（既有） |
+| body：LoginRequest/RefreshRequest/NoteCreate/NotePatch/AskRequest 全部字符串字段 | schemas `NoNulStr`（既有；surrogate 由 pydantic str 校验拒绝） |
+| body：NoteCreate.asr（dict 任意层级键/值） | `_reject_invalid_unicode_everywhere` 递归：NUL + lone surrogate + 深度 ≤16 |
+| body：recorded_at / client_time | `SafeDatetime`：换算/本地化 UTC 后必须可表示 |
+| body：NotePatch.rev | `Field(ge=1, le=int4 上界)` |
+| body：超深嵌套 JSON / 非法 UTF-8 字节 | RecursionError 处理器 422 / Starlette 解码失败 400 |
 | path：`/v1/notes/{note_id}` 等 | 中间件 + 参数 `NoNulStr` 注解（修 C8） |
-| query：`/v1/search?q=`、`/v1/sync?since=&limit=`、`/v1/notes?cursor=&limit=` | 中间件（q 已有 `NoNulStr`，since/limit 为 int） |
+| query：`/v1/search?q=`、`/v1/sync?since=&limit=`、`/v1/notes?cursor=&limit=` | 中间件（q 已有 `NoNulStr`）；since/cursor 补 `le=int8 上界`（超大整数绑定 OverflowError） |
 | header | 当前**无任何 header 值入库**（authorization 只做 JWT 解析，不落库）；规则：未来任何从 header 取值入库的字段必须走 `NoNulStr`（自查清单项） |
 
-**保证代码**：`app/middleware.py`（新）、`app/main.py::create_app`（注册）、`app/schemas.py`、`app/api/notes.py`（path 参数注解）。
+**保证代码**：`app/middleware.py`、`app/main.py::create_app`（注册）、`app/schemas.py`、`app/errors.py`、`app/api/notes.py`（path 参数注解、cursor 上界）、`app/api/sync.py`（since 上界）。
 
 **验证测试**：
 - `test_nul_in_path_param_422`（`/v1/notes/n%00x` 的 GET/PATCH/DELETE）
 - `test_nul_in_query_param_422`（`/v1/search?q=a%00b` 等）
 - `test_nul_middleware_covers_all_routes`（遍历 app.routes，把每个含参路径注入 `%00`，断言 422 而非 500）
 - 既有 `test_nul_rejected_in_note_strings_422` / `test_nul_rejected_in_auth_strings_422` / `test_nul_rejected_in_ask_and_search_422` 系列保留
+- `test_lone_surrogate_in_body_rejected_422`（text / ask text / asr 键与值）
+- `test_invalid_utf8_body_rejected_4xx`
+- `test_deeply_nested_asr_over_depth_limit_422`（限内 202、超限 422）
+- `test_absurdly_deep_body_recursion_guard_422`（解析期 RecursionError → 422）
+- `test_huge_int_inputs_422`（PATCH rev / sync since / notes cursor）
+- `test_extreme_datetime_inputs_422`（aware 换算越界、naive 本地化越界；边界内 aware 极值仍 202）
 
 ### INV-8 登录：device 原子 upsert
 
@@ -300,7 +310,7 @@ mem0 版本钉死：`server/requirements-mem0.txt` 写 `mem0ai==2.2.1`（4c1c9be
 | INV-4 | test_patch_and_delete_never_touch_memory_store_directly | 双后端 |
 | INV-5 | test_memory_sync_writes_memory_with_source_rev_and_marks_synced；test_memory_sync_on_deleted_note_removes_memory；test_memory_sync_on_unorganized_note_clears_stale_memory_without_add；test_memory_sync_requeues_and_deletes_only_own_ids_on_rev_change；test_memory_sync_converges_after_delete_during_add；test_memory_sync_worker_killed_mid_run_reclaimed_converges；test_memory_sync_attempts_exhausted_marks_failed_only_without_newer_job | 双后端语义；交错窗口用 DelayedAddStore 类时间注入复现，无需 PG |
 | INV-6 | test_stale_worker_finalize_ignored_after_lease_reclaimed_extract、test_stale_worker_finalize_ignored_after_lease_reclaimed_memory_sync；test_extract_finalize_marks_failed_only_at_enqueued_rev；test_memory_sync_finalize_failure_marks_memory_status_not_note_status | 双后端 |
-| INV-7 | test_nul_in_path_param_422；test_nul_in_query_param_422；test_nul_middleware_covers_all_routes | 双后端 |
+| INV-7 | test_nul_in_path_param_422；test_nul_in_query_param_422；test_nul_middleware_covers_all_routes；test_lone_surrogate_in_body_rejected_422；test_invalid_utf8_body_rejected_4xx；test_deeply_nested_asr_over_depth_limit_422；test_absurdly_deep_body_recursion_guard_422；test_huge_int_inputs_422；test_extreme_datetime_inputs_422 | 双后端 |
 | INV-8 | test_login_device_bound_to_other_user_403；test_concurrent_login_same_device_linearizable_pg；test_concurrent_first_login_same_device_no_integrity_error | 并发项 PG 真并发 |
 | INV-9 | test_init_db_concurrent_no_error_pg；test_lifespan_skips_create_all_on_postgres；test_init_db_sqlite_creates_tables | 并发项 PG |
 | INV-10 | test_openai_missing_api_key_rejected、test_openai_missing_base_url_rejected、test_openai_missing_model_rejected；test_openai_all_three_configured_ok；test_default_timezone_invalid_rejected；test_default_timezone_valid_ok | 纯配置，无 DB |
