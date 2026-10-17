@@ -1,0 +1,70 @@
+# Example caller for the reusable Auto Merge — copy to
+# YOUR_REPO/.github/workflows/auto-merge.yml.
+#
+# Check name produced by this example (job id `auto-merge`):
+#   - "auto-merge / Auto Merge"
+# (That check is intentionally NOT in required_checks — a run cannot
+# gate itself.)
+#
+# workflow_run fires when the named workflows complete. Note:
+#   - workflow_run only triggers from the default branch, once this file
+#     is merged there.
+#   - The names below must match the `name:` of YOUR repo's caller
+#     workflows (see examples/ci.yml, codex-gate.yml, qa-gate.yml).
+#   - Runs those workflows start from `push` are skipped by the reusable
+#     workflow; runs from `pull_request` are matched to a PR by head SHA;
+#     every other origin (pull_request_target / issue_comment / review /
+#     schedule / dispatch) triggers a sweep of ALL open non-draft PRs
+#     targeting the default branch (cap 30).
+#
+# Concurrency is the caller's job (a reusable workflow cannot own the
+# caller's event stream). Use exactly the group below with
+# cancel-in-progress: false — events QUEUE behind an in-flight
+# evaluation of the same PR (or behind another sweep) instead of
+# cancelling it, so a merge in progress is never interrupted.
+# Per-PR where the PR is known: pull_request_review /
+# workflow_dispatch(pr_number) / workflow_run whose triggering event was
+# `pull_request` (head SHA identifies the PR). Everything else shares
+# the `auto-merge-sweep` group.
+
+name: Auto Merge
+
+on:
+  workflow_run:
+    workflows: ["CI", "Codex Review Gate", "QA Gate"]
+    types: [completed]
+  pull_request_review:
+    types: [submitted]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to re-evaluate (e.g. after resolving review threads)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+  actions: read
+
+concurrency:
+  group: ${{ (github.event_name == 'workflow_dispatch' && format('auto-merge-pr-{0}', github.event.inputs.pr_number)) || (github.event_name == 'pull_request_review' && format('auto-merge-pr-{0}', github.event.pull_request.number)) || (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request' && format('auto-merge-pr-{0}', github.event.workflow_run.head_sha)) || 'auto-merge-sweep' }}
+  cancel-in-progress: false
+
+jobs:
+  auto-merge:
+    uses: qianhaoq/devflow-gates/.github/workflows/auto-merge.yml@1a6a4a85728b0c1f3482a52020f94cb8208c73f5  # devflow-gates main @ 1a6a4a8 (pinned; bump deliberately)
+    with:
+      # Exact check-run names = "<caller job name> / <called job name>"
+      # from YOUR ci.yml / codex-gate.yml / qa-gate.yml callers. "ci / Secret Scan"
+      # is required so a red gitleaks run can never be auto-merged.
+      required_checks: |
+        ci / Build & Test
+        codex / Codex Review Gate
+        ci / Secret Scan
+        qa / QA Gate
+      merge_method: squash
+      # Copilot quota is exhausted (2026-10): no Copilot dependency. Same switch as
+      # ai-devflow-weekly: set repo var DISABLE_COPILOT_REVIEW=false to require it again.
+      require_copilot: ${{ vars.DISABLE_COPILOT_REVIEW == 'false' }}

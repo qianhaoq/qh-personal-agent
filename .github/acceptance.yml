@@ -1,0 +1,21 @@
+# Acceptance Gate config — all keys: devflow-gates templates/acceptance.yml.
+# M1: observe-only (reports in a sticky PR comment, never blocks).
+mode: observe
+
+setup:
+  python_version: '3.12'
+
+metrics:
+  tests:
+    # Placeholder: wire server tests + coverage once server/ has code, e.g.
+    # command: 'cd server && pip install -e .[dev] && pytest --cov=app --cov-report=lcov:../coverage.lcov'
+    command: ''
+    threshold: 70
+  tests_changed:
+    exempt_label: no-test-needed
+  size:
+    threshold: 600
+  evidence:
+    heading_regex: '自测|验收|Test plan|QA'
+  ai_review:
+    check_name: 'codex / Codex Review Gate'

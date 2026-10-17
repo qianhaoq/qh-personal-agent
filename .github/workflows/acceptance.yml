@@ -1,0 +1,19 @@
+# Acceptance Gate (M1, observe-only) from qianhaoq/devflow-gates.
+# Produces "acceptance / Acceptance Gate" — NOT a required check in M1.
+# Config: .github/acceptance.yml. Must stay on pull_request (runs PR code).
+
+name: Acceptance
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, edited, labeled, unlabeled]
+
+permissions: {}
+
+jobs:
+  acceptance:
+    permissions:
+      contents: read
+      pull-requests: write   # sticky report comment
+      checks: read           # read the Codex gate result
+    uses: qianhaoq/devflow-gates/.github/workflows/acceptance.yml@1a6a4a85728b0c1f3482a52020f94cb8208c73f5  # devflow-gates main @ 1a6a4a8 (pinned)

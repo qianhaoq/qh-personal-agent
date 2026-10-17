@@ -1,0 +1,93 @@
+# Example caller for the reusable Codex Review Gate — copy to
+# YOUR_REPO/.github/workflows/codex-gate.yml.
+#
+# Required-check name produced by this example (job id `codex`):
+#   - "codex / Codex Review Gate"
+#
+# pull_request_target keeps the workflow YAML on the trusted base branch
+# while evaluating untrusted PRs; the reusable gate is read-only and
+# never checks out the PR head.
+#
+# NOTE on thread resolution: `pull_request_review_thread` is a WEBHOOK
+# event only — GitHub Actions cannot trigger a workflow with it (a file
+# that lists it under `on:` is rejected/never fires). Resolved Codex
+# threads are picked up by the scheduled refresh below, or manually via
+# workflow_dispatch (pr_number below) / a re-run of a
+# pull_request_target-originated Gate job.
+#
+# Schedule (*/15): a scheduled run's own conclusion does NOT attach to
+# any PR head check (neither does workflow_dispatch), so the schedule
+# path never evaluates. The reusable workflow's "Codex Gate Refresh" job
+# instead re-runs the most recent FAILED pull_request_target-originated
+# Gate run for every open non-draft PR whose gate check is failing
+# (actions.reRunWorkflowFailedJobs) — a re-run keeps the original
+# pull_request_target event, so the fresh conclusion re-attaches to the
+# PR head check. That API needs `actions: write`, granted here on the
+# schedule-path job ONLY (`codex-refresh`); the evaluator job `codex`
+# stays read-only. Expect failing PRs to be re-evaluated every 15
+# minutes until green or closed.
+#
+# Concurrency: one evaluation per PR; a stale in-flight run is cancelled
+# by the newer event. Schedule runs fall back to a unique run_id group
+# (nothing to cancel).
+
+# PERMISSIONS: GitHub validates the permissions of EVERY job in a called
+# workflow against the calling job's ceiling, even jobs skipped by `if`.
+# The reusable file contains both the evaluator (issues: read) and the
+# refresh job (actions: write), so both caller jobs grant the union. The
+# callee still narrows each job's own token (evaluator stays read-only).
+#
+name: Codex Review Gate
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, labeled, unlabeled]
+  issue_comment:
+    types: [created, edited]
+  pull_request_review:
+    types: [submitted]
+  pull_request_review_comment:
+    types: [created, edited]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to evaluate (e.g. after resolving Codex threads)'
+        required: true
+        type: string
+  schedule:
+    - cron: '*/15 * * * *'
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+
+concurrency:
+  # pull_request_target runs get their own group: only they attach the
+  # required check to the PR head, so an issue_comment / review event must
+  # never cancel an in-flight target run (it would leave the check cancelled).
+  group: codex-gate-pr-${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pr_number || github.run_id }}-${{ github.event_name == 'pull_request_target' && 'target' || 'aux' }}
+  cancel-in-progress: true
+
+jobs:
+  codex:
+    if: github.event_name != 'schedule'
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      actions: write
+    uses: qianhaoq/devflow-gates/.github/workflows/codex-gate.yml@1a6a4a85728b0c1f3482a52020f94cb8208c73f5  # devflow-gates main @ 1a6a4a8 (pinned; bump deliberately)
+    with:
+      wait_minutes: 20
+
+  # Schedule path only — see the header note. actions: write is scoped to
+  # this job so the evaluator above never holds it.
+  codex-refresh:
+    if: github.event_name == 'schedule'
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      actions: write
+    uses: qianhaoq/devflow-gates/.github/workflows/codex-gate.yml@1a6a4a85728b0c1f3482a52020f94cb8208c73f5  # devflow-gates main @ 1a6a4a8 (pinned; bump deliberately)

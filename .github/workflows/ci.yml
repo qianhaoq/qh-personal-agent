@@ -1,0 +1,29 @@
+# CI — reusable build/test + secret scan from qianhaoq/devflow-gates.
+# Required checks: "ci / Build & Test", "ci / Secret Scan".
+# Trigger on pull_request (NOT pull_request_target): Build & Test runs PR code.
+#
+# Skeleton-friendly: scripts/ci-test.sh runs the server checks only when
+# server/ has Python code and the Gradle build only when android/ has a
+# Gradle project, so the empty skeleton passes.
+
+name: CI
+
+on:
+  pull_request:
+    # edited: base retarget re-runs CI (not filtered: a skipped required check counts as passing).
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: qianhaoq/devflow-gates/.github/workflows/ci.yml@1a6a4a85728b0c1f3482a52020f94cb8208c73f5  # devflow-gates main @ 1a6a4a8 (pinned; bump deliberately)
+    with:
+      python_version: '3.12'
+      setup_command: ''
+      test_command: 'bash scripts/ci-test.sh'
+      working_directory: '.'
