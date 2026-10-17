@@ -98,9 +98,12 @@ memory_sync(note_id)     不带 rev。短读事务取 note 当前状态 →（�
 
 **保证代码**：`app/memory/base.py::MemoryStore.add`（签名扩为 `add(user_id, text, *, note_id, source_rev)`，实现写 metadata）、`app/memory/mem0_store.py`、`app/memory/inmemory.py`（MemoryItem 增 source_rev）、唯一写入口 `app/pipeline/memory_sync.py`（INV-4/5 保证只有它写）。
 
+mem0 版本钉死：`server/requirements-mem0.txt` 写 `mem0ai==2.2.1`（4c1c9be P2-3）。2.x 收回了 `search`/`get_all` 的顶层 `user_id` 参数（作用域只认 `filters={"user_id": ...}`，旧调用直接 ValueError）、`search` 条数参数是 `top_k`（无 `limit`）、`get_all` 默认 `top_k=20` 会截断全量列举（`delete_by_note` 依赖全量，适配层显式放大）、`add` 的 infer 主路径返回裸 list 且不回显 metadata（归属信息由适配层用自己的入参补齐）、`delete` 对不存在的 id 抛 ValueError（按已删除吞掉，幂等）。适配集中在 `app/memory/mem0_store.py`。
+
 **验证测试**：
 - `test_memory_metadata_contains_note_id_and_source_rev`
 - `test_no_stale_rev_memory_after_repatch`（PATCH 重整理后 /v1/search 不再命中旧文本；C9 的端到端回归）
+- mem0 2.2.1 调用形状（mock 按 2.2.1 签名建模、传旧参数即抛）：`test_search_scopes_user_via_filters_and_top_k`、`test_get_all_scopes_user_via_filters_and_avoids_truncation`、`test_add_returns_all_written_items_with_note_id_and_rev`、`test_delete_by_ids_delegates_each_id_and_tolerates_missing`、`test_delete_all_delegates_with_top_level_user_id`
 
 ### INV-4 谁可以删/写记忆
 
