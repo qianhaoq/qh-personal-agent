@@ -11,19 +11,19 @@ A false positive on legitimate code, or a crash, is a P1 against the checker.
 Source of truth: docs/server-invariants.md (lands with PR #2; its rules win).
 Rationale and examples: docs/agent-pitfalls.md.
 
-Rules:
-  INV-SEQ-LAST     In the transaction that calls allocate_seq(sess), no DB write
+Rules (checker id -> docs/server-invariants.md id):
+  INV-SEQ-LAST     [INV-1 锁顺序] In the transaction that calls allocate_seq(sess), no DB write
                    on that same session after it: sess.add/add_all/merge/delete/
                    execute(...) (except an UPDATE that only sets change_seq/
                    updated_at), or enqueue(sess, ...). Scope ends at sess.commit()/
                    rollback() or the end of the enclosing `with ... begin()` block.
                    Also: allocate_seq evaluated inside .values() that writes other columns.
-  INV-NUL          FastAPI path params typed as bare str (str, str | None,
+  INV-NUL          [INV-7 外部输入硬化] FastAPI path params typed as bare str (str, str | None,
                    Optional[str], Annotated[str, ...] without a NUL-safe constraint).
                    Accepted: NoNulStr; Annotated metadata with reject_nul/AfterValidator,
                    or any constraint call with pattern=/regex= (Path, Query, StringConstraints,
                    Field, constr); non-str converters ({id:int}).
-  INV-NO-FALLBACK  A known fake (MockLLM, FakeLLM, InMemoryStore) constructed as an
+  INV-NO-FALLBACK  [INV-10 配置完备性] A known fake (MockLLM, FakeLLM, InMemoryStore) constructed as an
                    implicit fallback: inside an `except` handler, a bare `else:`
                    branch, or an `if` whose test is a negation / `is None` /
                    empty-string check (e.g. missing key).
@@ -51,6 +51,7 @@ SESSION_WRITES = {"add", "add_all", "merge", "delete", "execute"}
 TXN_END = {"commit", "rollback"}
 KNOWN_FAKES = {"MockLLM", "FakeLLM", "InMemoryStore"}
 HTTP_METHODS = {"get", "post", "put", "patch", "delete", "head", "options", "api_route"}
+SOURCE_INV = {"INV-SEQ-LAST": "INV-1", "INV-NUL": "INV-7", "INV-NO-FALLBACK": "INV-10"}
 OK_MARK = re.compile(r"#\s*invariant-ok:\s*(INV-[A-Z-]+)\s+\S")
 
 
@@ -62,7 +63,9 @@ class Finding:
     msg: str
 
     def __str__(self) -> str:
-        return f"{self.path}:{self.line}: error [{self.rule}] {self.msg} (docs/agent-pitfalls.md#{self.rule.lower()})"
+        inv = SOURCE_INV[self.rule]
+        return (f"{self.path}:{self.line}: error [{self.rule} / {inv}] {self.msg} "
+                f"(docs/server-invariants.md {inv}; docs/agent-pitfalls.md#{self.rule.lower()})")
 
 
 def _name(n: ast.AST) -> str | None:

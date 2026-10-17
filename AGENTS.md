@@ -34,7 +34,7 @@
 ## 改 server 前必读 / 自检清单
 
 改 `server/` 之前（含修 review 意见），先读完以下两份：
-- [docs/server-invariants.md](docs/server-invariants.md)：服务端不变量，事实来源。随 PR #2 落地，落地前以 #2 中本文件「写代码」各条为准；冲突时以它为准。
+- [docs/server-invariants.md](docs/server-invariants.md)：服务端不变量 INV-1..INV-10，事实来源（随 PR #2 落地）；冲突时以它为准。
 - [docs/agent-pitfalls.md](docs/agent-pitfalls.md)：反复踩的坑和正反例。
 
 提交前逐条自检：
@@ -49,7 +49,7 @@
 
 Codex / 评审 bot 评审本仓 PR 时：
 
-- 以 docs/server-invariants.md（随 #2 落地）为准检查 server 改动。发现违反时注明是哪一条，并检查同一类模式在 diff 之外是否还有。
+- 以 docs/server-invariants.md（INV-1..INV-10，随 #2 落地）为准检查 server 改动。发现违反时注明 INV 编号，并检查同一类模式在 diff 之外是否还有。
 - 重点看 docs/agent-pitfalls.md 的高发类别。
 - 分级口径与 .github/copilot-instructions.md 一致：
   - CI 红灯为 P1（造成生产事故时才算 P0）；
