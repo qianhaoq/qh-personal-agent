@@ -99,6 +99,8 @@ class Settings(BaseSettings):
     # mem0 的 embedding 单独配置（可以和 LLM 不同源）
     mem0_embedding_base_url: str = ""
     mem0_embedding_model: str = ""
+    # 缺省回落 LLM_API_KEY（共用 OpenAI 兼容源时不用重复填）
+    mem0_embedding_api_key: str = ""
 
     # 流水线
     default_timezone: str = "Asia/Shanghai"
@@ -204,6 +206,26 @@ class Settings(BaseSettings):
         if missing:
             raise ValueError(
                 "LLM_PROVIDER=openai 必须同时设置 " + "、".join(missing) + "（缺任一项启动即失败，不会静默回落）"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _require_embedding_key_when_customized(self) -> "Settings":
+        """INV-10.5（threads6 P2，任何环境）：embedding 走自定义源
+        （MEM0_EMBEDDING_BASE_URL / MEM0_EMBEDDING_API_KEY 任一设置）时，
+        解析出的凭据（MEM0_EMBEDDING_API_KEY，缺省回落 LLM_API_KEY）必须
+        非空——mem0 的 openai embedder 拿空 key 不会启动报错，而是每次
+        add/search 都向 api.openai.com 发 401 请求，拖到运行期才暴露。
+        两项都不设置（完全共源）时由 _require_complete_openai_config
+        保证 LLM_API_KEY 的完备性。
+        """
+        if not (self.mem0_embedding_base_url or self.mem0_embedding_api_key):
+            return self
+        if not (self.mem0_embedding_api_key or self.llm_api_key):
+            raise ValueError(
+                "MEM0_EMBEDDING_BASE_URL/MEM0_EMBEDDING_API_KEY 已设置但缺少"
+                " embedding 凭据：请设置 MEM0_EMBEDDING_API_KEY，或与 LLM 共源"
+                "（不设置 MEM0_EMBEDDING_* 即回落 LLM_API_KEY）"
             )
         return self
 

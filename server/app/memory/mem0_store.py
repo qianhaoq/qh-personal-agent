@@ -86,7 +86,9 @@ class Mem0Store:
                 "provider": "openai",
                 "config": {
                     "base_url": settings.mem0_embedding_base_url or settings.llm_base_url,
-                    "api_key": settings.llm_api_key,
+                    # INV-10.5（threads6 P2）：独立凭据缺省回落 LLM key——
+                    # 自定义 embedding 源却拿 LLM 的 key 打过去，运行期必 401
+                    "api_key": settings.mem0_embedding_api_key or settings.llm_api_key,
                     "model": settings.mem0_embedding_model or "text-embedding-3-small",
                 },
             },

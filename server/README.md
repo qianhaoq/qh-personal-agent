@@ -81,6 +81,7 @@ docker compose exec api python -m app.cli create-invite
 | `LLM_PROVIDER` | `mock`（默认，确定性规则）或 `openai`（OpenAI 兼容接口）。只接受这两个值，拼错启动即报错；生产（postgresql）配 `mock` 或 `openai` 缺 `LLM_API_KEY` 都拒绝启动（不静默回落 MockLLM），跑 PG 测试套件可设 `ALLOW_MOCK_LLM_IN_PROD=true` 放行 |
 | `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | DeepSeek 示例 `https://api.deepseek.com`；腾讯混元 OpenAI 兼容地址示例见 `.env.example`。**地址与型号需按官网核实** |
 | `MEMORY_BACKEND` | `inmemory`（默认，仅单进程开发/测试）或 `mem0`（生产）。只接受这两个值，未知值启动即报错；配置 `mem0` 但未安装 mem0ai 时启动即报错并提示 `pip install -r requirements-mem0.txt`（不静默退化，也不会等到第一次 `/search` 才 500）。生产（postgresql）配置 `inmemory` 会拒绝启动（多 worker/独立 worker 进程各一份内存、重启即丢）；仅单进程跑 PG 测试套件的 CI/本地可设 `ALLOW_INMEMORY_IN_TESTS=true` 放行——**独立 worker 进程无论该标志都拒绝 inmemory+PG**（它写的记忆对 api 进程不可见） |
+| `MEM0_EMBEDDING_BASE_URL` / `MEM0_EMBEDDING_API_KEY` / `MEM0_EMBEDDING_MODEL` | mem0 的 embedding 可与 LLM 不同源：三项分别缺省回落 `LLM_BASE_URL` / `LLM_API_KEY` / `text-embedding-3-small`（共源时不必重复填）。设置了 `BASE_URL`/`API_KEY` 却解析不出任何凭据（两项 key 都空）时启动即报错（INV-10.5），而不是运行期拿空 key 向 embedding 源 401 |
 | `ENABLE_DOCS` | 默认 `false`：`/docs`、`/redoc`、`/openapi.json` 不暴露；本地开发设 `true` |
 | `LOG_LEVEL` | 默认 `info`（worker 进程的 basicConfig） |
 | `CORS_ALLOW_ORIGINS` | 逗号分隔来源；默认空 = 不启用 CORS（原生 App 无需浏览器跨域），需要浏览器前端时才配 |

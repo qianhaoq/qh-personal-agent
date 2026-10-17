@@ -183,6 +183,9 @@ def test_env_example_local_default_inmemory_documents_mem0():
     # mem0 的 embedding/LLM OpenAI 兼容配置有占位说明
     assert any(ln.startswith("# MEM0_EMBEDDING_BASE_URL=") for ln in lines)
     assert any(ln.startswith("# MEM0_EMBEDDING_MODEL=") for ln in lines)
+    # threads6 P2 / INV-10.5：独立 embedding 凭据有说明（含回落语义）
+    assert any(ln.startswith("# MEM0_EMBEDDING_API_KEY=") for ln in lines)
+    assert any("回落 LLM_API_KEY" in ln for ln in lines)
 
 
 def test_mem0_backend_missing_mem0ai_rejected_at_startup(monkeypatch):
@@ -402,3 +405,32 @@ def test_env_example_documents_new_runtime_flags():
     assert "ENABLE_DOCS=false" in lines
     assert "LOG_LEVEL=info" in lines
     assert any(ln.startswith("# CORS_ALLOW_ORIGINS=") for ln in lines)
+
+
+def test_mem0_embedding_custom_config_without_key_rejected():
+    """threads6 P2 / INV-10.5：自定义 embedding 源（MEM0_EMBEDDING_BASE_URL /
+    MEM0_EMBEDDING_API_KEY 任一设置）而解析不出凭据（两项 key 都空）——
+    启动即 ValidationError（任何环境），而不是运行期拿空 key 向 embedding
+    源 401。完全共源（都不设置）不受影响。"""
+    # 自定义 base_url，但既没有 embedding key 也没有 LLM key 可回落
+    with pytest.raises(ValidationError, match="MEM0_EMBEDDING"):
+        _pg_settings(
+            mem0_embedding_base_url="https://embed.example.com/v1",
+        )
+    # 只设置 embedding key 本身就是凭据：通过
+    assert (
+        _pg_settings(mem0_embedding_api_key="sk-embed").mem0_embedding_api_key == "sk-embed"
+    )
+    # 自定义 base_url + LLM key 回落：通过（回落链在 mem0_store 侧生效）
+    assert _pg_settings(
+        llm_api_key="sk-llm", mem0_embedding_base_url="https://embed.example.com/v1"
+    ).mem0_embedding_base_url.startswith("https://")
+    # 完全共源（什么都不设置）：校验不介入，LLM key 完备性归 LLM 校验管
+    assert _pg_settings().mem0_embedding_api_key == ""
+    # SQLite 本地开发同样生效（不是只挡生产）
+    with pytest.raises(ValidationError, match="MEM0_EMBEDDING"):
+        Settings(
+            database_url="sqlite+aiosqlite:///./app.sqlite3",
+            mem0_embedding_base_url="https://embed.example.com/v1",
+            llm_api_key="",
+        )

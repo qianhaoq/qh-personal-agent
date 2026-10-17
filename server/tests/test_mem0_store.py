@@ -48,6 +48,7 @@ class _FakeMem0Memory:
 
     @classmethod
     def from_config(cls, config: dict) -> "_FakeMem0Memory":
+        cls.last_config = config  # 供测试断言适配层拼出的配置
         return cls()
 
     # ---- add：顶层 user_id 仍合法；infer 主路径返回裸 list ----
@@ -309,3 +310,23 @@ async def test_mem0_backend_without_mem0ai_raises_instead_of_fallback(monkeypatc
     monkeypatch.setattr(get_settings(), "memory_backend", "mem0")
     with pytest.raises(ImportError):
         base.get_memory_store()
+
+
+def test_mem0_embedding_api_key_falls_back_to_llm_key(fake_mem0, monkeypatch):
+    """threads6 P2 / INV-10.5：embedder 凭据 = MEM0_EMBEDDING_API_KEY，
+    缺省回落 LLM_API_KEY（共源不必重复填）；LLM 部分仍用 LLM 自己的凭据。"""
+    from app.config import get_settings
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "llm_api_key", "sk-llm")
+
+    monkeypatch.setattr(settings, "mem0_embedding_api_key", "")
+    _make_store(fake_mem0)
+    embedder = fake_mem0.Memory.last_config["embedder"]["config"]
+    assert embedder["api_key"] == "sk-llm", "未配置独立凭据时回落 LLM_API_KEY"
+
+    monkeypatch.setattr(settings, "mem0_embedding_api_key", "sk-embed")
+    _make_store(fake_mem0)
+    last = fake_mem0.Memory.last_config
+    assert last["embedder"]["config"]["api_key"] == "sk-embed", "独立凭据优先"
+    assert last["llm"]["config"]["api_key"] == "sk-llm", "LLM 部分不受 embedding 配置影响"
