@@ -133,6 +133,9 @@ def _exclusive(a, b, parents) -> bool:
     child = a
     for p in _ancestors(a, parents):
         if id(p) in anc_b:
+            if isinstance(p, ast.Try):  # sibling except handlers never both run
+                cb = next((x for x in [b, *_ancestors(b, parents)] if parents.get(x) is p), None)
+                return isinstance(child, ast.ExceptHandler) and isinstance(cb, ast.ExceptHandler) and child is not cb
             if isinstance(p, ast.Match):  # different case arms never both run
                 cb = next((x for x in [b, *_ancestors(b, parents)] if parents.get(x) is p), None)
                 return isinstance(child, ast.match_case) and isinstance(cb, ast.match_case) and child is not cb
