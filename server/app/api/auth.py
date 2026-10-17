@@ -151,20 +151,48 @@ async def _lock_device(session: AsyncSession, device_id: str) -> Device | None:
     return (await session.execute(stmt)).scalar_one_or_none()
 
 
-async def _revoke_device_for_reuse(session: AsyncSession, device_id: str):
+async def _revoke_device_for_reuse(
+    session: AsyncSession, device_id: str, token_row_id: str
+):
     """重放已作废（被轮换/吊销）的 refresh：吊销设备并作废其全部 token
-    （原有语义保留）。锁序：device → refresh_tokens。"""
+    （原有语义保留）。锁序：device → refresh_tokens。
+
+    threads7 P1（auth.py:246，INV-8）：首读（无锁快照）看到 revoked_at
+    非空**不足以**直接吊销——等锁期间该行可能已被 logout 删除、或已跨过
+    expires_at（尚未被修剪），这两类按 INV-8 都是普通 401、不吊销设备。
+    先 _lock_device 串行化同设备的轮换/吊销，锁内用标量列重读该行归因
+    （绕过 identity map，INV-12：本会话首读装载的 ORM 对象不随并发提交
+    刷新），按固定顺序分类：不存在→401、已过期→401、已作废→重放吊销。"""
     await session.rollback()
     device = await _lock_device(session, device_id)
-    if device is not None:
-        device.revoked_at = utcnow()
+    if device is None:
+        # 设备行不存在（理论不可达，当前无删除路径）：无从吊销，普通 401
+        raise ApiError(401, "unauthorized", "invalid refresh token")
+    current = (
         await session.execute(
-            update(RefreshToken)
-            .where(RefreshToken.device_id == device_id, RefreshToken.revoked_at.is_(None))
-            .values(revoked_at=utcnow())
-            .execution_options(synchronize_session=False)
+            select(RefreshToken.id, RefreshToken.expires_at, RefreshToken.revoked_at).where(
+                RefreshToken.id == token_row_id
+            )
         )
-        await session.commit()
+    ).first()
+    if current is None:
+        # 等锁期间行被 logout 删除 / 第 6 次登录挤出：普通 401，不吊销设备
+        raise ApiError(401, "unauthorized", "invalid refresh token")
+    if as_utc(current.expires_at) <= utcnow():
+        # 等锁期间跨过过期时刻（过期行尚未被修剪）：按过期 401，不吊销设备
+        raise ApiError(401, "unauthorized", "refresh token 已过期")
+    if current.revoked_at is None:
+        # 理论不可达：revoked_at 只置不清，首读看到的是已提交值，不随开头
+        # 的 rollback 撤销。证据消失时绝不吊销设备（防御性普通 401）
+        raise ApiError(401, "unauthorized", "invalid refresh token")
+    device.revoked_at = utcnow()
+    await session.execute(
+        update(RefreshToken)
+        .where(RefreshToken.device_id == device_id, RefreshToken.revoked_at.is_(None))
+        .values(revoked_at=utcnow())
+        .execution_options(synchronize_session=False)
+    )
+    await session.commit()
     raise ApiError(401, "refresh_reused", "检测到 refresh token 复用，设备已吊销")
 
 
@@ -242,8 +270,10 @@ async def refresh(body: RefreshRequest, session: AsyncSession = Depends(get_db_s
 
     if row is not None:
         if row.revoked_at is not None:
-            # 已被轮换/吊销的 token 重放：复用检测，吊销整台设备（原语义）
-            return await _revoke_device_for_reuse(session, row.device_id)
+            # 已被轮换/吊销的 token 重放：复用检测候选——但是否真吊销由
+            # _revoke_device_for_reuse 在 device 锁内重读该行后判定（见其
+            # docstring：等锁期间行可能已被删除/已过期，都是普通 401）
+            return await _revoke_device_for_reuse(session, row.device_id, row.id)
         if as_utc(row.expires_at) <= now:
             # TTL 落库强制（README 已知限制中「有效期未强制」就此关闭）
             raise ApiError(401, "unauthorized", "refresh token 已过期")
@@ -295,7 +325,8 @@ async def refresh(body: RefreshRequest, session: AsyncSession = Depends(get_db_s
             # 等锁期间跨过了过期时刻 → 按过期 401（不吊销设备）
             raise ApiError(401, "unauthorized", "refresh token 已过期")
         # revoked_at 非空：确系被轮换/吊销后的重放 → 复用检测吊销整台设备
-        return await _revoke_device_for_reuse(session, device_id)
+        # （_revoke_device_for_reuse 内部会再按锁内重读复核一次）
+        return await _revoke_device_for_reuse(session, device_id, row.id)
 
     raise ApiError(401, "unauthorized", "invalid refresh token")
 

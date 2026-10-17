@@ -528,6 +528,108 @@ async def test_refresh_race_revoked_while_waiting_device_lock_detected_as_reuse(
     assert device.revoked_at is not None
 
 
+async def test_refresh_reuse_row_deleted_under_lock_401_no_revoke(
+    client, invite_code, monkeypatch
+):
+    """threads7 P1（auth.py:246，INV-8）：重放一枚已作废的 token，首读
+    （无锁）看到 revoked_at 非空，但等锁期间该行被 logout / 上限挤出
+    删除 → 锁内重读分类为「不存在」：普通 401，**不吊销设备**。旧行为
+    拿无锁快照直接吊销整台设备，把登出/挤出语义的请求错伤成攻击。"""
+    from sqlalchemy import delete as sa_delete
+
+    from app.api import auth as auth_api
+    from app.auth.tokens import hash_refresh_token
+    from app.db import get_sessionmaker
+    from app.models import Device, RefreshToken
+
+    device_id = "dev_reuse_del"
+    first = await client.post(
+        "/v1/auth/login", json={"invite_code": invite_code, "device_id": device_id}
+    )
+    assert first.status_code == 200, first.text
+    t1 = first.json()["refresh_token"]
+    # 轮换掉 t1：它的行已作废（已提交），此后重放首读才会看到 revoked_at
+    rotated = await client.post("/v1/auth/refresh", json={"refresh_token": t1})
+    assert rotated.status_code == 200, rotated.text
+    t2 = rotated.json()["refresh_token"]
+
+    real_lock_device = auth_api._lock_device
+
+    async def lock_device_after_row_deleted(session, device_id):
+        # 注入「首读到 revoked 之后、拿到 device 锁之前」窗口里发生的
+        # 删除（synchronize_session=False：真实并发在别的连接上，摸不到
+        # 本会话的 identity map）
+        async with session.begin_nested():
+            await session.execute(
+                sa_delete(RefreshToken).where(
+                    RefreshToken.token_hash == hash_refresh_token(t1)
+                )
+            )
+        return await real_lock_device(session, device_id)
+
+    monkeypatch.setattr(auth_api, "_lock_device", lock_device_after_row_deleted)
+
+    resp = await client.post("/v1/auth/refresh", json={"refresh_token": t1})
+    assert resp.status_code == 401, resp.text
+    assert resp.json()["error"]["code"] == "unauthorized", (
+        "行已在锁内消失：挤出/登出语义是普通 401，不是复用吊销"
+    )
+
+    async with get_sessionmaker()() as session:
+        device = await session.get(Device, device_id)
+    assert device.revoked_at is None
+    # 设备未吊销：轮换出的新 token 照常可用
+    other = await client.post("/v1/auth/refresh", json={"refresh_token": t2})
+    assert other.status_code == 200, other.text
+
+
+async def test_refresh_reuse_revoked_but_expired_401_no_revoke(client, invite_code):
+    """threads7 P1（auth.py:246，INV-8）：重放一枚已作废且已跨过过期时刻
+    （尚未被修剪）的 token → 锁内分类顺序「不存在→401、已过期→401、
+    已作废→重放吊销」中过期先于作废：普通 401，不吊销设备——过期的
+    凭据对任何路径都无意义，为它作废整台设备上的现行 token 是错伤。"""
+    from datetime import timedelta
+
+    from app.auth.tokens import hash_refresh_token
+    from app.db import get_sessionmaker
+    from app.models import Device, RefreshToken
+    from app.timeutil import utcnow
+
+    device_id = "dev_reuse_exp"
+    first = await client.post(
+        "/v1/auth/login", json={"invite_code": invite_code, "device_id": device_id}
+    )
+    assert first.status_code == 200, first.text
+    t1 = first.json()["refresh_token"]
+    rotated = await client.post("/v1/auth/refresh", json={"refresh_token": t1})
+    assert rotated.status_code == 200, rotated.text
+    t2 = rotated.json()["refresh_token"]
+
+    # 把已作废的 t1 行推过过期时刻（模拟等锁/修剪间隙里自然到期）
+    async with get_sessionmaker()() as session:
+        row = (
+            await session.execute(
+                select(RefreshToken).where(
+                    RefreshToken.token_hash == hash_refresh_token(t1)
+                )
+            )
+        ).scalar_one()
+        row.expires_at = utcnow() - timedelta(hours=1)
+        await session.commit()
+
+    resp = await client.post("/v1/auth/refresh", json={"refresh_token": t1})
+    assert resp.status_code == 401, resp.text
+    assert resp.json()["error"]["code"] == "unauthorized", (
+        "已过期优先于已作废：普通 401，不吊销设备"
+    )
+
+    async with get_sessionmaker()() as session:
+        device = await session.get(Device, device_id)
+    assert device.revoked_at is None
+    other = await client.post("/v1/auth/refresh", json={"refresh_token": t2})
+    assert other.status_code == 200, other.text
+
+
 @requires_postgres
 async def test_concurrent_sixth_login_eviction_vs_refresh_no_device_revoke_pg(
     client, invite_code
