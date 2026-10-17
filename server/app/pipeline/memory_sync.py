@@ -23,9 +23,14 @@ MemoryStore.add / delete / delete_by_note 调用方。
    add 产生的 memory id**（按 id 删，绝不 delete_by_note，修 C9：不误删
    并发新 rev 任务刚写入的记忆）+ INSERT memory_sync … ON CONFLICT DO
    NOTHING 再入队（与变更事务已入队的 pending 去重合并），job 仍算 done；
-   **租约已丢（被回收换主）→ 只删本次 add 产生的 id，不置位、不再入队**
-   ——外部写超过锁超时后任务会被回收，迟到 worker 不得仅凭 (rev,
-   deleted_at) 未变就再写一组记忆/置位。
+   **租约已丢（被回收换主）→ 只删本次 add 产生的 id、不置位，然后同样
+   无条件再入队一次补偿任务**（threads6 P1-1）——第 2 步的 delete_by_note
+   本身也可能耗过锁超时、在换主执行完成**之后**才落地，把新持有者刚写的
+   记忆删掉而队列里再无后继任务（note 永久无记忆、memory_status=synced）；
+   「删己 id」只对账自己 add 的部分，迟到删除造成的损害只能靠补偿再入队
+   兜底。本执行的全部外部写（delete_by_note + add）在复查前已顺序完成，
+   补偿任务在其后执行、读到最新状态幂等收敛；它拿新租约，若再丢租约同样
+   再入队——每轮至多一个 pending（部分唯一索引），收敛有界。
 4. **收尾**：runner 的 finalize_claim 只校验租约（INV-6），不带 rev。
 
 复查键 (rev, deleted_at) 足够：status 无法在不改 rev/deleted_at 的前提下
@@ -105,11 +110,18 @@ async def sync_note_memory(
     )
 
     if not lease_ok:
-        # 租约已丢（被回收换主）：只删本次 add 产生的 id，不置位、不再入队
-        # ——job 已由新持有者接管，其执行会按 note 当前状态收敛；迟到的
-        # 本次执行不得再留下任何对外效果（threads5 P2-1 / INV-6）
+        # 租约已丢（被回收换主）：只删本次 add 产生的 id、不置位，但**必须
+        # 补偿再入队**（threads6 P1-1 / INV-5）：第 2 步的 delete_by_note 可能
+        # 在换主执行完成之后才落地，把新持有者写的记忆删掉且再无后继任务
+        # ——「删己 id」对账不了这部分损害，唯一可靠的兜底是让队列再收敛
+        # 一次（ON CONFLICT DO NOTHING 与已有 pending 去重；迟到执行不得
+        # 置位/写 note，但允许留下这一个 INSERT，见 INV-6）
         if added:
             await store.delete(user_id, [m.id for m in added])
+        async with maker() as session, session.begin():
+            await enqueue(
+                session, "memory_sync", {"note_id": note_id}, note_id=note_id, dedupe_pending=True
+            )
         return
 
     if unchanged:
