@@ -6,6 +6,7 @@
 > C1 auth 并发登录同设备竞态（P1）；C2 create 中 enqueue 晚于 allocate_seq（P1）；C3 openai 配置需三项齐备（P2）；C4 PATCH 后旧记忆无兜底清理（P2）；C5 整理后 rev 变化导致失败收尾永不命中（P1）；C6 create_all 并发建表（P2）；C7 DEFAULT_TIMEZONE 未校验（P2）；C8 path/query 参数 NUL 进 PG（P1）；C9 旧整理任务 delete_by_note 误删新 rev 记忆（P1）。
 > 第五轮输入：threads5.txt 的 6 条（2 P1 + 4 P2），在对应 INV 内注明（INV-8 重写为多 refresh token 模型；INV-3 补枚举完整性；INV-5/6 补租约栅栏；INV-2 补内部字段不碰 updated_at；INV-7 补 aware 时间边界；INV-10 补后端可安装性/拓扑校验）。
 > 第六轮输入：threads6.txt 的 6 条（3 P1 + 3 P2），在对应 INV 内注明：INV-5 补「丢租约必再入队」（迟到的 delete_by_note 会删掉换主后写入的记忆）；新增 INV-11（写接口乐观锁与 rev 语义，含幂等/无操作快路径）；新增 INV-12（条件更新/删除 0 行后的归因规则）；INV-8 补 refresh 行消失/过期的分类与过期行清理；INV-7 补 LLM 输出时间同套 ±14h 安全界；INV-10 补 MEM0_EMBEDDING_API_KEY。
+> 第七轮输入：threads7.txt 的 5 条 P1（2 条 C 类 auth、1 条 A 类 memory_sync、1 条 compose；mem0_store.py 的 infer 一条**不在本分支修**，随生产记忆后端整体移交 feat/mem0-backend 分支），在对应 INV 内注明：INV-12 补「条件写后的重读必须绕过 identity map」（synchronize_session=False 不更新已加载对象）；INV-8 补「所有失败分支（含吊销/重放分支）先 _lock_device、锁内重读 token 行再判定」；INV-5 补「补偿入队必须在 try/finally——store.delete 抛异常也一定入队」；INV-9/INV-10 补「init-db 只校验数据库配置（校验分层），compose 各服务按 command 通过各自的启动校验（有测试）」。同轮把 mem0 生产后端拆分出去：`MEMORY_BACKEND` 取值变为 `inmemory | disabled`（新增空后端），mem0 相关实现细节从本仓移除、由后续 PR（feat/mem0-backend）提供，本文相应标注。
 
 ## 0. 总览：新任务与记忆模型
 
@@ -44,7 +45,7 @@ memory_sync(note_id)     不带 rev。短读事务取 note 当前状态 →（�
 1. 同一写事务内，业务行锁按固定顺序获取：**invite → user → device → refresh_tokens → note → reminders → jobs**（refresh_tokens 只被 auth 路径触碰，且永远排在 device 之后，见 INV-8）。
 2. 所有业务行的 INSERT/UPDATE（**含 job 行的 INSERT**，修 C2）显式 flush 落定之后，`allocate_seq`（sequences 行锁）必须是提交前获取的**最后一把锁**；change_seq 由其后的第二条 UPDATE 写回（行锁已持有，不新获取）。不得依赖 ORM autoflush 隐式落序。
 3. **API/业务路径对既存 job 行只有 INSERT（`ON CONFLICT DO NOTHING`），永远不 UPDATE 既存 job 行**；既存 job 行的 UPDATE 只允许出现在队列内部（`app/jobs/queue.py` 的 claim / finalize / 回收判死路径），这些路径对业务行的加锁序列固定为 **jobs → note（仅失败标记）→ sequences → change_seq 写回**，不碰 reminders/device。因此「业务路径」与「队列路径」的锁序单向不相交，全库无环。
-4. 事务边界内不得调用 LLM / mem0 / 任何外部网络服务（既有规则，保留）。
+4. 事务边界内不得调用 LLM / 记忆后端 / 任何外部网络服务（既有规则，保留）。
 
 **各写路径加锁序列**（第二步实现后逐一对应）：
 
@@ -96,26 +97,28 @@ memory_sync(note_id)     不带 rev。短读事务取 note 当前状态 →（�
 - `test_extract_and_memory_sync_independent_attempts`（extract 耗尽置 status=failed 不影响 memory_sync 运行；memory_sync 耗尽置 memory_status=failed 不影响 note.status=organized）
 - `test_memory_sync_status_updates_do_not_touch_updated_at_or_change_seq`（threads5 P2-2 / INV-2.6：重放 memory_sync 前后 note 的 updated_at 与 change_seq 不变，/v1/sync 不新增行）
 
-### INV-3 记忆归属：note_id + source_rev；枚举必须完整
+### INV-3 记忆归属：note_id + source_rev；后端契约（枚举完整、不越权改动、不推断合并）
 
 **陈述**：MemoryStore 中每条由本服务写入的记忆，`metadata` 必含 `note_id` 与 `source_rev`；**记忆只属于 note 的当前 rev**——note 已删除或当前 rev 未 organized 时，store 中不应存在该 note 的记忆；organized 时存在的记忆其 source_rev 应等于 note 当前 rev。API 不向客户端暴露 source_rev（内部字段）。
 
-在此之上（threads5 P1-1）：**对记忆后端做「全量」语义的枚举必须完整——一页取满又无法推进时必须报错，绝不当成已取全/已同步**。`list()` / `delete_by_note()` / `delete_all()` 的契约：
+**后端契约**（任何记忆后端实现——本仓的 inmemory/disabled，以及后续 feat/mem0-backend PR 的生产后端——都必须满足；threads5 P1-1 与 threads7 移交部分合并陈述）：
 
-- `delete_by_note(user_id, note_id)`：按 metadata 过滤（`filters={"user_id", "note_id"}`）+ **边取边删**的循环（每轮删掉本轮取到的，下一轮自然前进，无需游标分页）；同一批 id 重复出现（删除未生效）即抛 `MemoryEnumerationIncomplete` 让 job 失败重试。
-- `list(user_id)`：mem0 2.2.1 的 `get_all` 没有游标/offset 分页——一页取满即**无法证明已取全**，直接抛 `MemoryEnumerationIncomplete`（不静默截断；调用方让 job 失败重试）。页大小可注入（`Mem0Store(list_page_size=...)`），测试用极小值模拟超限。
-- `delete_all(user_id)`：与 `delete_by_note` 同一个「过滤 + 边取边删」循环，返回确切删除数。
-- `InMemoryStore` 同语义：可注入 `list_page_size` 上限，`list()` 取满即抛同款错误（进程内字典本身无截断，上限只为让两后端的「取不全即报错」行为都可测）。
+1. **全量枚举必须完整——一页取满又无法推进时必须报错，绝不当成已取全/已同步**：
+   - `delete_by_note(user_id, note_id)`：按 metadata 过滤 + **边取边删**的循环（每轮删掉本轮取到的，下一轮自然前进，无需游标分页）；同一批 id 重复出现（删除未生效）即抛 `MemoryEnumerationIncomplete` 让 job 失败重试。
+   - `list(user_id)`：一页取满且后端无游标/offset 可推进时**无法证明已取全**，直接抛 `MemoryEnumerationIncomplete`（不静默截断；调用方让 job 失败重试）。页大小可注入（`list_page_size`），测试用极小值模拟超限。
+   - `delete_all(user_id)`：与 `delete_by_note` 同一个「过滤 + 边取边删」循环，返回确切删除数。
+   - `InMemoryStore` 同语义：可注入 `list_page_size` 上限，`list()` 取满即抛同款错误（进程内字典本身无截断，上限只为让「取不全即报错」的行为脱离具体后端可测）。
+2. **任何操作不得修改其他 note_id 的记忆**（threads7 移交）：删除/枚举的过滤必须同时约束 user 与 note；同步一个 note 绝不能触碰另一个 note 的记录（对端没有任务能修复被误删/误改的记忆）。
+3. **add 不得基于既有记忆改写/合并（infer 类行为禁止，threads7 移交）**：`add` 必须是「插入属于本 note_id/source_rev 的新记录」——像 mem0 默认 `infer=True` 那样基于 user 级既有记忆做 UPDATE/DELETE/no-op 判定，会把同步 note B 变成改写 note A 的记录（A 无任务可修复，metadata 也不再满足归属模型）。生产后端必须用 `infer=False` 之类的原始插入，或等效地把推断约束在当前 note 内。
 
-**保证代码**：`app/memory/base.py`（`MemoryEnumerationIncomplete` + `add` 签名 `add(user_id, text, *, note_id, source_rev)`）、`app/memory/mem0_store.py`、`app/memory/inmemory.py`、唯一写入口 `app/pipeline/memory_sync.py`（INV-4/5 保证只有它写）。
+**生产后端（mem0）的实现细节已在 feat/mem0-backend 分支**（threads7 拆分）：mem0 2.2.1 的调用形状（`filters` 作用域、`top_k` 截断、`get_all` 无分页、`payload->>'note_id'` 过滤下推、`delete` 对不存在 id 抛 ValueError 的幂等吞掉）、版本钉死 `mem0ai==2.2.1`、psycopg 驱动与 embedding 凭据（原 INV-10.5/10.6）都随 `server/app/memory/mem0_store.py` 与 `requirements-mem0.txt` 移出本仓；该分支落地时按上面三条契约验收，契约本身不因后端换人而放宽。
 
-mem0 版本钉死：`server/requirements-mem0.txt` 写 `mem0ai==2.2.1`（4c1c9be P2-3）。2.x 收回了 `search`/`get_all` 的顶层 `user_id` 参数（作用域只认 `filters={"user_id": ...}`，旧调用直接 ValueError）、`search` 条数参数是 `top_k`（无 `limit`）、`get_all` 默认 `top_k=20` 会截断、**`get_all` 的 `filters` 透传到 pgvector `list()` 且支持 metadata 键**（`payload->>'note_id' = ...`，实测 2.2.1 `mem0/vector_stores/pgvector.py::_build_filter_conditions`；这是 `delete_by_note` 能按 note 精确枚举的依据）、`add` 的 infer 主路径返回裸 list 且不回显 metadata（归属信息由适配层用自己的入参补齐）、`delete` 对不存在的 id 抛 ValueError（按已删除吞掉，幂等）。适配集中在 `app/memory/mem0_store.py`。
+**保证代码**：`app/memory/base.py`（`MemoryEnumerationIncomplete` + `add` 签名 `add(user_id, text, *, note_id, source_rev)` + 工厂只认 `inmemory | disabled`）、`app/memory/inmemory.py`、`app/memory/disabled.py`（空后端，见 INV-10.5）、唯一写入口 `app/pipeline/memory_sync.py`（INV-4/5 保证只有它写）。
 
 **验证测试**：
 - `test_memory_metadata_contains_note_id_and_source_rev`
 - `test_no_stale_rev_memory_after_repatch`（PATCH 重整理后 /v1/search 不再命中旧文本；C9 的端到端回归）
-- mem0 2.2.1 调用形状（mock 按 2.2.1 签名建模、传旧参数即抛）：`test_search_scopes_user_via_filters_and_top_k`、`test_get_all_scopes_user_via_filters_and_avoids_truncation`、`test_add_returns_all_written_items_with_note_id_and_rev`、`test_delete_by_ids_delegates_each_id_and_tolerates_missing`
-- 枚举完整性（threads5 P1-1）：`test_delete_by_note_filters_by_note_metadata_and_paginates`（fake 的 get_all 按 2.2.1/pgvector 语义过滤 metadata 键 + top_k 截断；注入页大小 2 验证跨页删净）、`test_delete_by_note_raises_when_page_never_shrinks`（取满且同批重复 → 抛错）、`test_list_raises_when_page_full_cannot_advance`、`test_inmemory_list_page_cap_raises_when_full`、`test_memory_sync_fails_not_marks_synced_when_enumeration_incomplete`（枚举不完整 → job 失败重试、memory_status 不置 synced）
+- 枚举完整性（threads5 P1-1；现由 InMemoryStore 的可注入页上限承载，生产后端的等价测试随 feat/mem0-backend 回归）：`test_inmemory_list_page_cap_raises_when_full`、`test_memory_sync_fails_not_marks_synced_when_enumeration_incomplete`（枚举不完整 → job 失败重试、memory_status 不置 synced）
 
 ### INV-4 谁可以删/写记忆
 
@@ -138,10 +141,10 @@ mem0 版本钉死：`server/requirements-mem0.txt` 写 `mem0ai==2.2.1`（4c1c9be
 3. **复查**：新短读事务重读 `(rev, deleted_at)` **并确认自己仍持有租约**（threads5 P2-1：`job 行 status='running' AND locked_by=:worker_id AND locked_at=:claimed`——外部写（mem0 的 LLM/embedding）超过 `JOB_LOCK_TIMEOUT_SECONDS` 时任务会被回收换主，仅比 `(rev, deleted_at)` 挡不住「复活慢 worker 的迟到写入」）。三种结局：
    - 租约仍在且 `(rev, deleted_at)` 与第 1 步相同 → 条件 UPDATE `memory_status='synced'`（条件 `id=:id AND rev=读取rev AND deleted_at IS NULL`，不占 seq、不碰 `updated_at`/`change_seq`，见 INV-2.6；若 note 已 failed 且记忆为空则置 `failed`——该状态下不可能再有记忆）；
    - 租约仍在但 `(rev, deleted_at)` 已变 → **只删本次 add 产生的 memory id**（按 id 删，绝不 delete_by_note，修 C9）+ `INSERT memory_sync … ON CONFLICT DO NOTHING` 再入队，job 仍算 done；
-   - **租约已丢（被回收换主）→ 只删本次 add 产生的 memory id、不置 memory_status，然后无条件再入队一次 memory_sync（`ON CONFLICT DO NOTHING` 与已有 pending 去重），不得静默返回**（threads6 P1-1：「删己 id」只对账自己 add 的部分，**第 2 步的 delete_by_note 本身也可能耗时超过锁超时、在换主执行完成之后才落地**，把新持有者刚写的记忆删掉而队列里再无后继任务——note 永久无记忆且 memory_status=synced。迟到 worker 的全部外部写（delete_by_note + add）在复查前已顺序完成，补偿任务在其后执行，读到最新状态幂等收敛；补偿任务拿新租约，若再丢租约同样再入队——每轮至多一个 pending（部分唯一索引），收敛有界）。
+   - **租约已丢（被回收换主）→ 只删本次 add 产生的 memory id、不置 memory_status，然后无条件再入队一次 memory_sync（`ON CONFLICT DO NOTHING` 与已有 pending 去重），不得静默返回**（threads6 P1-1：「删己 id」只对账自己 add 的部分，**第 2 步的 delete_by_note 本身也可能耗时超过锁超时、在换主执行完成之后才落地**，把新持有者刚写的记忆删掉而队列里再无后继任务——note 永久无记忆且 memory_status=synced。迟到 worker 的全部外部写（delete_by_note + add）在复查前已顺序完成，补偿任务在其后执行，读到最新状态幂等收敛；补偿任务拿新租约，若再丢租约同样再入队——每轮至多一个 pending（部分唯一索引），收敛有界）。**「删己 id」与补偿入队必须在 try/finally 里**（threads7 P1，memory_sync.py:123）：删己 id 的 `store.delete` 抛异常时执行会直接退出、补偿入队被吞掉——本 job 的收尾因租约已丢而被拒（无法重试），替换 worker 可能已完成，留下永不收敛的损害；正确形态是 `try: 删己 finally: 入队`，异常照常上抛让 job 按重试语义处理，入队无论如何发生（每 note 至多一个 pending，与别处入队去重）。
 4. **收尾**：只校验租约（INV-6）。`(rev, deleted_at)` 足够作为复查键：status 无法在不改 rev/deleted_at 的前提下变化（PATCH 改 rev，DELETE 改 deleted_at，apply 改 rev）。
 
-**没有锁保护的外部写之后必须无条件再对账一次（threads6 P1-1 的总原则）**：任何绕过数据库锁的写（mem0 的 add / delete / delete_by_note）都无法被栅栏挡住迟到落地；执行体在结束前必须保证「存在一个后继任务会按 note 当前状态收敛」——正常路径靠置位/换主路径靠补偿再入队，唯一例外是复查确认自己仍持租约且状态未变（此时本次执行就是终态收敛）。丢 lease 一律重新入队 memory_sync（唯一索引去重），不得静默返回。
+**没有锁保护的外部写之后必须无条件再对账一次（threads6 P1-1 的总原则，threads7 补强）**：任何绕过数据库锁的写（记忆后端的 add / delete / delete_by_note）都无法被栅栏挡住迟到落地；执行体在结束前必须保证「存在一个后继任务会按 note 当前状态收敛」——正常路径靠置位/换主路径靠补偿再入队，唯一例外是复查确认自己仍持租约且状态未变（此时本次执行就是终态收敛）。丢 lease 一律重新入队 memory_sync（唯一索引去重），不得静默返回。**补偿入队必须与它前面的清理外部写构成 try/finally**：清理（删己 id）抛异常时入队照样发生，否则对账承诺被一个可重试的临时故障打破且无人兜底（threads7 P1）。
 
 **串行化方案的选择**（题目要求评估）：
 
@@ -246,7 +249,12 @@ mem0 版本钉死：`server/requirements-mem0.txt` 写 `mem0ai==2.2.1`（4c1c9be
   - 行不存在（被挤出/登出删除）→ 401 `unauthorized`，**不吊销设备**（挤出/登出的既定语义就是普通 401）；
   - `revoked_at` 非空 → 确系被轮换/吊销后的重放 → 按复用吊销整台设备（原语义）；
   - `revoked_at` 为空却没轮换成功 → 只可能是等待锁期间跨过过期时刻（UPDATE 里的 `now` 是请求起始时刻）→ 401 `unauthorized`（过期），不吊销设备。
-- **重放已作废（被轮换/吊销）的 token** → 401 `refresh_reused` + 吊销**整台设备**（`devices.revoked_at` + 作废其全部 token；既有语义保留）。被 5 枚上限挤出（行已删除）的 token 重放得到普通 401——包括「读行时还在、等锁期间被挤掉」的竞态窗口（上条的重读归因保证它不会被误判成重放）。上限本身是显式作废策略的一种，写入已知取舍。
+  - **重读必须绕过 identity map（threads7 P1，auth.py:280）**：轮换的条件 UPDATE 用 `synchronize_session=False`，不更新会话里已加载的 ORM 对象；随后的 `select(RefreshToken)` 会命中 identity map 里首读时装载的那份旧对象，把并发轮换刚提交的 `revoked_at` 读成 `None`——重放被误判成「过期 401」，设备与攻击者刚轮换到的新 token 都保持活跃。重读只查标量列（`select(RefreshToken.id, RefreshToken.expires_at, RefreshToken.revoked_at)`）或 `populate_existing=True`（细则与全仓清单见 INV-12）。
+- **重放已作废（被轮换/吊销）的 token → 一律先 `_lock_device`，锁内重读 token 行后再判定（threads7 P1，auth.py:246）**。首读（无锁快照）看到 `revoked_at` 非空**不足以**直接吊销：等锁期间该行可能已被 logout 删除、或已跨过 `expires_at`（尚未被修剪）——INV-8 对这两类的定义都是普通 401、不吊销设备。锁内重读按固定顺序分类：
+  - 行不存在（登出删除等）→ 401 `unauthorized`，**不吊销设备**；
+  - 行已过期（`expires_at <= now`，无论是否作废）→ 401 `unauthorized`（过期），**不吊销设备**——先判过期再判作废；
+  - 行存在、未过期、`revoked_at` 非空 → 确系重放 → 401 `refresh_reused` + 吊销**整台设备**（`devices.revoked_at` + 作废其全部 token；原语义保留）。
+  被 5 枚上限挤出（行已删除）的 token 重放得到普通 401——包括「读行时还在、等锁期间被挤掉」的竞态窗口（重读归因保证它不会被误判成重放）。上限本身是显式作废策略的一种，写入已知取舍。
 - **logout** → 清除（DELETE）该设备全部 token 行（不吊销设备行，access 到期自然失效；登出后的重放按既有语义得普通 401，不触发复用吊销——包括等锁期间被登出删除的竞态，同上由重读归因兜住）。
 - 过期 token（`expires_at<=now`，未作废）→ 401 unauthorized（TTL 首次真正强制；不吊销设备）。
 - **过期行清理策略（threads6 P2）**：登录/刷新追加新 token 的同一事务顺手 DELETE 该设备 `expires_at <= now` 的行——**已吊销（revoked_at 非空）但未过期的行保留到过期为止**（重放识别窗口：被轮换后 30 天内重放仍能关联到设备并触发吊销），过期后即无任何价值、随下一次该设备的登录/刷新清掉。活跃设备的表体积由此有界（≤5 枚活行 + 未过期的已吊销行）；完全失联设备的历史行不主动清理（可选的全局定期 GC 记为后续项， MVP 量级接受）。
@@ -274,16 +282,17 @@ mem0 版本钉死：`server/requirements-mem0.txt` 写 `mem0ai==2.2.1`（4c1c9be
 - `test_refresh_prunes_expired_rows_keeps_revoked_until_expiry`（threads6 P2：过期行在登录/刷新时被顺手清掉；已吊销未过期的行保留、其重放仍识别为 refresh_reused）
 - 既有 `test_refresh_rotation_and_reuse_revokes_device`（重放语义不变）保留
 
-### INV-9 建表/迁移：一次性 init-db
+### INV-9 建表/迁移：一次性 init-db；init-db 只校验数据库配置
 
-**陈述**：`create_all` 不得在 api/worker 启动时并发执行（修 C6）：
+**陈述**：`create_all` 不得在 api/worker 启动时并发执行（修 C6）；init-db 的配置校验按**分层**进行（threads7 P1，docker-compose.yml:24）：
 
 - 新命令 `python -m app.cli init-db`：PG 下在**单个事务**内先 `SELECT pg_advisory_xact_lock(<固定key>)` 再 `Base.metadata.create_all`（DDL 事务性 + 咨询锁，并发执行安全且串行化）；SQLite 下直接 create_all。
+- **init-db 只校验数据库层配置（`DbSettings`：DATABASE_URL）**，不加载完整 `Settings`——运行时记忆后端/LLM/JWT 与建表无关。migrate 服务在 compose 里只覆盖 `DATABASE_URL`，其余沿用 `.env`（本地模板默认 `MEMORY_BACKEND=inmemory`）；若 init-db 走完整校验，它会先撞上「生产拒绝 inmemory」退出，api/worker 等 `service_completed_successfully` 永远等不到，全新部署停在建表一步。
 - `main.py` lifespan 与 `app/jobs/worker.py`：`DATABASE_URL` 为 postgresql 时**不**建表（表缺失时让首个查询快速失败，暴露部署错误）；SQLite（本地开发/测试）保留启动建表。
-- `server/docker-compose.yml`：新增 one-shot `migrate` 服务（`command: python -m app.cli init-db`），`api`/`worker` 改为 `depends_on: migrate: condition: service_completed_successfully`（postgres 健康后先跑 migrate）。
+- `server/docker-compose.yml`：one-shot `migrate` 服务（`command: python -m app.cli init-db`），`api`/`worker` 改为 `depends_on: migrate: condition: service_completed_successfully`（postgres 健康后先跑 migrate）。**各服务的环境变量必须通过「按其 command 选择的启动校验」**：migrate → 数据库层校验（DbSettings）；api → 完整 Settings；worker → 完整 Settings + worker 拓扑校验（INV-10.4）。有测试解析 compose 与 `.env.example` 机械验证（env_file 指向 `.env`，测试用 `.env.example` 代替；生产必填的密钥类占位按 README 说明用生成值覆盖）。
 - 测试不受影响：conftest 自行 drop/create（测试基建，非应用启动路径）。
 
-**保证代码**：`app/cli.py`（init-db 子命令）、`app/db.py`（create_all 增加 PG 咨询锁包装或新函数）、`app/main.py`、`app/jobs/worker.py`、`server/docker-compose.yml`。
+**保证代码**：`app/cli.py`（init-db 子命令）、`app/db.py`（init_db 用 DbSettings 自建引擎；create_all 增加 PG 咨询锁包装或新函数）、`app/config.py::DbSettings/get_db_settings`（校验分层）、`app/main.py`、`app/jobs/worker.py`、`server/docker-compose.yml`、`server/tests/test_compose.py`。
 
 **验证测试**：
 - `test_init_db_concurrent_no_error_pg`（PG，真并发两个独立连接同时跑 init-db，均成功、无 duplicate-object 错误）
@@ -292,30 +301,27 @@ mem0 版本钉死：`server/requirements-mem0.txt` 写 `mem0ai==2.2.1`（4c1c9be
 
 ### INV-10 配置完备性校验
 
-**陈述**（Settings 加载即校验，任何环境）：
+**陈述**（Settings 加载即校验，任何环境；数据库层的分层校验见 INV-9）：
 
 1. `LLM_PROVIDER=openai` ⇒ `LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL` 三者必须齐备（修 C3：缺任一项启动即 ValueError，而不是运行期拼出相对 URL / 空 model 让每次 organize/ask 失败）。保留既有生产（postgresql）下 mock 拒绝等规则。
 2. `DEFAULT_TIMEZONE` 必须是合法 IANA 时区名（`ZoneInfo(...)` 可构造，修 C7；请求级 timezone 校验复用 `app/schemas.py::_check_timezone` 的逻辑）。
-3. **`MEMORY_BACKEND=mem0` ⇒ mem0ai 必须已安装**（threads5 P2-3：`importlib.util.find_spec("mem0")` 探测，失败即启动报错并提示 `pip install -r requirements-mem0.txt`——记忆 store 是懒构造，不查的话 api 照常起、首个 `/search` 才 500，`memory_sync` job 全部 ModuleNotFoundError）。任何环境生效。
-4. **inmemory 只属于单进程**：进程内状态跨 api/worker 两进程互不可见。生产（postgresql）+ inmemory 默认拒绝启动；仅单进程跑 PG 测试套件可设 `ALLOW_INMEMORY_IN_TESTS=true` 放行（原 `ALLOW_INMEMORY_IN_PROD` 改名：名字带 IN_PROD 误导部署者以为生产可开；**worker 进程无论该标志都拒绝 inmemory+PG**，`app/jobs/worker.py::check_memory_backend_shareable`）；SQLite 本地开发允许 inmemory，但 `.env.example` 与 README 写明其单进程局限（worker 写的记忆对 api 进程的 /search 不可见，完整链路用 compose/mem0）。`.env.example` 的本地默认值因此是 `inmemory`，mem0 行注释给出（未安装时启动即报第 3 条的错）。
-5. **`MEM0_EMBEDDING_API_KEY`（未设回退 `LLM_API_KEY`）**（threads6 P2）：mem0 的 embedding 可以与聊天 LLM 不同源（如 LLM 用 DeepSeek、embedding 用 OpenAI）——`MEM0_EMBEDDING_BASE_URL` 指向别的供应商时，embedding 端点的凭证不能想当然复用 `LLM_API_KEY`。取值顺序：`MEM0_EMBEDDING_API_KEY` → 未设则 `LLM_API_KEY`（同源部署零配置）。**启动校验**：设置了 `MEM0_EMBEDDING_BASE_URL` 或 `MEM0_EMBEDDING_API_KEY`（即显式自定义了 embedding 配置）而按上述顺序解析出的 key 为空时，启动即 ValueError——否则应用能正常启动，但 mem0 的每次 add/search 都在 embedding 端点上鉴权失败，memory_sync job 全部耗尽重试（问题被掩盖到队列里）。
-6. **mem0 2.2.1 适配层的两个实测事实**（threads6 集成验证，fake client 测不出——`from_config` 收任意 dict、不碰真实工厂）：
-   - llm/embedder 的 OpenAI 兼容配置键是 **`openai_base_url`**：`BaseLlmConfig`/`BaseEmbedderConfig` 都不收 `base_url`，传错键第一次构造 store 就 TypeError（`test_mem0_config_keys_match_real_backend` 把键名钉住）。
-   - mem0ai **不依赖任何 PostgreSQL 驱动**：pgvector 后端运行期才 `import psycopg`（缺了回落 psycopg2，再缺 ImportError）——`requirements-mem0.txt` 显式带 `psycopg[binary,pool]`，否则只装 mem0ai 的生产镜像第一次构造 store 就 ImportError。
+3. **`MEMORY_BACKEND` 只接受 `inmemory | disabled`**（threads7 拆分后；`mem0` 随生产后端移交 feat/mem0-backend，届时随该分支回到枚举）。未知值（含 `mem0`）启动即 ValidationError——绝不让拼错的后端静默退化丢记忆。
+4. **inmemory 只属于单进程**：进程内状态跨 api/worker 两进程互不可见。生产（postgresql）+ inmemory 默认拒绝启动，错误信息写明：inmemory 不能跨 api/worker 进程共享；生产记忆后端由后续 PR（feat/mem0-backend）提供，过渡期可显式设 `MEMORY_BACKEND=disabled`。仅单进程跑 PG 测试套件可设 `ALLOW_INMEMORY_IN_TESTS=true` 放行（原 `ALLOW_INMEMORY_IN_PROD` 改名：名字带 IN_PROD 误导部署者以为生产可开；**worker 进程无论该标志都拒绝 inmemory+PG**，`app/jobs/worker.py::check_memory_backend_shareable`——disabled 不受限）；SQLite 本地开发允许 inmemory，但 `.env.example` 与 README 写明其单进程局限（worker 写的记忆对 api 进程的 /search 不可见）。`.env.example` 的本地默认值因此是 `inmemory`。
+5. **`disabled`：显式的空记忆后端**（threads7 拆分引入），任何环境（含生产/worker）都允许：
+   - `DisabledMemoryStore` 实现 MemoryStore 全接口：`add` 返回 `[]`、`search`/`list` 返回 `[]`、`delete`/`delete_by_note`/`delete_all` 返回 0，无任何外部写。
+   - **memory_sync 照常运行并把 `memory_status` 标 `synced`**：「记忆 == f(note)」在空后端下**平凡成立**——后端里永远没有记忆，任何收敛操作都是 no-op 且正确。不把 disabled 当失败（不标 failed、不无限重试）。
+   - `/v1/search` 返回空 items、`/v1/ask` 走既有「无相关记忆」分支（`我没有相关记录。`），不报 500。
+   - **为什么是显式 `disabled` 而不是别的形态**：(a) *null-but-pretend*（配个假实现假装在记忆）——假 store 仍会「成功写入」产生不存在的记忆语义，观察者（测试/排障）无法区分「功能关闭」与「功能在跑」；(b) *测试标志放行 inmemory*——把生产行为绑在 `ALLOW_INMEMORY_IN_TESTS` 上等于宣布「测试开关可以打开生产语义」，且 inmemory 在多进程下是真丢数据（不是关闭）；(c) *拒绝启动*——拆分后到 feat/mem0-backend 落地前，api/worker 分进程部署没有任何可用的记忆配置，compose 起不来。`disabled` 把「关闭」做成一个显式、可审计、语义自洽的配置值：零外部依赖、零外部写、状态平凡收敛。
+6. （threads5 P2-3 的「mem0ai 安装探测」与 threads6 的「MEM0_EMBEDDING_API_KEY 回退链 / mem0 配置键与 psycopg 驱动」校验，随生产后端移至 feat/mem0-backend 分支，本仓不再有对应代码。）
 
-**保证代码**：`app/config.py`（`_require_complete_openai_config`、`_validate_default_timezone`、`_require_memory_backend_installed`、`_reject_inmemory_memory_backend_in_production`、`_require_embedding_key_when_customized`）、`app/memory/mem0_store.py`（embedder `api_key` 用回退链；llm/embedder 配置键 `openai_base_url`）、`requirements-mem0.txt`（psycopg 驱动）、`app/jobs/worker.py::check_memory_backend_shareable`、`server/.env.example`、`server/README.md`。
+**保证代码**：`app/config.py`（`_require_complete_openai_config`、`_validate_default_timezone`、`_reject_inmemory_memory_backend_in_production`——错误信息含 feat/mem0-backend 与 disabled 指引）、`app/memory/base.py::get_memory_store`（工厂只认 `inmemory | disabled`）、`app/memory/disabled.py`、`app/jobs/worker.py::check_memory_backend_shareable`、`server/.env.example`、`server/README.md`、`server/docker-compose.yml`（api/worker 显式 `MEMORY_BACKEND=disabled`）。
 
 **验证测试**：
 - `test_openai_missing_base_url_rejected` / `test_openai_missing_model_rejected` / `test_openai_missing_api_key_rejected`（已有 key 用例扩展）
 - `test_openai_all_three_configured_ok`（另有 `test_openai_missing_two_fields_lists_both` 断言多项缺失一并报出）
 - `test_default_timezone_invalid_rejected`（如 `Asia/Bejing`）/ `test_default_timezone_valid_ok`
-- `test_mem0_backend_missing_mem0ai_rejected_at_startup`（threads5 P2-3：错误信息含安装命令）
-- `test_mem0_embedding_api_key_falls_back_to_llm_key`（threads6 P2 / INV-10.5：设了 `MEM0_EMBEDDING_API_KEY` 用它，未设回退 `LLM_API_KEY`——用捕获 config 的假 mem0 断言传给 embedder 的 key）
-- `test_mem0_config_keys_match_real_backend`（threads6 集成实测：mem0 2.2.1 的配置键是 `openai_base_url`，传 `base_url` 构造即 TypeError——fake 测不出，键名钉死防回退）
-- `test_mem0_embedding_custom_config_without_key_rejected`（threads6 P2：自定义了 embedding 配置而无任何可用 key → 启动 ValueError）
 - `test_worker_refuses_inmemory_with_postgres`（worker 启动检查，无视放行标志）
-- `test_env_example_local_default_inmemory_documents_mem0`（模板本地默认 inmemory、mem0 行与安装说明齐全）
-- `test_mem0_constructs_and_scopes_user_and_note` / `test_mem0_delete_by_note_paginates_past_page_cap`（threads6 真实集成：真 mem0ai 2.2.1 + pgvector + 确定性本地 embedder——user/note 过滤下推、小页上限下的穷尽删除；常规环境按原因跳过，运行方式见 `tests/test_mem0_integration.py` 模块 docstring）
+- `test_get_memory_store_unknown_backend_raises`（即使绕过 config 校验，store 工厂也不静默退化）
 
 ### INV-11 API 写入的乐观锁与 rev 语义（threads6 P1-2）
 
@@ -345,7 +351,8 @@ mem0 版本钉死：`server/requirements-mem0.txt` 写 `mem0ai==2.2.1`（4c1c9be
 
 实现形态（择一，写代码时注明）：
 
-- **回滚后重读**：`rollback` → 重新 SELECT 该行 → 按当前值分类。正面样例：PATCH 的 404/409 复查（`_raise_conflict_or_not_found`）、login 邀请码抢占后重读（owner 已有 → 登录该 owner）、login device upsert rowcount==0 后重读（异 user → 403）、refresh 轮换 rowcount==0 后**锁内**重读 token 行（不存在 → 401 不吊销 / revoked → 重放吊销 / 未 revoked → 过期 401，INV-8）。
+- **回滚后重读**：`rollback` → 重新 SELECT 该行 → 按当前值分类。正面样例：PATCH 的 404/409 复查（`_raise_conflict_or_not_found`）、login 邀请码抢占后重读（owner 已有 → 登录该 owner）、login device upsert rowcount==0 后重读（异 user → 403）、refresh 轮换 rowcount==0 后**锁内**重读 token 行（不存在 → 401 不吊销 / revoked → 重放吊销（再经 INV-8 的锁内复核）/ 未 revoked → 过期 401）。
+- **锁内重读（不回滚）**：持有行锁的会话里直接重读归因（refresh 的 token 行）。**必须绕过 identity map（threads7 P1，auth.py:280）**：条件 UPDATE/DELETE 用 `synchronize_session=False` 时**不会**更新该会话先前已加载的 ORM 对象，而 `select(Model)` / `session.get` 对已存在于 identity map 的行返回旧对象且不刷新其未过期属性——「重读」拿到的其实是首读快照（实测：并发轮换提交后，loser 的重读仍把 `revoked_at` 读成 `None` → 重放被误判成过期 401、设备保持活跃）。写法二选一：只查标量列（`select(M.col1, M.col2)`，Row 不是实体、不过 identity map）或 `.execution_options(populate_existing=True)`。**rollback 后重读天然安全**：`Session.rollback()` 默认把 identity map 全部过期（实测验证），本仓「条件写 0 行 → rollback → 重读」的各处因此不受影响；新代码不得依赖「碰巧没缓存」，一律按本条两种形态之一写。
 - **因果封闭论证豁免**：若能证明「0 行的所有可达成因都导向同一个正确动作」，可免重读，但必须在代码注释里写明论证。现仓豁免点：DELETE note 的 0 行 → 404（进 UPDATE 前刚确认过行存在，条件只有 `deleted_at IS NULL`，无 un-delete 路径 ⟹ 唯一成因是并发软删）；队列 claim/reclaim/finalize 的各 0 行 → 跳过该候选（成因 ∈ {被抢/已收尾/已回收}，跳过对一切成因都正确）；`_mark_memory_status`/`_mark_extract_failed`/`_mark_memory_sync_failed` 的 0 行 → 不标（条件里显式携带归因前提，前提不满足即不该标；且 (rev, deleted_at) 变化必伴随后继任务，INV-5 P1）。
 
 **保证代码**：`app/api/notes.py`、`app/api/auth.py`、`app/jobs/queue.py`、`app/pipeline/memory_sync.py`（上述各点，含注释论证）。
@@ -373,13 +380,18 @@ mem0 版本钉死：`server/requirements-mem0.txt` 写 `mem0ai==2.2.1`（4c1c9be
 | 建表 | 一次性 init-db（PG 咨询锁）+ compose migrate one-shot | 启动时各进程并发 create_all（现状）：check-then-create 非原子，多 worker 下 duplicate DDL 崩溃（C6）；Alembic 迁移框架 MVP 暂不引入（无线上数据），init-db 即 create_all 的串行化包装，后续可平滑换 Alembic |
 | NUL 拒绝 | 中间件（path/query 解码后查）+ schemas（body 与参数注解）双层 | 只靠 schemas：path/query 参数不经 pydantic body 校验，`/v1/notes/n%00x` 仍直达 PG（C8）；只靠中间件：body 校验散落各 handler 易漏 |
 | refresh 凭据存储（threads5 P1-2） | 独立 `refresh_tokens` 表一行一枚，登录只追加 + 每设备 5 枚修剪 | 沿用 devices 单列 hash（后写者胜）：并发登录每个 200 各自返回的 token 只有最后一枚能用，其余天生无效；「登录失败重试」方案则把并发首登的原子性又变回多语句竞态 |
-| 记忆全量枚举（threads5 P1-1） | metadata 过滤（pgvector `payload->>'note_id'`）+ 边取边删循环推进；取不满一页才算删净；InMemoryStore 同语义可注入上限 | 固定大 top_k（如 1000）当「全量」：超限用户的老笔记记忆删不净且 job 报成功；只按 user 全量列举再过滤：同样受页上限截断 |
+| 记忆全量枚举（threads5 P1-1） | metadata 过滤 + 边取边删循环推进；取不满一页才算删净；取满且无法推进即抛错；InMemoryStore 同语义可注入上限 | 固定大 top_k（如 1000）当「全量」：超限用户的老笔记记忆删不净且 job 报成功；只按 user 全量列举再过滤：同样受页上限截断 |
 | aware 时间边界（threads5 P2-4） | 先转 UTC 再套与 naive 相同的 `[0001-01-02, 9998-12-31]` 界 | 只校验「能转成 UTC」：`9999-12-31T23:59:59Z` 合法入库，抽取/提醒解析在用户时区 `astimezone` 处 OverflowError，note 被标 failed 而不是 422 |
 | 丢租约后的外部写（threads6 P1-1） | 复查丢租约 → 删己 id + 无条件补偿再入队（唯一索引去重） | 只删己 id 就返回：迟到的 delete_by_note 会删掉换主后写入的记忆且再无后继任务，note 永久无记忆而 memory_status=synced |
 | PATCH 内容不变快路径（threads6 P1-2） | 快路径也先做自赋值条件 UPDATE 原子校验 rev | 无锁读后直接 200：过期 rev + 恰好等于旧内容的请求绕过乐观锁，客户端把过期视图当当前态 |
 | 条件写 0 行的归因（threads6 P1-3） | 重读当前状态（或因果封闭论证豁免，注释载明）再分类 | 按猜测归因：refresh 轮换 0 行被当成重放 → 等锁期间被挤出/登出的 token 错吊销整台设备 |
 | refresh 行清理（threads6 P2） | 登录/刷新时顺手删 `expires_at<=now` 的行；已吊销未过期的保留到过期 | 不清理：常刷新设备的已吊销/过期行无限堆积；只清活行则上限约束不住表体积 |
-| embedding 凭证（threads6 P2） | `MEM0_EMBEDDING_API_KEY` 未设回退 `LLM_API_KEY` + 自定义配置的启动校验 | 固定用 `LLM_API_KEY`：embedding 与聊天不同源时应用能启动但每次 add/search 都 401，问题被掩盖到队列耗尽 |
+| 生产记忆后端（threads7 拆分） | mem0 适配层整体移至 feat/mem0-backend 分支（后续 PR）；本仓 `MEMORY_BACKEND ∈ {inmemory, disabled}`，MemoryStore 接口与 INV-3 后端契约保留 | 留在本仓：拆分目的 PR 会随 mem0 实现细节（版本钉死、驱动、embedding 凭据）继续膨胀，评审面无法收敛；接口与契约留在本仓保证 feat/mem0-backend 按同一契约验收 |
+| disabled 空后端（threads7） | 显式配置值：全接口空实现、memory_sync 平凡收敛标 synced、任何环境允许 | null-but-pretend 假实现：无法区分「关闭」与「在跑」；测试标志放行 inmemory：生产语义绑在测试开关上且 inmemory 是真丢数据；拒绝启动：拆分后分进程部署无任何可用配置 |
+| 锁内重读绕过 identity map（threads7 P1，auth.py:280） | 条件 UPDATE（synchronize_session=False）后的重读只查标量列或 `populate_existing=True` | 直接 `select(Model)`/`session.get`：命中 identity map 首读的旧对象，并发轮换的 `revoked_at` 读成 None，重放误判过期 401、设备保持活跃 |
+| 重放分支的锁内复核（threads7 P1，auth.py:246） | 所有通往吊销的分支先 `_lock_device`，锁内重读按「不存在→401、已过期→401、已作废→重放吊销」判定 | 拿无锁快照直接吊销：行已被登出删除/已过期未修剪时，普通 401 语义的请求吊销整台设备并作废全部现行 token |
+| 补偿入队的可靠性（threads7 P1，memory_sync.py:123） | 删己 id 与补偿入队构成 try/finally：清理抛异常也一定入队，异常照常上抛走重试 | 顺序执行：store.delete 抛异常直接退出，补偿被吞掉且本 job 租约已丢无法重试，损害无人对账 |
+| init-db 校验分层（threads7 P1，docker-compose.yml:24） | init-db 只加载 DbSettings（数据库层）；migrate/api/worker 按 command 各自过启动校验，compose 有测试机械验证 | init-db 加载完整 Settings：migrate 沿用 .env 本地默认 inmemory + PG 覆盖，撞上生产拓扑校验退出，全新部署停在建表一步 |
 
 ## 3. 数据模型与迁移
 
@@ -398,17 +410,18 @@ mem0 版本钉死：`server/requirements-mem0.txt` 写 `mem0ai==2.2.1`（4c1c9be
 
 1. 三套验证全绿：SQLite pytest、`TEST_DATABASE_URL=postgresql+asyncpg://...` pytest、根目录 `ruff check server`。
 2. 每个新增/修改的写路径对照 INV-1 加锁序列表；`grep -rn "update(Job)" server/app/api server/app/pipeline` 为空（业务路径不 UPDATE 既存 job 行）。
-3. 事务边界内无 LLM/mem0/网络调用：检查 extract/memory_sync/notes/auth 的每个 `session.begin()` 块。
+3. 事务边界内无 LLM/记忆后端/网络调用：检查 extract/memory_sync/notes/auth 的每个 `session.begin()` 块。
 4. 新增状态变更已同步更新本文档对应 INV 与测试；本文「保证代码」落点与实际文件/函数一致。
 5. 并发测试在 PG 下用独立会话/连接真并发；SQLite 下无法复现的竞态 `skipif` 并注明原因（沿用 `requires_postgres` 标记）。
 6. init-db 后核对三条部分唯一索引在 PG（`\d jobs`）与 SQLite（`sqlite_master`）都存在（或以测试断言）。
 7. 旧 dev 库处理：PG 卷重建或手动 ALTER（见第 3 节）；`.env.example` 若涉及新配置项同步更新（`test_env_example_placeholder_matches_template`、`test_env_example_local_default_inmemory_documents_mem0`、`test_env_example_documents_new_runtime_flags` 系列）。
-8. compose 校验：`migrate` one-shot 先于 api/worker（`service_completed_successfully`）；PG 下 api/worker 启动不再建表。
+8. compose 校验：`migrate` one-shot 先于 api/worker（`service_completed_successfully`）；PG 下 api/worker 启动不再建表；各服务环境按其 command 通过对应启动校验（migrate → DbSettings；api → 完整 Settings；worker → 完整 Settings + worker 拓扑校验），`tests/test_compose.py` 机械验证（threads7 P1）。
 9. 未来任何 header 值入库必须走 `NoNulStr`（INV-7 覆盖面表）。
 10. 新增携带版本的写接口（或给既有接口加 rev）：对照 INV-11——快路径/幂等命中也必须先原子校验 rev，409 体用 `error_body("conflict", …)` 两段式。
-11. 新增条件 UPDATE/DELETE 且消费 rowcount：对照 INV-12——0 行后重读归因，或注释里写因果封闭论证；禁止按单一猜测直接定性（重放/冲突/已删除）。
-12. 新增绕过数据库锁的外部写路径：对照 INV-5 总原则——外部写之后无条件再对账一次，丢租约必补偿再入队，不得静默返回。
+11. 新增条件 UPDATE/DELETE 且消费 rowcount：对照 INV-12——0 行后重读归因，或注释里写因果封闭论证；禁止按单一猜测直接定性（重放/冲突/已删除）。**不回滚的重读必须绕过 identity map**（只查标量列或 `populate_existing=True`，synchronize_session=False 不更新已加载对象）；rollback 后重读天然安全（rollback 使 identity map 过期）。
+12. 新增绕过数据库锁的外部写路径：对照 INV-5 总原则——外部写之后无条件再对账一次，丢租约必补偿再入队，不得静默返回；**补偿入队与它前面的清理外部写构成 try/finally**（清理抛异常也一定入队）。
 13. AGENTS.md「写代码」含本文链接且路径有效。
+14. 记忆后端改动：对照 INV-3 后端契约（枚举完整、不越权改动其他 note、add 不做 infer 类改写/合并）与本仓 `MEMORY_BACKEND ∈ {inmemory, disabled}` 枚举；生产后端（feat/mem0-backend）落地时契约不放宽。
 
 ## 5. 测试计划汇总（INV ↔ 计划测试名 ↔ 后端要求）
 
@@ -416,14 +429,14 @@ mem0 版本钉死：`server/requirements-mem0.txt` 写 `mem0ai==2.2.1`（4c1c9be
 | --- | --- | --- |
 | INV-1 | test_create_note_sql_order_job_insert_before_seq_update；test_patch_sql_order_note_reminders_jobs_before_seq_update；test_extract_finalize_concurrent_patch_no_deadlock；test_business_paths_never_update_existing_job_rows；保留 test_patch_and_organize_writeback_overlap_no_deadlock、test_patch_delete_organize_three_way_overlap_no_deadlock | 前二双后端；并发项 PG 真并发 |
 | INV-2 | test_extract_skips_when_rev_moved_marks_done；test_extract_attempts_exhausted_marks_note_failed_by_rev；test_extract_finalize_skips_note_patched_after_enqueue；test_memory_sync_single_pending_per_note；test_memory_sync_pending_allowed_while_running；test_memory_sync_single_running_per_note；test_extract_and_memory_sync_independent_attempts | 单 running 项 PG 真并发，SQLite 仅语义 |
-| INV-3 | test_memory_metadata_contains_note_id_and_source_rev；test_no_stale_rev_memory_after_repatch；test_delete_by_note_filters_by_note_metadata_and_paginates；test_delete_by_note_raises_when_page_never_shrinks；test_list_raises_when_page_full_cannot_advance；test_inmemory_list_page_cap_raises_when_full；test_memory_sync_fails_not_marks_synced_when_enumeration_incomplete | 双后端（mem0 形状用 fake client） |
+| INV-3 | test_memory_metadata_contains_note_id_and_source_rev；test_no_stale_rev_memory_after_repatch；test_inmemory_list_page_cap_raises_when_full；test_memory_sync_fails_not_marks_synced_when_enumeration_incomplete | 双后端；枚举语义由 InMemoryStore 可注入上限承载，生产后端等价测试随 feat/mem0-backend |
 | INV-4 | test_patch_and_delete_never_touch_memory_store_directly | 双后端 |
 | INV-5 | test_memory_sync_writes_memory_with_source_rev_and_marks_synced；test_memory_sync_on_deleted_note_removes_memory；test_memory_sync_on_unorganized_note_clears_stale_memory_without_add；test_memory_sync_requeues_and_deletes_only_own_ids_on_rev_change；test_memory_sync_converges_after_delete_during_add；test_memory_sync_recheck_fences_reclaimed_lease_deletes_own_ids；test_memory_sync_stalled_delete_by_note_past_lease_requeues_and_converges；test_memory_sync_worker_killed_mid_run_reclaimed_converges；test_memory_sync_attempts_exhausted_marks_failed_only_without_newer_job | 双后端语义；交错窗口用 DelayedAddStore 类时间注入复现（threads6 的停顿在 delete_by_note，同一手法），无需 PG |
 | INV-6 | test_stale_worker_finalize_ignored_after_lease_reclaimed_extract、test_stale_worker_finalize_ignored_after_lease_reclaimed_memory_sync；test_extract_finalize_marks_failed_only_at_enqueued_rev；test_memory_sync_finalize_failure_marks_memory_status_not_note_status | 双后端 |
 | INV-7 | test_nul_in_path_param_422；test_nul_in_query_param_422；test_nul_middleware_covers_all_routes；test_lone_surrogate_in_body_rejected_422；test_invalid_utf8_body_rejected_4xx；test_deeply_nested_asr_over_depth_limit_422；test_absurdly_deep_body_recursion_guard_422；test_huge_int_inputs_422；test_extreme_datetime_inputs_422；test_aware_datetime_boundary_rejected_before_extraction_no_500；test_llm_boundary_fire_at_overflow_discarded | 双后端 |
 | INV-8 | test_login_device_bound_to_other_user_403；test_concurrent_login_same_device_all_returned_tokens_refreshable；test_concurrent_first_login_same_device_no_integrity_error；test_refresh_token_cap_evicts_oldest_keeps_current；test_refresh_rotation_revokes_only_rotated_token；test_logout_revokes_all_device_refresh_tokens；test_refresh_expired_token_rejected_401；test_refresh_race_row_deleted_while_waiting_device_lock_401_no_revoke；test_refresh_prunes_expired_rows_keeps_revoked_until_expiry | 并发项 PG 真并发；threads6 竞态项钩子注入两后端可跑 |
 | INV-9 | test_init_db_concurrent_no_error_pg；test_lifespan_skips_create_all_on_postgres；test_init_db_sqlite_creates_tables | 并发项 PG |
-| INV-10 | test_openai_missing_api_key_rejected、test_openai_missing_base_url_rejected、test_openai_missing_model_rejected；test_openai_all_three_configured_ok；test_default_timezone_invalid_rejected；test_default_timezone_valid_ok；test_mem0_backend_missing_mem0ai_rejected_at_startup；test_mem0_embedding_api_key_falls_back_to_llm_key；test_mem0_embedding_custom_config_without_key_rejected；test_worker_refuses_inmemory_with_postgres；test_env_example_local_default_inmemory_documents_mem0 | 纯配置，无 DB |
+| INV-10 | test_openai_missing_api_key_rejected、test_openai_missing_base_url_rejected、test_openai_missing_model_rejected；test_openai_all_three_configured_ok；test_default_timezone_invalid_rejected；test_default_timezone_valid_ok；test_worker_refuses_inmemory_with_postgres；test_get_memory_store_unknown_backend_raises | 纯配置，无 DB；mem0 相关用例随生产后端移至 feat/mem0-backend |
 | INV-11 | test_patch_unchanged_text_with_stale_rev_409 | 双后端 |
 | INV-12 | test_refresh_race_row_deleted_while_waiting_device_lock_401_no_revoke；test_concurrent_sixth_login_eviction_vs_refresh_no_device_revoke_pg；正面样例回归 test_concurrent_patch_same_rev_exactly_one_success、test_login_device_bound_to_other_user_403 | 竞态项 PG 真并发；钩子注入项双后端 |
 
