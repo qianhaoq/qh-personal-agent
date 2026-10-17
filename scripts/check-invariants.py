@@ -105,7 +105,11 @@ def _only_seq_update(call: ast.Call) -> bool:
     for n in ast.walk(call):
         if isinstance(n, ast.Call) and _name(n.func) == "values":
             keys = {k.arg for k in n.keywords}
-            return bool(keys) and None not in keys and keys <= SEQ_COLUMNS and not n.args
+            for arg in n.args:  # mapping form: .values({Note.change_seq: seq})
+                if not isinstance(arg, ast.Dict) or None in arg.keys:
+                    return False
+                keys |= {_name(k) for k in arg.keys}
+            return bool(keys) and None not in keys and keys <= SEQ_COLUMNS
     return False
 
 

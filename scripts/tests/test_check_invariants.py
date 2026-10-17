@@ -46,6 +46,7 @@ class SeqLast(unittest.TestCase):
             await session.flush()
             seq = await allocate_seq(session)
             await session.execute(update(Note).where(Note.id == i).values(change_seq=seq))
+            await session.execute(update(Note).values({Note.change_seq: seq, "updated_at": now}))
             await session.flush()
         """), [])
 
