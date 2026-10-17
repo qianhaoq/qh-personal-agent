@@ -1,16 +1,19 @@
 """笔记接口：幂等创建、读取、乐观锁更新、软删除。
 
-加锁顺序（防 PG 死锁，规则见 app/common.py 的 allocate_seq docstring）：
-所有写路径都是先锁业务行（note 的条件 UPDATE → reminders 的条件
-UPDATE），最后才 allocate_seq，再用第二条 UPDATE 写 change_seq。
-MemoryStore 的读写（mem0 内部还会调 LLM/embedding）一律放在数据库
-事务提交之后，失败只记日志：删除路径有幂等的 cleanup_memory job 兜底，
-重整理路径由 _sync_memory 的 delete_by_note → add 幂等补写。
+加锁顺序（防 PG 死锁，规则见 app/common.py 的 allocate_seq docstring 与
+docs/server-invariants.md INV-1）：所有写路径都是先锁业务行（note 的条件
+UPDATE → reminders 的条件 UPDATE），再 INSERT job 行（一律新行、
+memory_sync 用 ON CONFLICT DO NOTHING，绝不 UPDATE 既存 job 行），全部
+flush 落定之后最后 allocate_seq，再用第二条 UPDATE 写 change_seq。
+
+记忆（mem0 内部还会调 LLM/embedding）一律不在这里写删（INV-4）：
+PATCH/DELETE 只在写事务内 enqueue memory_sync，由该 job 按 note 当前态
+幂等收敛（见 app/pipeline/memory_sync.py）。
 """
 import json
-import logging
+from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Path, Query
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,12 +24,9 @@ from app.db import get_db_session
 from app.deps import get_current_user_id
 from app.errors import ApiError
 from app.jobs.queue import enqueue
-from app.memory.base import get_memory_store
 from app.models import Note, Reminder
-from app.schemas import NoteCreate, NotePatch, note_to_dict
+from app.schemas import NoNulStr, NoteCreate, NotePatch, note_to_dict
 from app.timeutil import to_utc, utcnow
-
-logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1/notes", tags=["notes"])
 
@@ -75,11 +75,18 @@ async def create_note(
     )
     session.add(note)
     try:
-        # INSERT 业务行在前，allocate_seq 是事务里最后一把锁（全局规则，
-        # 见 app/common.py）：与 PATCH/organize 等路径保持同一顺序
+        # 业务行（note 新行 → jobs 新行）的 INSERT 全部先 flush 落定，之后
+        # allocate_seq 才是事务里最后一把锁（全局规则，见 app/common.py；
+        # job INSERT 在 seq 分配之前，修 C2）。与 PATCH/extract 等路径同序
         await session.flush()
+        await enqueue(
+            session,
+            "extract",
+            {"note_id": note.id, "rev": 1},
+            note_id=note.id,
+            note_rev=1,
+        )
         note.change_seq = await allocate_seq(session)
-        await enqueue(session, "organize_note", {"note_id": note.id, "rev": 1})
         await session.commit()
     except IntegrityError:
         # 并发提交相同 client_note_id：先查后插之间存在窗口，靠唯一约束兜底，
@@ -127,7 +134,7 @@ async def list_notes(
 
 @router.get("/{note_id}")
 async def get_note(
-    note_id: str,
+    note_id: Annotated[NoNulStr, Path()],
     user_id: str = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_db_session),
 ):
@@ -137,7 +144,7 @@ async def get_note(
 
 @router.patch("/{note_id}")
 async def patch_note(
-    note_id: str,
+    note_id: Annotated[NoNulStr, Path()],
     body: NotePatch,
     user_id: str = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_db_session),
@@ -149,10 +156,9 @@ async def patch_note(
         return {"note": note_to_dict(note), "rev": note.rev}
 
     # 加锁顺序（全局规则见 app.common.allocate_seq）：先条件更新业务行
-    # note（本条 UPDATE 拿行锁），再作废 reminders，最后才 allocate_seq
-    # 用第二条 UPDATE 写 change_seq。旧实现把 allocate_seq 写在 .values()
-    # 里（先锁 sequences 再锁 note），与 organize 写回的“先 FOR UPDATE
-    # note 再 allocate_seq”重叠时在 PG 上构成 AB-BA 死锁
+    # note（本条 UPDATE 拿行锁），再作废 reminders，再 INSERT job 行
+    # （extract + memory_sync，均新行），全部 flush 后最后 allocate_seq，
+    # 用第二条 UPDATE 写 change_seq
     result = await session.execute(
         update(Note)
         .where(
@@ -165,9 +171,9 @@ async def patch_note(
             text=body.text,
             rev=Note.rev + 1,
             status="uploaded",
-            # 旧记忆已随提交后的清理作废；新整理提交后
-            # organize 会重新写入并把标记置回 True
-            memory_synced=False,
+            # 旧 rev 的记忆已作废：由本次入队的 memory_sync 清掉（extract
+            # 成功后再写新 rev 的记忆）
+            memory_status="pending",
             updated_at=utcnow(),
         )
         .execution_options(synchronize_session=False)
@@ -182,18 +188,23 @@ async def patch_note(
             raise ApiError(404, "not_found", "笔记不存在")
         raise ApiError(409, "conflict", "版本冲突，请拉取最新版本后重试")
 
-    # 旧的整理产物作废，重新入队（带最新 rev，整理侧据此丢弃过期任务）
+    # 旧的整理产物作废，重新入队 extract（带新 rev，执行侧据此丢弃过期
+    # 任务）；同时入队 memory_sync 清旧记忆——即使 extract 永久失败，
+    # 旧 rev 的记忆也会被清掉（修 C4），且这里不再提交后直删记忆
+    # （mem0 会调外部服务，也不能放进事务；入口唯一化见 INV-4）
     reminder_ids = await _invalidate_outputs(session, note.id)
-    await enqueue(session, "organize_note", {"note_id": note_id, "rev": body.rev + 1})
+    await enqueue(
+        session,
+        "extract",
+        {"note_id": note_id, "rev": body.rev + 1},
+        note_id=note.id,
+        note_rev=body.rev + 1,
+    )
+    await enqueue(
+        session, "memory_sync", {"note_id": note_id}, note_id=note.id, dedupe_pending=True
+    )
     await _assign_change_seqs(session, note_id, reminder_ids)
     await session.commit()
-    # 旧记忆在提交后清理（mem0 会调外部 LLM/embedding，不能放进事务）：
-    # 失败只记日志——重新整理的 _sync_memory 本来就会先 delete_by_note
-    # 再 add，这里只是整理最终失败时也不留旧记忆的兜底
-    try:
-        await get_memory_store().delete_by_note(user_id, note_id)
-    except Exception:  # 记忆清理失败不能让已提交的 PATCH 变 500
-        logger.warning("patch %s: 旧记忆清理失败（重整理会再写）", note_id, exc_info=True)
     # expire_on_commit=False：显式刷新让 note_to_dict 读到条件更新后的行
     await session.refresh(note)
     return {"note": note_to_dict(note), "rev": note.rev}
@@ -201,13 +212,14 @@ async def patch_note(
 
 @router.delete("/{note_id}", status_code=204)
 async def delete_note(
-    note_id: str,
+    note_id: Annotated[NoNulStr, Path()],
     user_id: str = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_db_session),
 ):
     note = await _get_owned_note(session, user_id, note_id)
     # 加锁顺序（全局规则见 app.common.allocate_seq）：先条件更新业务行
-    # note → 软删 reminders，最后才 allocate_seq 写 change_seq
+    # note → 软删 reminders → INSERT memory_sync（新行，清记忆的唯一
+    # 入口）→ flush → 最后 allocate_seq 写 change_seq
     now = utcnow()
     result = await session.execute(
         update(Note)
@@ -220,18 +232,13 @@ async def delete_note(
         await session.rollback()
         raise ApiError(404, "not_found", "笔记不存在")
     reminder_ids = await _tombstone_reminders(session, note.id, only_suggested=False)
-    # 记忆清理兜底：幂等的 cleanup_memory job（笔记仍处于已删除才执行
-    # delete_by_note）。即使下面提交后的直接清理失败、或与整理任务的
-    # store.add 交错导致“删除后记忆复活”，也能最终清掉
-    await enqueue(session, "cleanup_memory", {"note_id": note_id, "user_id": user_id})
+    # 记忆清理由 memory_sync job 收敛（与任何在途的整理交错也不会复活或
+    # 误删，见 app/pipeline/memory_sync.py 的复查协议）
+    await enqueue(
+        session, "memory_sync", {"note_id": note_id}, note_id=note.id, dedupe_pending=True
+    )
     await _assign_change_seqs(session, note.id, reminder_ids)
     await session.commit()
-    # 提交后直接清理（mem0 会调外部 LLM/embedding，不能放进事务）；
-    # 失败只记日志，cleanup_memory job 会兜底
-    try:
-        await get_memory_store().delete_by_note(user_id, note_id)
-    except Exception:  # 已提交的删除不能因记忆后端故障变 500
-        logger.warning("delete %s: 记忆清理失败（cleanup_memory job 会兜底）", note_id, exc_info=True)
 
 
 async def _tombstone_reminders(
@@ -280,7 +287,7 @@ async def _assign_change_seqs(
 async def _invalidate_outputs(session: AsyncSession, note_id: str) -> list[str]:
     """重新整理前作废旧的建议提醒（返回被软删的提醒 id）。
 
-    已确认（scheduled 等）的提醒不动。记忆不在这里删：清理移到提交之后
-    由调用方执行（mem0 会调外部服务，不能放进持锁事务）。
+    已确认（scheduled 等）的提醒不动。记忆不在这里删（INV-4）：
+    清理由 PATCH 入队的 memory_sync job 负责。
     """
     return await _tombstone_reminders(session, note_id, only_suggested=True)

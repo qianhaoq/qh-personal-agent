@@ -3,7 +3,7 @@ import asyncio
 import logging
 
 from app.config import get_settings
-from app.db import create_all
+from app.db import startup_create_all
 from app.pipeline.runner import run_pending_jobs
 
 logging.basicConfig(
@@ -15,7 +15,8 @@ logger = logging.getLogger("worker")
 
 async def main() -> None:
     settings = get_settings()
-    await create_all()
+    # PG 下不建表（先跑 init-db，见 INV-9）；SQLite 本地开发保留
+    await startup_create_all()
     logger.info("worker started (interval=%.1fs)", settings.worker_poll_interval_seconds)
     while True:
         try:

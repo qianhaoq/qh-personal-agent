@@ -1,6 +1,6 @@
 """鉴权接口：邀请码 + 设备注册、refresh 轮换、登出。"""
 from fastapi import APIRouter, Depends
-from sqlalchemy import or_, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.tokens import (
@@ -30,6 +30,53 @@ def _token_pair(user_id: str, device_id: str) -> dict:
     }
 
 
+def _device_upsert(device_id: str, user_id: str, body: LoginRequest, refresh_hash: str, now):
+    """单条 INSERT … ON CONFLICT DO UPDATE（INV-8，修 C1）：原子完成
+    「存在性检查 + 归属检查 + refresh hash 覆写」。
+
+    - 无冲突 → 插入新设备行；
+    - 冲突且 user_id 相同 → DO UPDATE 覆写 refresh hash、清 prev/revoked、
+      刷新 last_seen（name/platform 仅在请求非空时覆盖）；
+    - 冲突且 user_id 不同 → WHERE 不成立，rowcount=0 → 调用方复查后 403。
+
+    并发语义：同设备登录在行/PK 上串行化（不再有“先 get 再改写”的
+    读-写窗口，也不会 IntegrityError 500）；refresh hash 后写者胜。
+    """
+    if is_postgres():
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        insert_stmt = pg_insert(Device)
+    else:
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        insert_stmt = sqlite_insert(Device)
+    stmt = insert_stmt.values(
+        id=device_id,
+        user_id=user_id,
+        name=body.device_name or "",
+        platform=body.platform or "android",
+        refresh_token_hash=refresh_hash,
+        prev_refresh_token_hash=None,
+        revoked_at=None,
+        last_seen=now,
+    )
+    excluded = stmt.excluded
+    return stmt.on_conflict_do_update(
+        index_elements=[Device.id],
+        set_={
+            "refresh_token_hash": refresh_hash,
+            "prev_refresh_token_hash": None,
+            "revoked_at": None,
+            "last_seen": now,
+            # 请求里为空的 name/platform 不覆盖已有值
+            "name": func.coalesce(func.nullif(excluded.name, ""), Device.name),
+            "platform": func.coalesce(func.nullif(excluded.platform, ""), Device.platform),
+        },
+        # 归属检查放进语句：设备已绑定其他账号时不更新（rowcount=0 → 403）
+        where=Device.user_id == excluded.user_id,
+    )
+
+
 @router.post("/login")
 async def login(body: LoginRequest, session: AsyncSession = Depends(get_db_session)):
     invite = await session.get(InviteCode, body.invite_code)
@@ -42,7 +89,7 @@ async def login(body: LoginRequest, session: AsyncSession = Depends(get_db_sessi
     # 本事务用户 id 的事务才创建账号）：并发首登同一码时，其余事务
     # rowcount=0 后复查，按“同码后续登录复用同一账号”的既有语义登录
     # 先占到的人——同一邀请码不会创建出多个用户。加锁顺序上这是唯一
-    # 要锁的业务行之一（invite → user/device，本接口不碰 sequences）
+    # 要锁的业务行之一（invite → user → device，本接口不碰 sequences）
     user_id = invite.owner_user_id
     if user_id is None:
         if invite.used >= invite.max_uses:
@@ -77,20 +124,18 @@ async def login(body: LoginRequest, session: AsyncSession = Depends(get_db_sessi
             session.add(User(id=user_id))
             await session.flush()
 
-    device = await session.get(Device, body.device_id)
-    if device is not None and device.user_id != user_id:
-        raise ApiError(403, "device_conflict", "设备已绑定其他账号")
-
     result = _token_pair(user_id, body.device_id)
-    if device is None:
-        device = Device(id=body.device_id, user_id=user_id)
-        session.add(device)
-    device.name = body.device_name or device.name
-    device.platform = body.platform or device.platform
-    device.refresh_token_hash = hash_refresh_token(result["refresh_token"])
-    device.prev_refresh_token_hash = None
-    device.revoked_at = None
-    device.last_seen = now
+    upserted = await session.execute(
+        _device_upsert(body.device_id, user_id, body, hash_refresh_token(result["refresh_token"]), now)
+    )
+    if upserted.rowcount == 0:
+        # WHERE 不成立：设备已绑定其他账号。复查确认后 403（行不存在 =
+        # 并发删除，当前无删除路径，保守按冲突处理并让部署问题暴露）
+        await session.rollback()
+        device = await session.get(Device, body.device_id)
+        if device is None or device.user_id == user_id:
+            raise ApiError(500, "internal_error", "设备行状态异常，登录未落定")
+        raise ApiError(403, "device_conflict", "设备已绑定其他账号")
     await session.commit()
     return result
 
