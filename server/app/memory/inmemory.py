@@ -1,4 +1,6 @@
 """进程内记忆实现：字符级/关键词混合相似度，测试与本地开发用。"""
+from __future__ import annotations
+
 from difflib import SequenceMatcher
 
 from app.common import new_id
@@ -33,10 +35,12 @@ class InMemoryStore(MemoryStore):
     def __init__(self) -> None:
         self._items: dict[str, MemoryItem] = {}  # memory_id -> item
 
-    async def add(self, user_id: str, text: str, note_id: str | None = None) -> MemoryItem:
-        item = MemoryItem(id=new_id("mem"), user_id=user_id, text=text, note_id=note_id)
+    async def add(
+        self, user_id: str, text: str, *, note_id: str | None = None, source_rev: int | None = None
+    ) -> list[MemoryItem]:
+        item = MemoryItem(id=new_id("mem"), user_id=user_id, text=text, note_id=note_id, source_rev=source_rev)
         self._items[item.id] = item
-        return item
+        return [item]
 
     async def search(self, user_id: str, query: str, top_k: int = 5) -> list[MemoryItem]:
         scored = [
@@ -54,6 +58,7 @@ class InMemoryStore(MemoryStore):
                     user_id=item.user_id,
                     text=item.text,
                     note_id=item.note_id,
+                    source_rev=item.source_rev,
                     score=round(score, 4),
                     created_at=item.created_at,
                 )
@@ -63,12 +68,15 @@ class InMemoryStore(MemoryStore):
     async def list(self, user_id: str) -> list[MemoryItem]:
         return [item for item in self._items.values() if item.user_id == user_id]
 
-    async def delete(self, user_id: str, memory_id: str) -> bool:
-        item = self._items.get(memory_id)
-        if item is None or item.user_id != user_id:
-            return False
-        del self._items[memory_id]
-        return True
+    async def delete(self, user_id: str, memory_ids: list[str]) -> int:
+        """按 id 精确删（只删属于该用户的）：复查不一致时清理本次新增用。"""
+        deleted = 0
+        for mid in memory_ids:
+            item = self._items.get(mid)
+            if item is not None and item.user_id == user_id:
+                del self._items[mid]
+                deleted += 1
+        return deleted
 
     async def delete_by_note(self, user_id: str, note_id: str) -> int:
         ids = [

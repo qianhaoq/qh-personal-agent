@@ -1,4 +1,10 @@
-"""MemoryStore 抽象：全部按 user_id 隔离。"""
+"""MemoryStore 抽象：全部按 user_id 隔离。
+
+记忆归属（INV-3，docs/server-invariants.md）：每条由本服务写入的记忆
+metadata 必含 note_id 与 source_rev——记忆只属于 note 的当前 rev。
+写删记忆的唯一入口是 memory_sync job（app/pipeline/memory_sync.py）。"""
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
@@ -9,13 +15,19 @@ class MemoryItem:
     user_id: str
     text: str
     note_id: str | None = None
+    source_rev: int | None = None
     score: float = 0.0
     created_at: str | None = None
 
 
 class MemoryStore(ABC):
+    """add 返回本次写入的全部记忆（mem0 一次 add 可能产生多条）；
+    delete 按 memory id 列表精确删（复查不一致时只删本次新增，修 C9）。"""
+
     @abstractmethod
-    async def add(self, user_id: str, text: str, note_id: str | None = None) -> MemoryItem: ...
+    async def add(
+        self, user_id: str, text: str, *, note_id: str | None = None, source_rev: int | None = None
+    ) -> list[MemoryItem]: ...
 
     @abstractmethod
     async def search(self, user_id: str, query: str, top_k: int = 5) -> list[MemoryItem]: ...
@@ -24,7 +36,7 @@ class MemoryStore(ABC):
     async def list(self, user_id: str) -> list[MemoryItem]: ...
 
     @abstractmethod
-    async def delete(self, user_id: str, memory_id: str) -> bool: ...
+    async def delete(self, user_id: str, memory_ids: list[str]) -> int: ...
 
     @abstractmethod
     async def delete_by_note(self, user_id: str, note_id: str) -> int: ...

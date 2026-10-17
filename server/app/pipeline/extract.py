@@ -1,32 +1,27 @@
-"""自动整理流水线：每条笔记只调用一次 LLM。
+"""LLM 抽取流水线：每条笔记只调用一次 LLM。
+
+extract job（INV-2）：只负责 LLM 抽取与整理产物落库；记忆写删一律由
+memory_sync job 负责（唯一入口，见 app/pipeline/memory_sync.py）——本
+模块不 import memory store（INV-4）。
 
 事务划分（P2：持锁期间不调外部服务）：
 1. 短读事务：读 note 快照（text/rev/timezone/recorded_at 等），不加锁、
-   不分配 seq。笔记已删除直接跳过；已 organized 但 memory_synced=False
-   说明上次整理的 DB 副作用已提交、只差记忆没写上（store.add 失败后的
-   重试），跳过 LLM 只补写记忆
+   不分配 seq。笔记已删除 → 跳过 = done；note.rev != 入队 rev（入队后
+   被 PATCH，PATCH 已重新入队）→ 跳过 = done（过期任务无副作用）。
 2. LLM 结构化抽取（JSON Schema：title/tags/todos/suggested_reminders）
-   在所有事务之外调用——最长 llm_timeout_seconds。旧实现把它关在
-   SELECT ... FOR UPDATE 事务里，期间同笔记的 PATCH 与全库写事务
-   （sequences 行锁）都被串行阻塞
+   在所有事务之外调用——最长 llm_timeout_seconds。
 3. 短写事务：锁 note（PG：FOR UPDATE；SQLite 无行锁跳过）并复查——
-   已删除，或 rev != 入队 rev（LLM 调用期间被 PATCH，会重新入队）则
-   放弃本次结果，job 视为完成；否则清旧产物、写 note 与建议提醒。
-   业务行的 UPDATE/INSERT 全部 flush 之后才 allocate_seq（全局加锁
-   顺序规则，见 app.common.allocate_seq：sequences 必须是事务里最后
-   一把锁），change_seq 由其后的第二条 UPDATE 写回
-4. 写事务提交后再写 MemoryStore（mem0 内部还会调 LLM/embedding）：
-   先 delete_by_note 再 add，add 之后复查 note（新事务）：期间笔记
-   被删除（防“删除后记忆复活”：删除路径的清理与本次 add 交错）或
-   rev 又变了（被 PATCH，本次整理已作废）就把刚写入的记忆再删掉。
-   失败抛异常交给 job 队列重试；重试时按第 1 步的判定只补写记忆，
-   不再调 LLM，保证记忆最终写入且不重复。删除路径另有幂等的
-   cleanup_memory job 兜底（见 cleanup_note_memory）
+   已删除或 rev != 入队 rev 则放弃本次结果（job 视为完成）；否则清旧
+   产物、写 note 与建议提醒、enqueue memory_sync（同事务）。业务行
+   （note → reminders → jobs）的 UPDATE/INSERT 全部 flush 之后才
+   allocate_seq（全局加锁顺序规则，见 app.common.allocate_seq：
+   sequences 必须是事务里最后一把锁），change_seq 由其后的第二条
+   UPDATE 写回。
 
-相对时间以 note.recorded_at（及其时区）为参照；早于参照时间或早于
-服务器当前时间的 fire_at 都不生成建议提醒。
-失败最多重试 job_max_attempts 次（由 jobs 队列的 attempts 控制），
-之后 note.status=failed。
+相对时间以 note.recorded_at（及其时区）为参照；早于参照时间或早于服务器
+当前时间的 fire_at 都不生成建议提醒。失败最多重试 job_max_attempts 次
+（由 jobs 队列的 attempts 控制），之后按入队 rev 条件置 note.status=failed
+（见 jobs.queue.mark_note_failed_on_job_failure）。
 """
 import json
 import re
@@ -34,15 +29,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.common import allocate_seq, new_id
 from app.config import get_settings
 from app.db import get_sessionmaker
-from app.jobs.queue import is_postgres
+from app.jobs.queue import enqueue, is_postgres
 from app.llm.base import EXTRACTION_SCHEMA, get_llm_client
-from app.memory.base import get_memory_store
 from app.models import Note, Reminder
 from app.timeutil import as_utc, utcnow
 
@@ -134,12 +128,8 @@ def _coerce_extraction(data: dict) -> dict:
     }
 
 
-async def organize_note(note_id: str, enqueued_rev: int | None = None) -> None:
-    """整理一条笔记。抛异常由调用方（runner）决定重试。
-
-    LLM 与记忆写入都在数据库事务之外：前者纯外部调用，后者的失败靠
-    job 重试 + memory_synced 标记幂等补写（见模块 docstring 第 1/4 步）。
-    """
+async def extract_note(note_id: str, enqueued_rev: int | None = None) -> None:
+    """抽取并落库一条笔记的整理产物。抛异常由调用方（runner）决定重试。"""
     maker = get_sessionmaker()
 
     # 1. 短读事务：不加锁、不占序列，读完即提交
@@ -147,8 +137,10 @@ async def organize_note(note_id: str, enqueued_rev: int | None = None) -> None:
         note = await session.get(Note, note_id)
         if note is None or note.deleted_at is not None:
             return
-        # 上次整理只差记忆没写上：跳过 LLM，直接走补写
-        memory_only = note.status == "organized" and not note.memory_synced
+        if enqueued_rev is not None and note.rev != enqueued_rev:
+            # 入队后 rev 已变（PATCH 会重新入队）：本次任务没有可整理的
+            # 版本，跳过 = done，无任何副作用
+            return
         snapshot = _NoteSnapshot(
             note_id=note.id,
             user_id=note.user_id,
@@ -157,25 +149,15 @@ async def organize_note(note_id: str, enqueued_rev: int | None = None) -> None:
             timezone=note.timezone,
             recorded_at=note.recorded_at,
         )
-    if not memory_only and enqueued_rev is not None and snapshot.rev != enqueued_rev:
-        # 入队后 rev 已变（PATCH 会重新入队）：本次任务没有可整理的版本
-        return
 
-    if not memory_only:
-        # 2. LLM 在事务外调用；规范化文本只作为输入，不写回 note.text
-        normalized = normalize_text(snapshot.text)
-        llm = await get_llm_client()
-        raw = await llm.chat(_build_messages(snapshot, normalized), response_format=EXTRACTION_SCHEMA)
-        extraction = _coerce_extraction(_parse_llm_json(raw))
+    # 2. LLM 在事务外调用；规范化文本只作为输入，不写回 note.text
+    normalized = normalize_text(snapshot.text)
+    llm = await get_llm_client()
+    raw = await llm.chat(_build_messages(snapshot, normalized), response_format=EXTRACTION_SCHEMA)
+    extraction = _coerce_extraction(_parse_llm_json(raw))
 
-        # 3. 短写事务：复查不过说明结果已过期，放弃本次（job 视为完成）
-        if await _apply_extraction(maker, note_id, enqueued_rev, snapshot, extraction):
-            return
-
-    # 4. 记忆写入在写事务提交之后。expected_rev 是本次整理落库后的期望
-    # rev（apply 路径 snapshot.rev+1；补写路径不变），_sync_memory 用它
-    # 复查“add 之后笔记是否又被删除/修改”
-    await _sync_memory(maker, snapshot, snapshot.rev + (0 if memory_only else 1))
+    # 3. 短写事务：复查不过说明结果已过期，放弃本次（job 视为完成）
+    await _apply_extraction(maker, note_id, enqueued_rev, snapshot, extraction)
 
 
 async def _apply_extraction(
@@ -185,7 +167,10 @@ async def _apply_extraction(
     snapshot: _NoteSnapshot,
     extraction: dict,
 ) -> bool:
-    """短写事务：锁行复查后写入整理产物。返回 True 表示放弃（已删除/rev 已变）。"""
+    """短写事务：锁行复查后写入整理产物，同事务 enqueue memory_sync。
+
+    返回 True 表示放弃（已删除/rev 已变）。
+    """
     settings = get_settings()
     async with maker() as session, session.begin():
         stmt = select(Note).where(Note.id == note_id)
@@ -229,7 +214,7 @@ async def _apply_extraction(
         note.status = "organized"
         note.rev += 1
         note.llm_calls += 1
-        note.memory_synced = False  # 记忆要等提交后由 _sync_memory 写入
+        note.memory_status = "pending"  # 记忆由本事务入队的 memory_sync 写
         note.updated_at = now
         for r in stale:
             r.deleted_at = now
@@ -245,9 +230,18 @@ async def _apply_extraction(
             )
             session.add(row)
             fresh_rows.append(row)
-        # 业务行（note → reminders）的 UPDATE/INSERT 全部先 flush 落定、
-        # 拿到行锁，之后才 allocate_seq：sequences 必须是本事务最后一把
-        # 锁（全局加锁顺序规则，见 app.common.allocate_seq）。反过来
+        # 记忆同步入队（同事务，pending 去重）：业务路径对 job 行只有
+        # INSERT（INV-1.3）。enqueue 内部自带 flush（jobs INSERT 落定）
+        await enqueue(
+            session,
+            "memory_sync",
+            {"note_id": note.id},
+            note_id=note.id,
+            dedupe_pending=True,
+        )
+        # 业务行（note → reminders → jobs）的 UPDATE/INSERT 全部先 flush
+        # 落定、拿到行锁，之后才 allocate_seq：sequences 必须是本事务最后
+        # 一把锁（全局加锁顺序规则，见 app.common.allocate_seq）。反过来
         # （先 allocate_seq 再锁 note）会与 PATCH 的“先条件 UPDATE note”
         # 构成 AB-BA 死锁
         await session.flush()
@@ -264,65 +258,6 @@ async def _apply_extraction(
             row.change_seq = next(seqs)
         await session.flush()
     return False
-
-
-async def _sync_memory(
-    maker: async_sessionmaker[AsyncSession], snapshot: _NoteSnapshot, expected_rev: int
-) -> None:
-    """把笔记写入 MemoryStore（在写事务提交之后），成功后置 memory_synced。
-
-    mem0 内部还会调 LLM/embedding，同样不能放进数据库事务。失败抛给
-    job 队列重试：重试时 note 已 organized 且 memory_synced=False，只走
-    补写路径（不再调 LLM）。先 delete_by_note 再 add，重放不会产生
-    重复记忆；标记本身失败也只需再补写一次。
-
-    add 之后复查（新事务读 note）：期间笔记被删除——delete 的清理与
-    本次 add 交错会让已删笔记的记忆“复活”——或 rev 又变了（被 PATCH，
-    本次整理已作废，重新入队的任务会重写）时，把刚写入的记忆再删掉
-    且不置 memory_synced。删除路径另有幂等的 cleanup_memory job 兜底
-    （见 cleanup_note_memory）：即使复查读到的是删除提交前的快照，
-    较晚落定的那一方也会把记忆清掉。
-    """
-    store = get_memory_store()
-    await store.delete_by_note(snapshot.user_id, snapshot.note_id)
-    await store.add(snapshot.user_id, snapshot.text, note_id=snapshot.note_id)
-    async with maker() as session:
-        note = await session.get(Note, snapshot.note_id)
-    if note is None or note.deleted_at is not None or note.rev != expected_rev:
-        await store.delete_by_note(snapshot.user_id, snapshot.note_id)
-        return
-    async with maker() as session, session.begin():
-        # 条件更新：期间被 PATCH（status 回到 uploaded，记忆已作废）、
-        # 删除或 rev 再变时不置位，交给重新入队的任务
-        await session.execute(
-            update(Note)
-            .where(
-                Note.id == snapshot.note_id,
-                Note.deleted_at.is_(None),
-                Note.status == "organized",
-                Note.memory_synced.is_(False),
-                Note.rev == expected_rev,
-            )
-            .values(memory_synced=True)
-            .execution_options(synchronize_session=False)
-        )
-
-
-async def cleanup_note_memory(note_id: str, user_id: str) -> None:
-    """cleanup_memory job 的实现：清掉已删笔记在 MemoryStore 的残留。
-
-    幂等：只有笔记仍处于已删除（或行已不存在）才执行 delete_by_note；
-    未删除则跳过，避免误删在用记忆。与 organize 的 _sync_memory 交错时
-    （job 先跑、add 后落，或反之），_sync_memory 的 add 后复查与本 job
-    中较晚执行的一方会把已删笔记的记忆清掉，防“删除后记忆复活”。
-    """
-    maker = get_sessionmaker()
-    async with maker() as session:
-        note = await session.get(Note, note_id)
-    if note is not None and note.deleted_at is None:
-        return
-    store = get_memory_store()
-    await store.delete_by_note(user_id, note_id)
 
 
 def _parse_fire_at(value, tzname: str):

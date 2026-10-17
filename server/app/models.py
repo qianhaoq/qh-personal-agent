@@ -4,7 +4,6 @@ from datetime import UTC, datetime
 from sqlalchemy import (
     JSON,
     BigInteger,
-    Boolean,
     DateTime,
     ForeignKey,
     Index,
@@ -12,6 +11,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -86,9 +86,11 @@ class Note(Base):
     tags: Mapped[list | None] = mapped_column(JSON, nullable=True)
     todos: Mapped[list | None] = mapped_column(JSON, nullable=True)
     llm_calls: Mapped[int] = mapped_column(Integer, default=0)
-    # 整理产物已写入 MemoryStore。记忆写入在 DB 事务提交之后（mem0 内部
-    # 还有 LLM/embedding 调用），失败靠 job 重试补写（见 pipeline/organize）
-    memory_synced: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # 记忆同步状态（服务端内部，不进 API 响应、不占 change_seq）：
+    # pending（有变更待同步）| synced（记忆 == f(note 当前态)）| failed
+    #（同步耗尽，可见可恢复）。写删记忆的唯一入口是 memory_sync job
+    # （见 app/pipeline/memory_sync.py）
+    memory_status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
     rev: Mapped[int] = mapped_column(Integer, default=1)
     change_seq: Mapped[int] = mapped_column(BigInteger, default=0, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -118,8 +120,34 @@ class Reminder(Base):
 
 
 class Job(Base):
+    """任务队列行。kind ∈ {extract, memory_sync}（见 docs/server-invariants.md INV-2）：
+
+    - extract 携带 note_rev（入队时的笔记版本；执行时 rev 不一致即跳过=done）；
+    - memory_sync 不带 rev，按 note 当前状态收敛记忆；每个 note 至多一个
+      pending / 一个 running 的 memory_sync（部分唯一索引硬保证）。
+    """
+
     __tablename__ = "jobs"
-    __table_args__ = (Index("ix_jobs_status_run_after", "status", "run_after"),)
+    __table_args__ = (
+        Index("ix_jobs_status_run_after", "status", "run_after"),
+        Index("ix_jobs_note_id", "note_id"),
+        # 部分唯一索引（双方言）：memory_sync 的 pending / running 各自按
+        # note 去重/串行化，数据库层硬保证（INV-2.3/2.4）
+        Index(
+            "uq_jobs_memsync_pending",
+            "note_id",
+            unique=True,
+            postgresql_where=text("kind = 'memory_sync' AND status = 'pending'"),
+            sqlite_where=text("kind = 'memory_sync' AND status = 'pending'"),
+        ),
+        Index(
+            "uq_jobs_memsync_running",
+            "note_id",
+            unique=True,
+            postgresql_where=text("kind = 'memory_sync' AND status = 'running'"),
+            sqlite_where=text("kind = 'memory_sync' AND status = 'running'"),
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     kind: Mapped[str] = mapped_column(String(32))
@@ -133,6 +161,9 @@ class Job(Base):
     # 持有租约的 worker 实例 id：收尾按 (status, locked_by, locked_at) 校验，
     # 任务被回收换主后旧 worker 的收尾不再生效（见 jobs.queue.finalize_claim）
     locked_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # 任务归属的笔记（两种 kind 都填）；extract 另带入队时的 rev
+    note_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    note_rev: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
