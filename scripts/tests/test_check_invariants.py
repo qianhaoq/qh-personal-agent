@@ -205,6 +205,11 @@ class Fallback(unittest.TestCase):
                 case "mock":
                     if _client is None:
                         return MockLLM()
+        def w(p):
+            match p:
+                case _ if p == "mock":
+                    if _client is None:
+                        return MockLLM()
         def n(s):
             if s.provider != "mock":
                 return OpenAI(s)

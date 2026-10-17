@@ -312,7 +312,10 @@ def check_fallback(tree, path, parents) -> list[Finding]:
         for p in _ancestors(c, parents):
             if isinstance(p, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 break
-            if isinstance(p, ast.match_case) and not (isinstance(p.pattern, ast.MatchAs) and p.pattern.pattern is None):
+            if isinstance(p, ast.match_case) and (
+                not (isinstance(p.pattern, ast.MatchAs) and p.pattern.pattern is None)
+                or (p.guard is not None and not _implicit_test(p.guard))
+            ):
                 explicit = True  # enclosing literal/value case (case "mock": / case Provider.MOCK:)
                 break
             if isinstance(p, ast.ExceptHandler):
