@@ -130,6 +130,9 @@ def _exclusive(a, b, parents) -> bool:
     child = a
     for p in _ancestors(a, parents):
         if id(p) in anc_b:
+            if isinstance(p, ast.Match):  # different case arms never both run
+                cb = next((x for x in [b, *_ancestors(b, parents)] if parents.get(x) is p), None)
+                return isinstance(child, ast.match_case) and isinstance(cb, ast.match_case) and child is not cb
             if not isinstance(p, ast.If):
                 return False
             cb = b
@@ -155,7 +158,8 @@ def check_seq_last(tree, path, parents) -> list[Finding]:
              and next((p for p in _ancestors(c, parents) if isinstance(p, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))), None) is fn),
             key=_pos,
         )
-        for seq in (c for c in calls if _name(c.func) == SEQ_FUNC):
+        for seq in (c for c in calls if _name(c.func) == SEQ_FUNC
+                    and not any(isinstance(p, (ast.GeneratorExp, ast.Lambda)) for p in _ancestors(c, parents))):
             sess = seq.args[0].id if seq.args and isinstance(seq.args[0], ast.Name) else None
             if sess not in sessions:
                 continue
@@ -286,6 +290,9 @@ def check_fallback(tree, path, parents) -> list[Finding]:
         child, why, explicit = c, None, False
         for p in _ancestors(c, parents):
             if isinstance(p, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                break
+            if isinstance(p, ast.match_case) and not (isinstance(p.pattern, ast.MatchAs) and p.pattern.pattern is None):
+                explicit = True  # enclosing literal/value case (case "mock": / case Provider.MOCK:)
                 break
             if isinstance(p, ast.ExceptHandler):
                 why = why or "in an except handler"

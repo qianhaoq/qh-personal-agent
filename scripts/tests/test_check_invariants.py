@@ -75,6 +75,15 @@ class SeqLast(unittest.TestCase):
                 seq = await allocate_seq(session)
             else:
                 session.add(row)
+        async def m(session, k):
+            match k:
+                case "a":
+                    seq = await allocate_seq(session)
+                case _:
+                    session.add(row)
+        async def g(session, items):
+            gen = (await allocate_seq(session) for _ in items)
+            session.add(row)
         async def c(self, other):
             seq = await allocate_seq(self.session)
             other.session.add(audit)
@@ -179,6 +188,11 @@ class Fallback(unittest.TestCase):
             if s.provider == "mock":
                 if _client is None:
                     _client = MockLLM()
+        def f(p):
+            match p:
+                case "mock":
+                    if _client is None:
+                        return MockLLM()
         def d(s):
             if s.provider == "mock" and s.mock_seed is None:
                 return MockLLM()
