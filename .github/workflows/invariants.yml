@@ -1,0 +1,42 @@
+# Server invariant check (scripts/check-invariants.py; rules in docs/agent-pitfalls.md,
+# source of truth docs/server-invariants.md, which lands with PR #2).
+# Own workflow on purpose: a red invariant check must not turn the `CI` workflow
+# red (auto-merge only acts on a successful CI workflow_run). NOT a required check.
+# Check name as it appears on PRs: "Invariant Check (non-required)".
+# Exits 0 while server/ does not exist. Stdlib only, no installs, no secrets.
+
+name: Invariants
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  invariants:
+    name: Invariant Check (non-required)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Checker unit tests
+        run: python -m unittest discover -s scripts/tests -v
+
+      - name: check-invariants
+        run: python scripts/check-invariants.py .
