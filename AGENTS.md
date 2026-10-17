@@ -17,6 +17,7 @@
 - 每个改动一个分支、一个 PR；不直接推 `main`（受保护）。
 - 先读后写的状态变更（乐观锁、token 轮换、计数、状态机）必须锁行（SELECT … FOR UPDATE）或用条件更新（UPDATE … WHERE 旧值），并配并发测试。
 - 数据库写事务的加锁顺序全局固定：**先锁业务行**（条件 UPDATE / FOR UPDATE，业务行之间按 note → reminders → device … 的顺序），全部写完后再调用 `allocate_seq`（server/app/common.py，须紧贴提交），change_seq 用其后的第二条 UPDATE 写入；绝不允许先 `allocate_seq` 再去锁业务行——PG 上会与其他路径构成 AB-BA 死锁（PATCH 与 organize 写回曾因此死锁）。不得依赖 ORM autoflush 隐式落序：业务行写完显式 flush 后才分配 seq。
+- 改服务端前先读 [docs/server-invariants.md](docs/server-invariants.md)，改动不得违反其中不变量；新增状态变更需同步更新该文档与对应测试。
 - 事务边界里不得有 LLM / mem0 / 网络调用；鉴权等只读依赖用**独立短会话**完成即还连接（server/app/deps.py），不得把请求级会话/事务带进秒级外部调用。
 - 字符串入参一律拒绝 NUL（\x00）：schemas 层统一用 `NoNulStr`/`reject_nul`（server/app/schemas.py）校验成 422，而不是等 PG 编码错误变 500。
 - 异步 job 的收尾必须带租约条件（`WHERE status='running' AND locked_by=:me AND locked_at=:claimed`，见 server/app/jobs/queue.py 的 `finalize_claim`）：任务被回收换主后旧 worker 的收尾一律放弃。
