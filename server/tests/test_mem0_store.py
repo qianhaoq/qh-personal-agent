@@ -5,7 +5,11 @@ fake 严格按钉住的 mem0ai==2.2.1 签名建模（requirements-mem0.txt）：
   作用域只认 filters={"user_id": ...}；search 的条数参数是 top_k；
 - get_all 按 top_k 截断（默认 20）；filters 的 **metadata 键**像 pgvector
   一样下推过滤（threads5 P1-1：delete_by_note 靠它精确枚举）；
-- add 的 infer 主路径返回裸 list（不是 {"results": [...]}）；
+- add 的 infer 主路径返回裸 list（不是 {"results": [...]}）且文本与既有
+  记忆相似时**原地改写**那条记忆（mem0 默认 infer=True 的 LLM 决策会跨
+  note 改写，Codex P1 / INV-3——fake 用「最长公共子串 ≥ 3」近似「相关」，
+  证明适配层的 infer=False 调用不触碰其他 note_id）；infer=False 原样
+  插入（deepcopy(metadata) + role 键），返回 {"results": [...]}；
 - delete 对不存在的 id 抛 ValueError。
 适配层若退回旧调用方式，这些测试会立刻红（4c1c9be P2-3）。
 """
@@ -17,6 +21,15 @@ import pytest
 from app.memory.base import MemoryEnumerationIncomplete
 
 _ENTITY_PARAMS = {"user_id", "agent_id", "run_id"}
+
+
+def _similar(a: str, b: str) -> bool:
+    """fake 的 infer 路径用「最长公共子串 ≥ 3」近似 mem0 LLM 的「相关记忆」
+    判定——决策本身不可确定，够演示跨 note 改写即可。"""
+    from difflib import SequenceMatcher
+
+    match = SequenceMatcher(None, a, b).find_longest_match(0, len(a), 0, len(b))
+    return match.size >= 3
 
 
 def _reject_top_level_entity(kwargs: dict, method: str) -> None:
@@ -51,19 +64,42 @@ class _FakeMem0Memory:
         cls.last_config = config  # 供测试断言适配层拼出的配置
         return cls()
 
-    # ---- add：顶层 user_id 仍合法；infer 主路径返回裸 list ----
+    # ---- add：顶层 user_id 仍合法；infer 主路径裸 list + 跨 note 改写，
+    # infer=False 原样插入 ----
 
-    def add(self, messages, *, user_id=None, agent_id=None, run_id=None, metadata=None, **kwargs):
-        self.add_calls.append((messages, dict(kwargs, user_id=user_id, metadata=metadata)))
+    def add(
+        self, messages, *, user_id=None, agent_id=None, run_id=None, metadata=None, infer=True, **kwargs
+    ):
+        self.add_calls.append((messages, dict(kwargs, user_id=user_id, metadata=metadata, infer=infer)))
+        if not infer:
+            # 2.2.1 原始路径：逐条消息原样入库（deepcopy(metadata)+role 键），
+            # 返回 {"results": [...]}（infer 主路径才是裸 list），不回显
+            # metadata（只有 id/memory/event）
+            msgs = messages if isinstance(messages, list) else [{"role": "user", "content": messages}]
+            results = []
+            for m in msgs:
+                if m.get("role") == "system":
+                    continue
+                self._seq += 1
+                mid = f"m_add{self._seq}"
+                stored = dict(metadata or {})
+                stored["role"] = m["role"]
+                self.items[mid] = {"id": mid, "memory": m["content"], "metadata": stored}
+                results.append({"id": mid, "memory": m["content"], "event": "ADD"})
+            return {"results": results}
+
+        # infer 主路径（mem0 默认）：先检索用户既有记忆，LLM 决定 ADD/UPDATE/
+        # DELETE/NOOP。fake 用「最长公共子串 ≥ 3」近似「相关」：命中即**原地
+        # 改写**那条记忆（id 与旧 note_id 不变、只换文本）——这正是破坏
+        # INV-3 归属的跨 note 改写路径（Codex P1），适配层必须绕开
+        for mid, item in self.items.items():
+            if _similar(messages, item["memory"]):
+                item["memory"] = messages
+                return [{"id": mid, "memory": messages, "event": "UPDATE"}]
         self._seq += 1
-        results = []
-        # 一次 add 产出两条：验证“返回全部写入”而不是只回第一条；
-        # 2.2.1 的 infer 路径不回显 metadata（只有 id/memory/event）
-        for suffix in ("", "_续"):
-            mid = f"m_add{self._seq}{suffix}"
-            self.items[mid] = {"id": mid, "memory": messages + suffix}
-            results.append({"id": mid, "memory": messages + suffix, "event": "ADD"})
-        return results
+        mid = f"m_add{self._seq}"
+        self.items[mid] = {"id": mid, "memory": messages}
+        return [{"id": mid, "memory": messages, "event": "ADD"}]
 
     # ---- get_all：只认 filters；top_k 截断（默认 20）；metadata 键下推过滤 ----
 
@@ -130,21 +166,53 @@ def _make_store(fake_mem0, **kwargs):
 
 
 async def test_add_returns_all_written_items_with_note_id_and_rev(fake_mem0):
-    """INV-3：add 的 metadata 必带 note_id/source_rev，且把 mem0 返回的全部
-    条目转成 MemoryItem（一次 add 可能产生多条；2.2.1 infer 路径返回裸
-    list 且不回显 metadata——note_id/rev 由适配层用自己的入参补齐）。"""
+    """INV-3：add 的 metadata 必带 note_id/source_rev 且显式 infer=False；
+    2.2.1 infer=False 原样插入、返回 {"results": [...]} 且不回显 metadata
+    ——note_id/rev 由适配层用自己的入参补齐。"""
     store = _make_store(fake_mem0)
     items = await store.add("usr_1", "对花生过敏", note_id="nte_x", source_rev=3)
-    assert len(items) == 2
-    assert all(m.note_id == "nte_x" and m.source_rev == 3 for m in items)
-    assert all(m.user_id == "usr_1" and m.text.startswith("对花生过敏") for m in items)
-    assert len({m.id for m in items}) == 2
+    assert len(items) == 1
+    assert items[0].note_id == "nte_x" and items[0].source_rev == 3
+    assert items[0].user_id == "usr_1" and items[0].text == "对花生过敏"
 
     # 客户端调用形状：顶层 user_id（2.x 只收回 search/get_all 的）+ metadata
+    # + infer=False（Codex P1：默认 infer=True 是跨 note 改写路径）
     text, kwargs = store._client.add_calls[0]
     assert text == "对花生过敏"
     assert kwargs["user_id"] == "usr_1"
     assert kwargs["metadata"] == {"note_id": "nte_x", "source_rev": 3}
+    assert kwargs["infer"] is False
+
+
+async def test_add_infer_false_never_rewrites_other_notes_memory(fake_mem0):
+    """Codex P1 / INV-3：add 必须 infer=False——mem0 默认 infer=True 会基于
+    用户范围内既有记忆做 UPDATE/DELETE/NOOP 决策，相似内容会改写/复用其他
+    note 的记忆。先为 note A add，再为 note B add 相似文本：A 的记忆
+    （id/文本/note_id）必须原样保留，B 的记忆归属 B。"""
+    store = _make_store(fake_mem0)
+    a_items = await store.add("usr_1", "对花生过敏", note_id="nte_a", source_rev=1)
+    b_items = await store.add("usr_1", "对花生过敏，最近还对芒果起疹子", note_id="nte_b", source_rev=2)
+
+    # 适配层的每次 add 都显式 infer=False（缺省即 True 的推理改写路径）
+    assert store._client.add_calls, "应发生过 add"
+    for _, kwargs in store._client.add_calls:
+        assert kwargs["infer"] is False
+
+    # A 的记忆原样保留；B 的记忆是自己的新条目、note_id=B
+    assert len(a_items) == 1 and len(b_items) == 1
+    a_id, b_id = a_items[0].id, b_items[0].id
+    assert a_id != b_id
+    assert store._client.items[a_id]["memory"] == "对花生过敏"
+    assert store._client.items[a_id]["metadata"]["note_id"] == "nte_a"
+    assert store._client.items[b_id]["memory"] == "对花生过敏，最近还对芒果起疹子"
+    assert store._client.items[b_id]["metadata"]["note_id"] == "nte_b"
+
+    # 反证：同一 fake 换默认 infer=True 再 add 相似文本，A 的记忆被原地改写
+    # （id 不变、文本换血、note_id 仍挂 A）——适配层若退回默认 infer，
+    # 上面的归属断言就会像这里一样被破坏。
+    store._client.add("对花生过敏，又新增了腰果", user_id="usr_1", metadata={"note_id": "nte_c"})
+    assert store._client.items[a_id]["memory"] == "对花生过敏，又新增了腰果"
+    assert store._client.items[a_id]["metadata"]["note_id"] == "nte_a"
 
 
 async def test_search_scopes_user_via_filters_and_top_k(fake_mem0):

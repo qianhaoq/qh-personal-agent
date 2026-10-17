@@ -6,8 +6,9 @@
 - 向量库 pgvector 与业务库同一个 PostgreSQL 实例；mem0 内部的 LLM/embedding 走
   OpenAI 兼容配置。
 - mem0 是同步库，这里用 asyncio.to_thread 包一层。
-- add 返回本次写入的全部记忆（metadata 带 note_id/source_rev，INV-3）；
-  delete 按 id 列表删（复查不一致时只删本次新增，修 C9）。
+- add 一律 infer=False，返回本次写入的全部记忆（metadata 带
+  note_id/source_rev，INV-3）；delete 按 id 列表删（复查不一致时只删本次
+  新增，修 C9）。
 
 mem0 2.x API 适配（2.2.1 实测，钉版本防漂移）：
 - search/get_all **拒绝**顶层 user_id/agent_id/run_id（ValueError），作用域
@@ -20,8 +21,12 @@ mem0 2.x API 适配（2.2.1 实测，钉版本防漂移）：
   list() 无法推进，一页取满即抛 MemoryEnumerationIncomplete（INV-3：
   取不全就报错，绝不当成已取全）。页大小可注入（list_page_size），
   测试用极小值模拟超限。
-- add 的返回有两种形状：infer=True 主路径返回**裸 list**，
-  infer=False 原始路径返回 {"results": [...]}——两种都归一。
+- add 必须 infer=False（Codex P1 / INV-3）：默认 infer=True 会先检索
+  **用户范围内**的既有记忆、由 LLM 决定 ADD/UPDATE/DELETE/NOOP——相似
+  内容会被判成「相关」而改写/删除/复用**其他 note** 的记忆，破坏
+  note_id/source_rev 归属；删旧写新只由 memory_sync 收敛（INV-5），后端
+  不得自作主张。返回形状两种都归一：infer 主路径是裸 list，infer=False
+  原始路径返回 {"results": [...]}。
 - delete 对不存在的 id 抛 ValueError：按「已删除」处理（幂等），不中断
   批量清理。
 """
@@ -106,13 +111,16 @@ class Mem0Store:
         import asyncio
 
         metadata = {"note_id": note_id, "source_rev": source_rev}
-        # add 接受顶层 user_id（2.x 只对 search/get_all 收回了顶层实体参数）
+        # add 接受顶层 user_id（2.x 只对 search/get_all 收回了顶层实体参数）。
+        # infer=False（Codex P1 / INV-3）：默认 infer=True 会基于用户范围内
+        # 既有记忆做 UPDATE/DELETE/NOOP 决策，相似内容会改写/删除/复用其他
+        # note 的记忆——原样插入，删旧写新只由 memory_sync 收敛（INV-5）
         result = await asyncio.to_thread(
-            self._client.add, text, user_id=user_id, metadata=metadata
+            self._client.add, text, user_id=user_id, metadata=metadata, infer=False
         )
-        # 一次 add 可能产生多条记忆，全部带回（形状归一见模块 docstring）。
-        # 2.2.1 的 infer 主路径不回显 metadata：note_id/source_rev 用自己的
-        # 入参补齐（INV-3 归属信息不能依赖后端回显）
+        # infer=False 恰好只写本 note 的记忆，返回 {"results": [...]}（形状
+        # 归一见模块 docstring）且不回显 metadata：note_id/source_rev 用自己
+        # 的入参补齐（INV-3 归属信息不能依赖后端回显）
         items = [_item_from_result(user_id, r) for r in _results_of(result)]
         for item in items:
             if item.note_id is None:

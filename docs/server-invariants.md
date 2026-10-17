@@ -6,6 +6,7 @@
 > C1 auth 并发登录同设备竞态（P1）；C2 create 中 enqueue 晚于 allocate_seq（P1）；C3 openai 配置需三项齐备（P2）；C4 PATCH 后旧记忆无兜底清理（P2）；C5 整理后 rev 变化导致失败收尾永不命中（P1）；C6 create_all 并发建表（P2）；C7 DEFAULT_TIMEZONE 未校验（P2）；C8 path/query 参数 NUL 进 PG（P1）；C9 旧整理任务 delete_by_note 误删新 rev 记忆（P1）。
 > 第五轮输入：threads5.txt 的 6 条（2 P1 + 4 P2），在对应 INV 内注明（INV-8 重写为多 refresh token 模型；INV-3 补枚举完整性；INV-5/6 补租约栅栏；INV-2 补内部字段不碰 updated_at；INV-7 补 aware 时间边界；INV-10 补后端可安装性/拓扑校验）。
 > 第六轮输入：threads6.txt 的 6 条（3 P1 + 3 P2），在对应 INV 内注明：INV-5 补「丢租约必再入队」（迟到的 delete_by_note 会删掉换主后写入的记忆）；新增 INV-11（写接口乐观锁与 rev 语义，含幂等/无操作快路径）；新增 INV-12（条件更新/删除 0 行后的归因规则）；INV-8 补 refresh 行消失/过期的分类与过期行清理；INV-7 补 LLM 输出时间同套 ±14h 安全界；INV-10 补 MEM0_EMBEDDING_API_KEY。
+> 第七轮输入：Codex 评审 1 条 P1（mem0 `add` 未显式 `infer=False`：默认 infer 路径会基于用户既有记忆做 UPDATE/DELETE/NOOP 决策，跨 note 改写破坏归属），在 INV-3 注明「add 必须 infer=False」。
 
 ## 0. 总览：新任务与记忆模型
 
@@ -100,6 +101,8 @@ memory_sync(note_id)     不带 rev。短读事务取 note 当前状态 →（�
 
 **陈述**：MemoryStore 中每条由本服务写入的记忆，`metadata` 必含 `note_id` 与 `source_rev`；**记忆只属于 note 的当前 rev**——note 已删除或当前 rev 未 organized 时，store 中不应存在该 note 的记忆；organized 时存在的记忆其 source_rev 应等于 note 当前 rev。API 不向客户端暴露 source_rev（内部字段）。
 
+**add 必须 `infer=False`，禁止跨 note 推理改写**（第七轮 Codex P1）：mem0 的 `add` 默认 `infer=True`——先检索**用户范围内**的既有记忆，再由 LLM 决定 ADD/UPDATE/DELETE/NOOP，相似内容会被判成「相关」而**改写/删除/复用其他 note 的记忆**（保留别人的 id/note_id、换掉文本），直接破坏本条的归属不变量。记忆的删旧写新完全由 memory_sync 的收敛逻辑管理（INV-5：先 `delete_by_note` 再 `add`），后端只做无主见的存储——适配层 `add` 一律显式 `infer=False`（原样插入，恰好只创建本 note 的记忆）。
+
 在此之上（threads5 P1-1）：**对记忆后端做「全量」语义的枚举必须完整——一页取满又无法推进时必须报错，绝不当成已取全/已同步**。`list()` / `delete_by_note()` / `delete_all()` 的契约：
 
 - `delete_by_note(user_id, note_id)`：按 metadata 过滤（`filters={"user_id", "note_id"}`）+ **边取边删**的循环（每轮删掉本轮取到的，下一轮自然前进，无需游标分页）；同一批 id 重复出现（删除未生效）即抛 `MemoryEnumerationIncomplete` 让 job 失败重试。
@@ -109,12 +112,13 @@ memory_sync(note_id)     不带 rev。短读事务取 note 当前状态 →（�
 
 **保证代码**：`app/memory/base.py`（`MemoryEnumerationIncomplete` + `add` 签名 `add(user_id, text, *, note_id, source_rev)`）、`app/memory/mem0_store.py`、`app/memory/inmemory.py`、唯一写入口 `app/pipeline/memory_sync.py`（INV-4/5 保证只有它写）。
 
-mem0 版本钉死：`server/requirements-mem0.txt` 写 `mem0ai==2.2.1`（4c1c9be P2-3）。2.x 收回了 `search`/`get_all` 的顶层 `user_id` 参数（作用域只认 `filters={"user_id": ...}`，旧调用直接 ValueError）、`search` 条数参数是 `top_k`（无 `limit`）、`get_all` 默认 `top_k=20` 会截断、**`get_all` 的 `filters` 透传到 pgvector `list()` 且支持 metadata 键**（`payload->>'note_id' = ...`，实测 2.2.1 `mem0/vector_stores/pgvector.py::_build_filter_conditions`；这是 `delete_by_note` 能按 note 精确枚举的依据）、`add` 的 infer 主路径返回裸 list 且不回显 metadata（归属信息由适配层用自己的入参补齐）、`delete` 对不存在的 id 抛 ValueError（按已删除吞掉，幂等）。适配集中在 `app/memory/mem0_store.py`。
+mem0 版本钉死：`server/requirements-mem0.txt` 写 `mem0ai==2.2.1`（4c1c9be P2-3）。2.x 收回了 `search`/`get_all` 的顶层 `user_id` 参数（作用域只认 `filters={"user_id": ...}`，旧调用直接 ValueError）、`search` 条数参数是 `top_k`（无 `limit`）、`get_all` 默认 `top_k=20` 会截断、**`get_all` 的 `filters` 透传到 pgvector `list()` 且支持 metadata 键**（`payload->>'note_id' = ...`，实测 2.2.1 `mem0/vector_stores/pgvector.py::_build_filter_conditions`；这是 `delete_by_note` 能按 note 精确枚举的依据）、`add` 的 infer 主路径返回裸 list 且不回显 metadata（归属信息由适配层用自己的入参补齐）、**适配层 `add` 一律传 `infer=False`**（默认 `infer=True` 的 LLM 决策会跨 note 改写，见上；`infer=False` 原样插入、返回 `{"results": [...]}` 且不回显 metadata，也不发起任何 LLM 调用）、`delete` 对不存在的 id 抛 ValueError（按已删除吞掉，幂等）。适配集中在 `app/memory/mem0_store.py`。
 
 **验证测试**：
 - `test_memory_metadata_contains_note_id_and_source_rev`
 - `test_no_stale_rev_memory_after_repatch`（PATCH 重整理后 /v1/search 不再命中旧文本；C9 的端到端回归）
 - mem0 2.2.1 调用形状（mock 按 2.2.1 签名建模、传旧参数即抛）：`test_search_scopes_user_via_filters_and_top_k`、`test_get_all_scopes_user_via_filters_and_avoids_truncation`、`test_add_returns_all_written_items_with_note_id_and_rev`、`test_delete_by_ids_delegates_each_id_and_tolerates_missing`
+- add 必须 infer=False（第七轮 Codex P1）：`test_add_infer_false_never_rewrites_other_notes_memory`（fake 的 infer=True 路径在文本相似时**原地改写**既有记忆——先 add note A 再 add 相似文本的 note B，A 的记忆原样保留、B 的记忆 note_id=B；真实 mem0ai+pgvector 的同款归属隔离见 `tests/test_mem0_integration.py::test_add_infer_false_never_rewrites_other_notes_memory`，可选环境）
 - 枚举完整性（threads5 P1-1）：`test_delete_by_note_filters_by_note_metadata_and_paginates`（fake 的 get_all 按 2.2.1/pgvector 语义过滤 metadata 键 + top_k 截断；注入页大小 2 验证跨页删净）、`test_delete_by_note_raises_when_page_never_shrinks`（取满且同批重复 → 抛错）、`test_list_raises_when_page_full_cannot_advance`、`test_inmemory_list_page_cap_raises_when_full`、`test_memory_sync_fails_not_marks_synced_when_enumeration_incomplete`（枚举不完整 → job 失败重试、memory_status 不置 synced）
 
 ### INV-4 谁可以删/写记忆
@@ -416,7 +420,7 @@ mem0 版本钉死：`server/requirements-mem0.txt` 写 `mem0ai==2.2.1`（4c1c9be
 | --- | --- | --- |
 | INV-1 | test_create_note_sql_order_job_insert_before_seq_update；test_patch_sql_order_note_reminders_jobs_before_seq_update；test_extract_finalize_concurrent_patch_no_deadlock；test_business_paths_never_update_existing_job_rows；保留 test_patch_and_organize_writeback_overlap_no_deadlock、test_patch_delete_organize_three_way_overlap_no_deadlock | 前二双后端；并发项 PG 真并发 |
 | INV-2 | test_extract_skips_when_rev_moved_marks_done；test_extract_attempts_exhausted_marks_note_failed_by_rev；test_extract_finalize_skips_note_patched_after_enqueue；test_memory_sync_single_pending_per_note；test_memory_sync_pending_allowed_while_running；test_memory_sync_single_running_per_note；test_extract_and_memory_sync_independent_attempts | 单 running 项 PG 真并发，SQLite 仅语义 |
-| INV-3 | test_memory_metadata_contains_note_id_and_source_rev；test_no_stale_rev_memory_after_repatch；test_delete_by_note_filters_by_note_metadata_and_paginates；test_delete_by_note_raises_when_page_never_shrinks；test_list_raises_when_page_full_cannot_advance；test_inmemory_list_page_cap_raises_when_full；test_memory_sync_fails_not_marks_synced_when_enumeration_incomplete | 双后端（mem0 形状用 fake client） |
+| INV-3 | test_memory_metadata_contains_note_id_and_source_rev；test_no_stale_rev_memory_after_repatch；test_add_infer_false_never_rewrites_other_notes_memory；test_delete_by_note_filters_by_note_metadata_and_paginates；test_delete_by_note_raises_when_page_never_shrinks；test_list_raises_when_page_full_cannot_advance；test_inmemory_list_page_cap_raises_when_full；test_memory_sync_fails_not_marks_synced_when_enumeration_incomplete | 双后端（mem0 形状用 fake client） |
 | INV-4 | test_patch_and_delete_never_touch_memory_store_directly | 双后端 |
 | INV-5 | test_memory_sync_writes_memory_with_source_rev_and_marks_synced；test_memory_sync_on_deleted_note_removes_memory；test_memory_sync_on_unorganized_note_clears_stale_memory_without_add；test_memory_sync_requeues_and_deletes_only_own_ids_on_rev_change；test_memory_sync_converges_after_delete_during_add；test_memory_sync_recheck_fences_reclaimed_lease_deletes_own_ids；test_memory_sync_stalled_delete_by_note_past_lease_requeues_and_converges；test_memory_sync_worker_killed_mid_run_reclaimed_converges；test_memory_sync_attempts_exhausted_marks_failed_only_without_newer_job | 双后端语义；交错窗口用 DelayedAddStore 类时间注入复现（threads6 的停顿在 delete_by_note，同一手法），无需 PG |
 | INV-6 | test_stale_worker_finalize_ignored_after_lease_reclaimed_extract、test_stale_worker_finalize_ignored_after_lease_reclaimed_memory_sync；test_extract_finalize_marks_failed_only_at_enqueued_rev；test_memory_sync_finalize_failure_marks_memory_status_not_note_status | 双后端 |

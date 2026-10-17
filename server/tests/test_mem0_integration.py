@@ -9,13 +9,17 @@
 2. **user_id / note_id 过滤下推**：search/get_all 的 filters、delete_by_note
    的 metadata 过滤（`payload->>'note_id'`）不串用户、不串笔记；
 3. **无游标分页下的穷尽删除**：get_all 只有 top_k 截断，小页上限
-   （list_page_size=3）下「边取边删」循环也能删净超过一页的数据。
+   （list_page_size=3）下「边取边删」循环也能删净超过一页的数据；
+4. **add 必须 infer=False（Codex P1 / INV-3）**：mem0 默认 infer=True 的
+   add 会基于用户范围内既有记忆做 UPDATE/DELETE/NOOP 决策，相似内容会
+   改写/复用其他 note 的记忆——两条相似内容先后 add 后，先写 note 的
+   记忆条数与内容必须原样保留（归属隔离）。
 
 确定性本地 embedder：把 EmbedderFactory 的 openai 槽位替换成 crc32 token
 哈希的 1536 维向量（pgvector 表维度默认 1536，必须匹配）——不访问任何
-外部 API。LLM 不参与：种子数据经 `client.add(..., infer=False)` 直写原始
-文本，绕过 mem0 的 infer 抽取（那是 mem0 内部行为，不属于本仓适配层
-职责；适配层 add 的形状已由 fake 测试覆盖）。
+外部 API。LLM 不参与：add 全程 infer=False（适配层策略，见上第 4 点），
+绕过 mem0 的 LLM 抽取/改写决策；凭据是占位值，只在构造时实例化 OpenAI
+客户端，绝不发起调用。
 
 运行方式（独立 venv，避免污染常规 civenv）：
 
@@ -203,6 +207,48 @@ async def _cleanup(store, *user_ids: str) -> None:
             await store.delete_all(uid)
         except Exception:  # noqa: BLE001, S110
             pass
+
+
+async def test_add_infer_false_never_rewrites_other_notes_memory(store):
+    """Codex P1 / INV-3：适配层 add 必须 infer=False——mem0 默认 infer=True
+    会先检索用户范围内既有记忆、由 LLM 决定 ADD/UPDATE/DELETE/NOOP，相似
+    内容会被判成「相关」而改写/复用，破坏 note_id/source_rev 归属。两条
+    相似内容（B 的文本是 A 的超集）先后经 store.add 写入后，按 note_id
+    过滤：A 的记忆条数与内容不变，B 的记忆归属 B。infer=False 全程不碰
+    LLM（占位 LLM 不可达也不会被调用）。"""
+    import asyncio
+
+    user = _fresh_user()
+    note_a, note_b = "nte_it_infer_a", "nte_it_infer_b"
+    text_a = "对花生和腰果严重过敏"
+    text_b = "对花生和腰果严重过敏，最近吃芒果也起疹子"
+    try:
+        added_a = await store.add(user, text_a, note_id=note_a, source_rev=1)
+        added_b = await store.add(user, text_b, note_id=note_b, source_rev=2)
+        # infer=False 一次 add 恰好写一条本 note 的记忆
+        assert len(added_a) == 1 and len(added_b) == 1
+        assert added_a[0].note_id == note_a and added_b[0].note_id == note_b
+
+        async def by_note(note_id: str) -> list[dict]:
+            # pgvector 的 metadata 键下推（payload->>'note_id'）按 note 精确取
+            result = await asyncio.to_thread(
+                store._client.get_all,
+                filters={"user_id": user, "note_id": note_id},
+                top_k=10,
+            )
+            return result["results"]
+
+        mems_a = await by_note(note_a)
+        mems_b = await by_note(note_b)
+        assert [m["memory"] for m in mems_a] == [text_a], "A 的记忆内容必须原样保留"
+        assert mems_a[0]["metadata"]["note_id"] == note_a
+        assert int(mems_a[0]["metadata"]["source_rev"]) == 1
+        assert [m["memory"] for m in mems_b] == [text_b]
+        assert int(mems_b[0]["metadata"]["source_rev"]) == 2
+        # 用户名下恰好两条：infer=True 的 NOOP/合并会让总数 < 2
+        assert len(await store.list(user)) == 2
+    finally:
+        await _cleanup(store, user)
 
 
 @pytest.mark.parametrize("store", [50], indirect=True)
