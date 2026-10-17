@@ -15,6 +15,7 @@
 - 代码改动默认交给本地 **`coding glm`**，模型用用户指定的 **GLM 5.3**。
 - 前端 / UI（Android 界面、交互、样式）交给 **`coding kimi`**。
 - 每个改动一个分支、一个 PR；不直接推 `main`（受保护）。
+- 先读后写的状态变更（乐观锁、token 轮换、计数、状态机）必须锁行（SELECT … FOR UPDATE）或用条件更新（UPDATE … WHERE 旧值），并配并发测试。
 
 ## 评审与修复
 

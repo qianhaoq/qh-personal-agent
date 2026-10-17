@@ -32,6 +32,7 @@ app.add_exception_handler(Exception, unhandled_exception_handler)
 
 @app.get("/healthz", tags=["health"])
 async def healthz():
+    from fastapi.responses import JSONResponse
     from sqlalchemy import text
 
     from app.db import get_engine
@@ -42,7 +43,11 @@ async def healthz():
             await conn.execute(text("SELECT 1"))
     except Exception:  # noqa: BLE001 健康检查必须兜住一切异常，返回降级状态而不是 500
         db_ok = False
-    return {"ok": db_ok, "db": db_ok, "llm": _llm_status()}
+    body = {"ok": db_ok, "db": db_ok, "llm": _llm_status()}
+    if not db_ok:
+        # 依赖数据库健康检查的负载均衡器据此摘除实例
+        return JSONResponse(status_code=503, content=body)
+    return body
 
 
 def _llm_status() -> str:

@@ -95,3 +95,64 @@ async def test_notes_pagination(client, user):
         f"/v1/notes?limit=3&cursor={d1['next_cursor']}", headers=auth_headers(user)
     )
     assert len(page2.json()["items"]) == 2
+
+
+async def test_create_note_timezone_defaults_to_settings(client, user, monkeypatch):
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "default_timezone", "Asia/Tokyo")
+    r = await client.post(
+        "/v1/notes",
+        json={"client_note_id": str(uuid.uuid4()), "text": "没带时区"},
+        headers=auth_headers(user),
+    )
+    assert r.status_code == 202
+    got = await client.get(f"/v1/notes/{r.json()['note_id']}", headers=auth_headers(user))
+    assert got.json()["timezone"] == "Asia/Tokyo"
+
+
+async def test_create_note_bad_timezone_422(client, user):
+    for tz in ("Mars/Olympus", "UTC+8", "x" * 65):
+        r = await client.post(
+            "/v1/notes",
+            json={"client_note_id": str(uuid.uuid4()), "text": "x", "timezone": tz},
+            headers=auth_headers(user),
+        )
+        assert r.status_code == 422, (tz, r.status_code)
+        assert r.json()["error"]["code"] == "validation_error"
+
+
+async def test_create_note_asr_too_large_422(client, user):
+    r = await client.post(
+        "/v1/notes",
+        json={
+            "client_note_id": str(uuid.uuid4()),
+            "text": "x",
+            "asr": {"transcript": "y" * 5000},
+        },
+        headers=auth_headers(user),
+    )
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "validation_error"
+
+
+async def test_note_text_too_long_422(client, user):
+    created = await client.post(
+        "/v1/notes",
+        json={"client_note_id": str(uuid.uuid4()), "text": "x" * 5001},
+        headers=auth_headers(user),
+    )
+    assert created.status_code == 422
+
+    ok = await client.post(
+        "/v1/notes",
+        json={"client_note_id": str(uuid.uuid4()), "text": "正常长度"},
+        headers=auth_headers(user),
+    )
+    note_id, rev = ok.json()["note_id"], ok.json()["rev"]
+    patched = await client.patch(
+        f"/v1/notes/{note_id}",
+        json={"text": "y" * 5001, "rev": rev},
+        headers=auth_headers(user),
+    )
+    assert patched.status_code == 422

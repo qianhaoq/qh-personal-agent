@@ -3,9 +3,11 @@ import json
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common import allocate_seq, new_id
+from app.config import get_settings
 from app.db import get_db_session
 from app.deps import get_current_user_id
 from app.errors import ApiError
@@ -51,16 +53,31 @@ async def create_note(
         text=body.text,
         source=body.source,
         recorded_at=as_utc(body.recorded_at),
-        timezone=body.timezone or "Asia/Shanghai",
+        timezone=body.timezone or get_settings().default_timezone,
         status="uploaded",
         rev=1,
         change_seq=await allocate_seq(session),
         asr_meta_json=_asr_json(body.asr),
     )
     session.add(note)
-    await session.flush()
-    await enqueue(session, "organize_note", {"note_id": note.id})
-    await session.commit()
+    try:
+        await session.flush()
+        await enqueue(session, "organize_note", {"note_id": note.id, "rev": 1})
+        await session.commit()
+    except IntegrityError:
+        # 并发提交相同 client_note_id：先查后插之间存在窗口，靠唯一约束兜底，
+        # 回滚后返回已存在记录（幂等），而不是 500
+        await session.rollback()
+        existing = (
+            await session.execute(
+                select(Note).where(
+                    Note.user_id == user_id, Note.client_note_id == body.client_note_id
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is None:
+            raise
+        return {"note_id": existing.id, "status": existing.status, "rev": existing.rev}
     return {"note_id": note.id, "status": note.status, "rev": note.rev}
 
 

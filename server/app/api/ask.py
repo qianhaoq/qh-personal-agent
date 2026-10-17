@@ -8,7 +8,7 @@ from app.deps import get_current_user_id
 from app.llm.base import get_llm_client
 from app.memory.base import get_memory_store
 from app.schemas import AskRequest
-from app.timeutil import utcnow
+from app.timeutil import as_utc, utcnow
 
 router = APIRouter(prefix="/v1", tags=["ask"])
 
@@ -45,12 +45,16 @@ async def ask(
         return {"answer": "我没有相关记录。", "citations": []}
 
     context = "\n".join(f"- {m.text}" for m in memories)
+    # 参照时间：客户端时间（语音提问的“今天/明天”以它为准），缺省退回服务器时钟
+    ref_time = as_utc(body.client_time) or utcnow()
+    tzname = body.timezone or settings.default_timezone
     messages = [
         {
             "role": "system",
             "content": (
                 "你是用户的个人助理，只依据 <memories> 中给出的记忆回答问题，"
-                "不要编造记忆里没有的信息。当前时间：" + utcnow().isoformat()
+                "不要编造记忆里没有的信息。"
+                f"当前时间：{ref_time.isoformat()}（时区：{tzname}）"
             ),
         },
         {

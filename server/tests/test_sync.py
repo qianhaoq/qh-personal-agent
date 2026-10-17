@@ -70,8 +70,7 @@ async def _walk(client, headers, limit: int) -> tuple[dict[str, dict], list[dict
             notes.setdefault(nid, {"id": nid})
         reminders.extend(page["reminders"])
         reminders.extend({"id": rid} for rid in page["deleted"]["reminders"])
-        if page["cursor"] > cursor:
-            cursor = page["cursor"]
+        cursor = max(cursor, page["cursor"])
         if not page["has_more"]:
             return notes, reminders
     raise AssertionError("分页未在 200 页内结束")

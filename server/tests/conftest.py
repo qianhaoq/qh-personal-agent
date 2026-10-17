@@ -2,8 +2,11 @@
 
 - SQLite 而不是 testcontainers：本机无 Docker。差异（SKIP LOCKED、pgvector）
   在 README 里说明。
-- 每个测试重置引擎：aiosqlite 连接绑定事件循环，pytest-asyncio 每个测试
-  一个新循环。
+- 设置环境变量 TEST_DATABASE_URL（postgresql+asyncpg://...）时改用 PG
+  运行同一套测试：SQLite 是单写者模型，并发请求实际被串行化，真实的
+  读-写竞态（条件更新、行锁）只有在 PG 下才能验证（见 test_concurrency.py）。
+- 每个测试重置引擎：aiosqlite/asyncpg 连接绑定事件循环，pytest-asyncio
+  每个测试一个新循环。
 """
 import os
 import pathlib
@@ -11,7 +14,11 @@ import pathlib
 # 必须在导入 app 之前设置环境
 _DB_FILE = pathlib.Path(__file__).parent / "_test.sqlite3"
 _DB_FILE.unlink(missing_ok=True)
-os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{_DB_FILE}"
+_TEST_DB_URL = os.environ.get("TEST_DATABASE_URL")
+if _TEST_DB_URL:
+    os.environ["DATABASE_URL"] = _TEST_DB_URL
+else:
+    os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{_DB_FILE}"
 # 明显的占位符（非真实密钥），长度 ≥32 字节以满足 HS256 建议
 os.environ["JWT_SECRET"] = "test-only-not-a-secret-0123456789abcdef"
 os.environ["LLM_PROVIDER"] = "mock"
@@ -20,7 +27,7 @@ os.environ["MEMORY_BACKEND"] = "inmemory"
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from app.db import create_all, dispose_engine
+from app.db import Base, create_all, dispose_engine, get_engine
 from app.memory.base import set_memory_store
 from app.memory.inmemory import InMemoryStore
 from app.models import InviteCode
@@ -29,6 +36,11 @@ from app.models import InviteCode
 @pytest.fixture(autouse=True)
 async def _fresh_env():
     """每个测试：建表 + 干净的记忆存储 + 结束后释放引擎。"""
+    if _TEST_DB_URL:
+        # PG：每个测试先 drop 再建，保证隔离（SQLite 靠 import 时删库文件 + 随机 ID）
+        engine = get_engine()
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.drop_all)
     await create_all()
     set_memory_store(InMemoryStore())
     yield

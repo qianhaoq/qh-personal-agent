@@ -72,8 +72,8 @@ async def test_mem0_backend_without_mem0ai_raises_instead_of_fallback(monkeypatc
 
     if importlib.util.find_spec("mem0") is not None:
         pytest.skip("本环境已安装 mem0ai，无法测试未安装路径")
-    import app.memory.base as base
     from app.config import get_settings
+    from app.memory import base
 
     monkeypatch.setattr(base, "_store", None)
     monkeypatch.setattr(get_settings(), "memory_backend", "mem0")

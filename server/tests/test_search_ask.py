@@ -70,3 +70,43 @@ async def test_ask_validation(client, user):
     resp = await client.post("/v1/ask", json={}, headers=auth_headers(user))
     assert resp.status_code == 422
     assert resp.json()["error"]["code"] == "validation_error"
+
+
+async def test_ask_uses_client_time_as_reference(client, user, run_jobs, monkeypatch):
+    """有 client_time/timezone 时，prompt 里的参照时间用它们而不是服务器时钟。"""
+    await _add_note(client, user, "我对花生过敏，吃饭要注意")
+    await run_jobs()
+
+    captured: dict = {}
+
+    class SpyLLM:
+        async def chat(self, messages, response_format=None):
+            captured["messages"] = messages
+            return "根据你的记录：花生过敏"
+
+    async def fake_get_llm():
+        return SpyLLM()
+
+    monkeypatch.setattr("app.api.ask.get_llm_client", fake_get_llm)
+    resp = await client.post(
+        "/v1/ask",
+        json={
+            "text": "我吃东西要注意什么",
+            "client_time": "2026-10-16T08:00:00+00:00",
+            "timezone": "Asia/Shanghai",
+        },
+        headers=auth_headers(user),
+    )
+    assert resp.status_code == 200
+    system = captured["messages"][0]["content"]
+    assert "2026-10-16T08:00:00+00:00" in system
+    assert "Asia/Shanghai" in system
+
+
+async def test_ask_bad_timezone_422(client, user):
+    resp = await client.post(
+        "/v1/ask",
+        json={"text": "hi", "timezone": "Mars/Olympus"},
+        headers=auth_headers(user),
+    )
+    assert resp.status_code == 422

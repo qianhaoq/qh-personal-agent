@@ -28,11 +28,14 @@ def is_postgres() -> bool:
 
 
 async def enqueue(session: AsyncSession, kind: str, payload: dict) -> str:
+    from app.config import get_settings
+
     job = Job(
         id=new_id("job"),
         kind=kind,
         payload_json=json.dumps(payload, ensure_ascii=False),
         status="pending",
+        max_attempts=get_settings().job_max_attempts,
     )
     session.add(job)
     await session.flush()

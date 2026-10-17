@@ -63,17 +63,20 @@ async def run_pending_jobs(limit: int = 100, retry_delay_seconds: int = 30) -> i
 
 async def _claim_one(maker: async_sessionmaker[AsyncSession]) -> _Claimed | None:
     """事务 1：认领一个到期 job（None 表示队列空）。"""
-    async with maker() as session, session.begin():
-        async with claim_next(session) as job:
-            if job is None:
-                return None
-            return _Claimed(
-                id=job.id,
-                kind=job.kind,
-                payload=json.loads(job.payload_json or "{}"),
-                attempts=job.attempts,
-                max_attempts=job.max_attempts,
-            )
+    async with (
+        maker() as session,
+        session.begin(),
+        claim_next(session) as job,
+    ):
+        if job is None:
+            return None
+        return _Claimed(
+            id=job.id,
+            kind=job.kind,
+            payload=json.loads(job.payload_json or "{}"),
+            attempts=job.attempts,
+            max_attempts=job.max_attempts,
+        )
 
 
 async def _finalize_failure(

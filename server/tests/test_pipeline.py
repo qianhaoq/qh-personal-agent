@@ -265,6 +265,27 @@ async def test_past_or_broken_fire_at_discarded(client, user, monkeypatch, run_j
         ).scalars().all() == []
 
 
+async def test_enqueue_uses_configured_max_attempts(client, user, monkeypatch):
+    """入队的 job 继承 settings.job_max_attempts，而不是写死默认值。"""
+    from app.config import get_settings
+    from app.db import get_sessionmaker
+
+    monkeypatch.setattr(get_settings(), "job_max_attempts", 5)
+    r = await client.post(
+        "/v1/notes",
+        json={"client_note_id": str(uuid.uuid4()), "text": "重试次数配置"},
+        headers={"authorization": f"Bearer {user['access_token']}"},
+    )
+    note_id = r.json()["note_id"]
+    async with get_sessionmaker()() as session:
+        job = (
+            await session.execute(
+                select(Job).where(Job.kind == "organize_note", Job.payload_json.contains(note_id))
+            )
+        ).scalars().one()
+    assert job.max_attempts == 5
+
+
 async def test_failure_marks_note_failed(client, user, monkeypatch):
     """LLM 连续失败 3 次后 note.status=failed。"""
     import uuid
