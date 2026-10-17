@@ -27,3 +27,64 @@ jobs:
       setup_command: ''
       test_command: 'bash scripts/ci-test.sh'
       working_directory: '.'
+
+  # Server tests against a real PostgreSQL 16 (row locks / conditional
+  # updates in tests/test_concurrency.py are only meaningful on PG; the
+  # required "ci / Build & Test" runs the same suite on SQLite).
+  # NOT a required check yet. The reusable devflow-gates CI has no
+  # `services` support, so this lives in the caller as its own job.
+  # Skips cleanly while server/ has no tests (e.g. the skeleton on main).
+  pg-tests:
+    name: PG Tests (PostgreSQL 16, non-required)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: personal
+          POSTGRES_PASSWORD: ci-only-postgres-pw
+          POSTGRES_DB: personal_agent_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U personal -d personal_agent_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      # Same scheme as server/tests/conftest.py expects (SQLAlchemy async + asyncpg).
+      # Throwaway CI-only credentials for the ephemeral service container.
+      TEST_DATABASE_URL: postgresql+asyncpg://personal:ci-only-postgres-pw@localhost:5432/personal_agent_test
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Detect server tests
+        id: detect
+        run: |
+          if [ -f server/requirements.txt ] && find server/tests -name 'test_*.py' 2>/dev/null | grep -q .; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "server/ has no tests yet: PG tests skipped" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Set up Python
+        if: steps.detect.outputs.run == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install server dependencies
+        if: steps.detect.outputs.run == 'true'
+        run: python -m pip install -q -r server/requirements.txt
+
+      - name: pytest on PostgreSQL 16
+        if: steps.detect.outputs.run == 'true'
+        working-directory: server
+        run: python -m pytest -q
