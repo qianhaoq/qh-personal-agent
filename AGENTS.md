@@ -33,7 +33,7 @@
 
 ## 改 server 前必读 / 自检清单
 
-改 `server/` 之前（含修 review 意见），先读完：[docs/server-invariants.md](docs/server-invariants.md)（服务端不变量，事实来源）和 [docs/agent-pitfalls.md](docs/agent-pitfalls.md)（反复踩的坑和正反例）。提交前逐条自检：
+改 `server/` 之前（含修 review 意见），先读完：[docs/server-invariants.md](docs/server-invariants.md)（服务端不变量，事实来源；随 PR #2 落地，落地前以 #2 的本文件「写代码」各条为准）和 [docs/agent-pitfalls.md](docs/agent-pitfalls.md)（反复踩的坑和正反例）。提交前逐条自检：
 
 - [ ] 改动涉及并发（锁、条件更新、job、sync、记忆同步）时，配了能在 **PostgreSQL** 上跑的并发测试（`PG Tests` job），不能只在 SQLite 上过。
 - [ ] **按类修，不按行修**：一个 review 发现修好后，用 `rg` 把同一类模式在整个 `server/` 里排查一遍，并在线程回复里写清排查了哪些地方。

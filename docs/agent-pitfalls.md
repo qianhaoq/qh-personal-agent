@@ -1,6 +1,6 @@
 # Agent 反复踩的坑（server）
 
-> **事实来源**：服务端不变量以 [docs/server-invariants.md](server-invariants.md) 为准（随 PR #2 落地）。本文只收集“同一类问题被 Codex 反复提出”的模式、正反例和怎么被发现的，帮助后来的 agent 少走回头路。两者冲突时以 server-invariants.md 为准，并回来改本文。
+> **事实来源**：服务端不变量以 [docs/server-invariants.md](server-invariants.md) 为准（随 PR #2 落地；落地前以 #2 中 AGENTS.md「写代码」各条为准）。本文只收集“同一类问题被 Codex 反复提出”的模式、正反例和怎么被发现的，帮助后来的 agent 少走回头路。两者冲突时以 server-invariants.md 为准，并回来改本文。
 >
 > 能机械检查的规则由 `scripts/check-invariants.py` 在 CI 的 `ci / Invariant Check (non-required)` 里执行；单行豁免写 `# invariant-ok: <理由>`，评审时要能说清理由。
 
@@ -71,7 +71,7 @@ async def get_note(note_id: str): ...
 async def get_note(note_id: NoNulStr): ...
 ```
 
-**机检**：`INV-NUL` 会标出 FastAPI 路由里类型为裸 `str` / `Annotated[str, …]`（没有 `reject_nul`）的 path 参数。**怎么发现的**：第 4 轮给 body/query 加了 NoNulStr，漏了 path，第 5 轮 Codex 又提出来。
+**机检**：`INV-NUL` 会标出 FastAPI 路由里类型为裸 `str` / `Annotated[str, …]`（没有 `reject_nul`）的 path 参数，同模块 `APIRouter(prefix="/…/{x}")` 引入的参数也算（`include_router(prefix=…)` 跨模块的前缀暂不解析）。**怎么发现的**：第 4 轮给 body/query 加了 NoNulStr，漏了 path，第 5 轮 Codex 又提出来。
 
 ## 4. 提交后副作用要能收敛 <a id="side-effects"></a>
 
@@ -104,7 +104,7 @@ elif s.provider == "mock": return MockLLM()
 else: raise ValueError(s.provider)
 ```
 
-**机检**：`INV-NO-FALLBACK` 标出没有出现在 `== "mock"`/`"inmemory"` 分支里、前面也没有生产拒绝的 `raise` 的 `Mock*`/`InMemory*`/`Fake*` 构造（tests 目录不检查）。
+**机检**：`INV-NO-FALLBACK` 标出没有出现在 `== "mock"`/`"inmemory"` 分支里、前面也没有顶层“生产 / postgresql 即 raise”守卫的 `Mock*`/`InMemory*`/`Fake*` 构造（tests 目录不检查）。
 
 ## 7. allocate_seq 是事务里最后一把锁（INV-SEQ-LAST） <a id="inv-seq-last"></a>
 
@@ -123,7 +123,7 @@ seq = await allocate_seq(s)
 await s.execute(update(Note).where(Note.id == nid).values(change_seq=seq))
 ```
 
-**机检**：`INV-SEQ-LAST`：同一函数里第一次调用 `allocate_seq` 之后，出现 `enqueue*`/`add`/`add_all`/`insert`/`merge`/`delete`/`with_for_update`，或者 `.values()` 写了 `change_seq`/`updated_at` 以外的列；以及 `allocate_seq` 嵌在写业务列的 `.values()` 里。对 3bac263 回放能抓到当时的死锁行 notes.py:151 和 queue.py 的收尾顺序问题。
+**机检**：`INV-SEQ-LAST`：同一函数里第一次调用 `allocate_seq` 之后，出现 `enqueue*`/`add`/`add_all`/`insert`/`merge`/`delete`/`with_for_update`，或者 `.values()` 写了 `change_seq`/`updated_at` 以外的列；以及 `allocate_seq` 嵌在写业务列的 `.values()` 里；同一循环体里既有写入又有 `allocate_seq` 时（下一轮的写入落在上一轮的 seq 之后）也会报。对 3bac263 回放能抓到当时的死锁行 notes.py:151 和 queue.py 的收尾顺序问题。
 
 ## 8. sync：单快照 + 前缀 cursor <a id="sync"></a>
 
@@ -131,7 +131,7 @@ await s.execute(update(Note).where(Note.id == nid).values(change_seq=seq))
 
 ## 9. 多进程启动不做 DDL（INV-STARTUP-DDL，提议） <a id="inv-startup-ddl"></a>
 
-**规则**（提议加入 server-invariants.md）：`create_all` / 迁移只在一次性的 bootstrap 步骤里运行（如 `app/cli.py`），不能放在 API lifespan 或 worker 启动里——多个 worker 会并发执行 DDL。机检目前只报**警告**，等 server-invariants.md 收录这条后再改成错误。
+**规则**（提议加入 server-invariants.md）：`create_all` / 迁移只在一次性的 bootstrap 步骤里运行（如 `app/cli.py`），不能放在 API lifespan 或 worker 启动里——多个 worker 会并发执行 DDL。机检会识别包装函数（函数体里有 `metadata.create_all` 的 helper，跨模块也算）在非 bootstrap 文件里的调用；目前只报**警告**，等 server-invariants.md 收录这条后再改成错误。
 
 ## 10. 并发相关的改动必须在 PG 上测 <a id="pg"></a>
 

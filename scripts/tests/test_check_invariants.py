@@ -75,7 +75,39 @@ class SeqLast(unittest.TestCase):
         self.assertEqual(rules(src), [])
 
 
+class SeqLoop(unittest.TestCase):
+    def test_write_before_allocate_in_same_loop_flagged(self):
+        src = """
+        async def f(session, rows):
+            for row in rows:
+                session.add(row)
+                row.change_seq = await allocate_seq(session)
+        """
+        self.assertEqual(rules(src), [("INV-SEQ-LAST", 4)])
+
+    def test_batch_allocate_then_change_seq_loop_ok(self):
+        src = """
+        async def f(session, rows):
+            for row in rows:
+                session.add(row)
+            await session.flush()
+            last = await allocate_seq(session, count=len(rows))
+            for i, row in enumerate(rows):
+                row.change_seq = last - i
+        """
+        self.assertEqual(rules(src), [])
+
+
 class Nul(unittest.TestCase):
+    def test_router_prefix_param_flagged(self):
+        src = """
+        router = APIRouter(prefix="/users/{user_id}")
+        @router.get("/notes")
+        async def list_notes(user_id: str):
+            ...
+        """
+        self.assertEqual(rules(src), [("INV-NUL", 4)])
+
     def test_bare_str_path_param_flagged(self):
         src = """
         @router.get("/{note_id}")
@@ -136,6 +168,17 @@ class Fallback(unittest.TestCase):
         """
         self.assertEqual(rules(src), [])
 
+    def test_guard_mentioning_mock_does_not_excuse_fallthrough(self):
+        src = """
+        def get_llm(provider, key):
+            if provider not in {"openai", "mock"}:
+                raise ValueError(provider)
+            if provider == "openai" and key:
+                return OpenAI()
+            return MockLLM()
+        """
+        self.assertEqual(rules(src), [("INV-NO-FALLBACK", 7)])
+
     def test_mock_class_name_without_call_or_in_mock_factory_ok(self):
         src = """
         def make_mock_llm():
@@ -153,6 +196,22 @@ class Ddl(unittest.TestCase):
         """
         found = ci.check_source(textwrap.dedent(src), "server/app/main.py")
         self.assertEqual([(f.rule, f.warning) for f in found], [("INV-STARTUP-DDL", True)])
+
+    def test_wrapper_helper_called_at_startup_warns(self):
+        src = """
+        async def init_db():
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+        async def lifespan(app):
+            await init_db()
+            yield
+        """
+        found = ci.check_source(textwrap.dedent(src), "server/app/main.py")
+        self.assertEqual([(f.rule, f.line) for f in found], [("INV-STARTUP-DDL", 6)])
+
+    def test_cross_module_helper_warns(self):
+        found = ci.check_source("async def lifespan(a):\n    await init_db()\n", "server/app/main.py", {"init_db"})
+        self.assertEqual([f.rule for f in found], ["INV-STARTUP-DDL"])
 
     def test_helper_and_cli_ok(self):
         helper = """

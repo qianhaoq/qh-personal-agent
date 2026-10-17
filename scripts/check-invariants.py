@@ -2,8 +2,8 @@
 """Mechanical server-invariant checks (AST based, low false-positive).
 
 Every rule traces to docs/server-invariants.md (source of truth, lands with
-PR #2) and is explained in docs/agent-pitfalls.md. Until that doc exists the
-rule text lives in AGENTS.md "写代码" bullets added by #2.
+PR #2) and is explained in docs/agent-pitfalls.md. Until that doc is on main
+the rule text lives in the AGENTS.md "写代码" bullets added by #2.
 
 Rules (id -> invariant):
   INV-SEQ-LAST       lock order: allocate_seq is the last lock in the write
@@ -107,8 +107,14 @@ def check_seq_last(tree: ast.AST, path: str, parents) -> list[Finding]:
                     break
                 p = parents.get(p)
         first = min(seq_calls, key=_pos)
+        # loop back-edge: a write in a loop body that also allocates runs after
+        # the previous iteration's allocate_seq
+        loop_bodies = [lp for sc in seq_calls for lp in [_enclosing_loop(sc, fn, parents)] if lp is not None]
         for c in calls:
-            if _pos(c) <= _pos(first) or c in seq_calls or _inside(c, first, parents):
+            if c in seq_calls or any(_inside(c, sc, parents) for sc in seq_calls):
+                continue
+            in_loop = any(_inside(c, lp, parents) for lp in loop_bodies)
+            if _pos(c) <= _pos(first) and not in_loop:
                 continue
             name = _call_name(c)
             bad = None
@@ -123,6 +129,15 @@ def check_seq_last(tree: ast.AST, path: str, parents) -> list[Finding]:
                     f"{bad} after {SEQ_FUNC}() (line {first.lineno}) in {fn.name}(): allocate_seq must be the "
                     "last lock before commit; only change_seq/updated_at may be written after it."))
     return out
+
+
+def _enclosing_loop(n, fn, parents):
+    p = parents.get(n)
+    while p is not None and p is not fn:
+        if isinstance(p, (ast.For, ast.AsyncFor, ast.While)):
+            return p
+        p = parents.get(p)
+    return None
 
 
 def _enclosing_func(n, parents):
@@ -142,13 +157,28 @@ def _inside(n, anc, parents) -> bool:
 
 
 # ---------------------------------------------------------------- INV-NUL
-def _route_path(dec: ast.AST) -> str | None:
+def _router_prefixes(tree: ast.AST) -> dict[str, str]:
+    """`router = APIRouter(prefix="/users/{user_id}")` -> {"router": "/users/{user_id}"}."""
+    out: dict[str, str] = {}
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Assign) and isinstance(n.value, ast.Call) and _call_name(n.value) in {"APIRouter", "FastAPI"}:
+            for k in n.value.keywords:
+                if k.arg == "prefix" and isinstance(k.value, ast.Constant) and isinstance(k.value.value, str):
+                    for t in n.targets:
+                        if isinstance(t, ast.Name):
+                            out[t.id] = k.value.value
+    return out
+
+
+def _route_path(dec: ast.AST, prefixes: dict[str, str] | None = None) -> str | None:
     if isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute) and dec.func.attr in HTTP_METHODS:
+        prefix = (prefixes or {}).get(_name(dec.func.value) or "", "")
         if dec.args and isinstance(dec.args[0], ast.Constant) and isinstance(dec.args[0].value, str):
-            return dec.args[0].value
+            return prefix + dec.args[0].value
         for k in dec.keywords:
             if k.arg == "path" and isinstance(k.value, ast.Constant):
-                return k.value.value
+                return prefix + k.value.value
+        return prefix or None
     return None
 
 
@@ -170,12 +200,13 @@ def _is_bare_str(ann: ast.AST | None) -> bool:
 
 def check_nul(tree: ast.AST, path: str, parents) -> list[Finding]:
     out = []
+    prefixes = _router_prefixes(tree)
     for fn in ast.walk(tree):
         if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         params: set[str] = set()
         for d in fn.decorator_list:
-            rp = _route_path(d)
+            rp = _route_path(d, prefixes)
             if rp:
                 params |= {m.split(":")[0] for m in re.findall(r"{([^}]+)}", rp)}
         if not params:
@@ -223,54 +254,74 @@ def check_fallback(tree: ast.AST, path: str, parents) -> list[Finding]:
 
 
 def _guarded_by_earlier_raise(c: ast.Call, fn) -> bool:
-    """Fall-through construction after an `if <selector>: ... raise` guard in the same function."""
+    """Fall-through construction after a top-level `if <is production>: raise` guard."""
     for st in fn.body:
         if getattr(st, "lineno", 0) >= c.lineno:
             break
-        if isinstance(st, ast.If) and any(isinstance(n, ast.Raise) for n in ast.walk(st)) and (
-            _selects_explicitly(st.test) or "prod" in ast.unparse(st.test).lower() or "postgres" in ast.unparse(st.test).lower()
-        ):
-            return True
+        # Only an unconditional prod/PostgreSQL rejection counts: a guard that
+        # merely mentions "mock" (e.g. `provider not in {"openai", "mock"}`)
+        # does not stop a later fall-through from silently picking the fake.
+        if isinstance(st, ast.If) and not st.orelse and any(isinstance(n, ast.Raise) for n in st.body):
+            t = ast.unparse(st.test).lower()
+            if "prod" in t or "postgres" in t:
+                return True
     return False
 
 
 # ---------------------------------------------------------------- INV-STARTUP-DDL
-def check_ddl(tree: ast.AST, path: str, parents) -> list[Finding]:
+DDL_NAMES = {"create_all", "drop_all"}
+
+
+def ddl_helpers(tree: ast.AST) -> set[str]:
+    """Functions whose body references create_all/drop_all (called or passed, e.g. run_sync(Base.metadata.create_all))."""
+    out = set()
+    for fn in ast.walk(tree):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # only real DDL (`<x>.metadata.create_all`), not callers of a wrapper
+            if any(
+                isinstance(n, ast.Attribute) and n.attr in DDL_NAMES
+                and isinstance(n.value, ast.Attribute) and n.value.attr == "metadata"
+                for n in ast.walk(fn)
+            ):
+                out.add(fn.name)
+    return out
+
+
+def check_ddl(tree: ast.AST, path: str, parents, helpers: set[str] | None = None) -> list[Finding]:
     p = Path(path)
     if p.name in DDL_ALLOWED_FILES or any(d in p.parts for d in DDL_ALLOWED_DIRS):
         return []
+    names = DDL_NAMES | (helpers or set()) | ddl_helpers(tree)
     out = []
     for c in ast.walk(tree):
-        if isinstance(c, ast.Call) and _call_name(c) in {"create_all", "drop_all"}:
+        if isinstance(c, ast.Call) and _call_name(c) in names:
             fn = _enclosing_func(c, parents)
-            if fn is not None and not isinstance(fn, ast.Lambda) and fn.name in {"create_all", "drop_all", "init_db", "bootstrap"}:
-                continue  # the helper definition itself
-            if isinstance(c.func, ast.Attribute) and isinstance(c.func.value, ast.Attribute) and c.func.value.attr == "metadata":
-                if fn is not None and not isinstance(fn, ast.Lambda) and fn.name in {"create_all", "init_db"}:
-                    continue
+            if fn is not None and not isinstance(fn, ast.Lambda) and fn.name in names:
+                continue  # inside a DDL helper definition: flag its callers instead
             out.append(Finding(path, c.lineno, "INV-STARTUP-DDL",
                 "schema DDL at process startup: API workers and the worker service race on create_all. "
                 "Run it once in a bootstrap/migration step (e.g. app/cli.py) before starting services.", warning=True))
     return out
 
 
-CHECKS = (check_seq_last, check_nul, check_fallback, check_ddl)
+CHECKS = (check_seq_last, check_nul, check_fallback)  # check_ddl needs cross-module helpers
 
 
 def is_test_file(p: Path) -> bool:
     return "tests" in p.parts or p.name.startswith("test_") or p.name.endswith("_test.py") or p.name == "conftest.py"
 
 
-def check_source(src: str, path: str) -> list[Finding]:
+def check_source(src: str, path: str, helpers: set[str] | None = None) -> list[Finding]:
     tree = ast.parse(src, filename=path)
     parents = _parents(tree)
     lines = src.splitlines()
     found = []
-    for chk in CHECKS:
-        for f in chk(tree, path, parents):
-            line = lines[f.line - 1] if 0 < f.line <= len(lines) else ""
-            if not OK_MARK.search(line):
-                found.append(f)
+    results = [f for chk in CHECKS for f in chk(tree, path, parents)]
+    results += check_ddl(tree, path, parents, helpers)
+    for f in results:
+        line = lines[f.line - 1] if 0 < f.line <= len(lines) else ""
+        if not OK_MARK.search(line):
+            found.append(f)
     return sorted(found, key=lambda f: (f.path, f.line, f.rule))
 
 
@@ -281,11 +332,18 @@ def main(argv: list[str]) -> int:
         print("check-invariants: no server/ directory, nothing to check")
         return 0
     findings: list[Finding] = []
+    files = []
     for f in sorted(server.rglob("*.py")):
         rel = f.relative_to(root)
         if is_test_file(rel) or ".venv" in rel.parts or "site-packages" in rel.parts:
             continue
-        findings += check_source(f.read_text(encoding="utf-8"), str(rel))
+        files.append((rel, f.read_text(encoding="utf-8")))
+    # cross-module DDL helpers (e.g. db.init_db wrapping metadata.create_all)
+    helpers = set()
+    for _, src in files:
+        helpers |= ddl_helpers(ast.parse(src))
+    for rel, src in files:
+        findings += check_source(src, str(rel), helpers)
     for f in findings:
         print(f)
     errors = [f for f in findings if not f.warning]
