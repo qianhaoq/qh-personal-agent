@@ -34,8 +34,18 @@
 ## 改 server 前必读 / 自检清单
 
 改 `server/` 之前（含修 review 意见），先读完以下两份：
-- [docs/server-invariants.md](docs/server-invariants.md)：服务端不变量 INV-1..INV-10，事实来源（随 PR #2 落地）；冲突时以它为准。
+- [docs/server-invariants.md](docs/server-invariants.md)：服务端不变量 INV-1..INV-12，事实来源（随 PR #2 落地）；冲突时以它为准。
 - [docs/agent-pitfalls.md](docs/agent-pitfalls.md)：反复踩的坑和正反例。
+
+关键不变量速记（只是索引，细节与例外以 docs/server-invariants.md 对应条目为准）：
+
+- **INV-1 锁序**：invite → user → device → refresh_tokens → note → reminders → jobs；业务行（含 job INSERT）显式 flush 后，`allocate_seq` 必须是提交前最后一把锁；事务内不调 LLM / mem0 / 外部网络。
+- **INV-6 租约收尾**：收尾带租约条件（`status='running' AND locked_by AND locked_at`）；丢租约的 worker 只删自己写的 memory id 并补偿再入队 memory_sync，**不得静默 return**（INV-5 第 3 步）。
+- **INV-7 输入硬化**：外部输入含 `\x00` 一律 422；病态输入（surrogate、超深 JSON、超大整数、越界时间）一律 4xx 不 500；时间（含 LLM 输出的 fire_at）统一用 `utc_safe_datetime` 的 ±14h 安全界。
+- **INV-8 登录/refresh**：device 单条原子 upsert；refresh token 存 `refresh_tokens` 表、每设备 ≤5 枚；轮换只作废被轮换的那一枚，重放已作废的 token 才吊销整台设备。
+- **INV-10 配置校验**：启动即校验，缺配置直接报错；生产（postgresql）不得隐式退化到 mock / inmemory，`MEMORY_BACKEND=mem0` 必须已装 mem0ai。
+- **INV-11 乐观锁 / rev**：rev 比较在任何提前返回之前、在锁或条件更新里原子完成；内容不变的快路径也要先校验 rev，过期 rev 一律 409。
+- **INV-12 0 行归因**：条件 UPDATE/DELETE 匹配 0 行后必须重读当前状态再定原因（或在注释里写因果封闭论证），不得猜成重放 / 冲突 / 已删除。
 
 提交前逐条自检：
 
@@ -49,7 +59,7 @@
 
 Codex / 评审 bot 评审本仓 PR 时：
 
-- 以 docs/server-invariants.md（INV-1..INV-10，随 #2 落地）为准检查 server 改动。发现违反时注明 INV 编号，并检查同一类模式在 diff 之外是否还有。
+- 以 docs/server-invariants.md（INV-1..INV-12，随 #2 落地）为准检查 server 改动。发现违反时注明 INV 编号，并检查同一类模式在 diff 之外是否还有。
 - 重点看 docs/agent-pitfalls.md 的高发类别。
 - 分级口径与 .github/copilot-instructions.md 一致：
   - CI 红灯为 P1（造成生产事故时才算 P0）；
