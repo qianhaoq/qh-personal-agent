@@ -313,6 +313,7 @@ memory_sync(note_id)     不带 rev。短读事务取 note 当前状态 →（�
 1. `LLM_PROVIDER=openai` ⇒ `LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL` 三者必须齐备（修 C3：缺任一项启动即 ValueError，而不是运行期拼出相对 URL / 空 model 让每次 organize/ask 失败）。保留既有生产（postgresql）下 mock 拒绝等规则。
 2. `DEFAULT_TIMEZONE` 必须是合法 IANA 时区名（`ZoneInfo(...)` 可构造，修 C7；请求级 timezone 校验复用 `app/schemas.py::_check_timezone` 的逻辑）。
 3. **`MEMORY_BACKEND` 只接受 `inmemory | disabled`**（threads7 拆分后；`mem0` 随生产后端移交 feat/mem0-backend，届时随该分支回到枚举）。未知值（含 `mem0`）启动即 ValidationError——绝不让拼错的后端静默退化丢记忆。
+3a. **部署门槛**：本分支 compose（migrate/api/worker）以 `MEMORY_BACKEND=disabled` 通过各自启动校验（`tests` 解析 compose 验证），**但在 feat/mem0-backend PR 合入前不得部署生产**——disabled 下记忆功能恒为空，仅供联调/预发。README 生产一节同步写明。
 4. **inmemory 只属于单进程**：进程内状态跨 api/worker 两进程互不可见。生产（postgresql）+ inmemory 默认拒绝启动，错误信息写明：inmemory 不能跨 api/worker 进程共享；生产记忆后端由后续 PR（feat/mem0-backend）提供，过渡期可显式设 `MEMORY_BACKEND=disabled`。仅单进程跑 PG 测试套件可设 `ALLOW_INMEMORY_IN_TESTS=true` 放行（原 `ALLOW_INMEMORY_IN_PROD` 改名：名字带 IN_PROD 误导部署者以为生产可开；**worker 进程无论该标志都拒绝 inmemory+PG**，`app/jobs/worker.py::check_memory_backend_shareable`——disabled 不受限）；SQLite 本地开发允许 inmemory，但 `.env.example` 与 README 写明其单进程局限（worker 写的记忆对 api 进程的 /search 不可见）。`.env.example` 的本地默认值因此是 `inmemory`。
 5. **`disabled`：显式的空记忆后端**（threads7 拆分引入），任何环境（含生产/worker）都允许：
    - `DisabledMemoryStore` 实现 MemoryStore 全接口：`add` 返回 `[]`、`search`/`list` 返回 `[]`、`delete`/`delete_by_note`/`delete_all` 返回 0，无任何外部写。

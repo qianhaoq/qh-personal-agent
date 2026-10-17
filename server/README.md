@@ -63,6 +63,8 @@ api 与 worker 是两个进程、各持一份内存，worker 写的记忆在 api
 
 ### 生产（Docker Compose：caddy + api + worker + postgres）
 
+> ⚠️ **在 feat/mem0-backend（生产记忆后端）PR 合入前不要部署生产。** 本分支的 compose 以 `MEMORY_BACKEND=disabled` 启动（能通过启动校验，但记忆检索/问答恒为空），仅用于联调与预发验证。
+
 ```bash
 cp .env.example .env
 # 编辑 .env：JWT_SECRET、POSTGRES_PASSWORD、DOMAIN、LLM_*（真实密钥不要提交）
