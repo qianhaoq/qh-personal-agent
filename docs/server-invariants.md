@@ -1,6 +1,6 @@
 # 服务端不变量与新模型设计（server-invariants.md）
 
-> 状态：设计稿（第一步，只写文档不改代码）。第二步按本文实施代码与测试。
+> 状态：已实施（PR #2）。每条 INV 的「保证代码」与「验证测试」均为现存代码与测试（`test_invariants_doc_test_names_exist` 机械校验测试名存在）；机械检查器见 `scripts/check-invariants.py`。
 > 范围：`server/`。本文回答两件事：**服务端必须永远成立的不变量**（INV-x，每条含精确陈述、保证代码、验证测试——测试名为第二步的计划名），以及**任务/记忆新模型**的设计与理由。
 > 输入：threads4.txt 的 9 条 Codex 评审意见，下文以 C1–C9 指代：
 > C1 auth 并发登录同设备竞态（P1）；C2 create 中 enqueue 晚于 allocate_seq（P1）；C3 openai 配置需三项齐备（P2）；C4 PATCH 后旧记忆无兜底清理（P2）；C5 整理后 rev 变化导致失败收尾永不命中（P1）；C6 create_all 并发建表（P2）；C7 DEFAULT_TIMEZONE 未校验（P2）；C8 path/query 参数 NUL 进 PG（P1）；C9 旧整理任务 delete_by_note 误删新 rev 记忆（P1）。
