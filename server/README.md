@@ -72,7 +72,7 @@ docker compose exec api python -m app.cli create-invite
 | `JWT_SECRET` | HS256 签名密钥，至少 32 字节随机串 |
 | `LLM_PROVIDER` | `mock`（默认，确定性规则）或 `openai`（OpenAI 兼容接口） |
 | `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | DeepSeek 示例 `https://api.deepseek.com`；腾讯混元 OpenAI 兼容地址示例见 `.env.example`。**地址与型号需按官网核实** |
-| `MEMORY_BACKEND` | `inmemory`（测试）或 `mem0`（生产，`pip install -r requirements-mem0.txt`，可选装，未装时自动退化） |
+| `MEMORY_BACKEND` | `inmemory`（测试）或 `mem0`（生产，`pip install -r requirements-mem0.txt`）。只接受这两个值，未知值启动即报错；配置 `mem0` 但未安装 mem0ai 时也直接报错，不静默退化 |
 
 ## 测试
 
@@ -87,7 +87,7 @@ docker compose exec api python -m app.cli create-invite
 
 本机没有 Docker，因此测试跑在 `sqlite+aiosqlite` 上，没有起真实 PostgreSQL 容器。由此带来的**未覆盖差异**：
 
-- **`SELECT ... FOR UPDATE SKIP LOCKED` 未在测试中执行**。多 worker 并发抢占逻辑的 PG 分支（`app/jobs/queue.py`）只有代码审查，没有集成测试；SQLite 分支退化为“先取候选、再条件 UPDATE 抢占”，这条路径被测试覆盖。上线前建议用真实 PG 做一次手工验证（开两个 worker 并发跑）。
+- **默认只跑 SQLite 分支，PG 分支需显式指定数据库**。设置 `TEST_DATABASE_URL=postgresql+asyncpg://...` 后同一套测试在真实 PG 上再跑一遍，覆盖 PG 专属路径（`app/jobs/queue.py` 的 `FOR UPDATE SKIP LOCKED` 领取/回收、`app/api/sync.py` 的 REPEATABLE READ 一致快照与序列行锁提交顺序，见 `tests/test_sync.py` 里仅 PG 运行的测试）。日常开发不装 PG 时，这些 PG 分支只有代码审查。
 - **pgvector / mem0 后端未在测试中覆盖**。测试全部使用 `InMemoryStore`；`Mem0Store`（pgvector + OpenAI 兼容 embedding）只在类型结构上对齐，未连真实库验证。embedding 选型本身也是待决策项（见 tech-arch 第 13 节）。
 - SQLite 方言存 datetime 不保留时区偏移（值统一为 UTC 墙钟），`app/timeutil.py` 做了归一，但 PG 下 timestamptz 的行为仍建议上线前冒烟一遍。
 

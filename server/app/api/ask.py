@@ -8,7 +8,7 @@ from app.deps import get_current_user_id
 from app.llm.base import get_llm_client
 from app.memory.base import get_memory_store
 from app.schemas import AskRequest
-from app.timeutil import as_utc, utcnow
+from app.timeutil import to_utc, utcnow
 
 router = APIRouter(prefix="/v1", tags=["ask"])
 
@@ -45,9 +45,10 @@ async def ask(
         return {"answer": "我没有相关记录。", "citations": []}
 
     context = "\n".join(f"- {m.text}" for m in memories)
-    # 参照时间：客户端时间（语音提问的“今天/明天”以它为准），缺省退回服务器时钟
-    ref_time = as_utc(body.client_time) or utcnow()
     tzname = body.timezone or settings.default_timezone
+    # 参照时间：客户端时间（语音提问的“今天/明天”以它为准），缺省退回服务器时钟。
+    # naive 的 client_time 按请求时区（缺省 default_timezone）本地化，不当成 UTC
+    ref_time = to_utc(body.client_time, tzname) or utcnow()
     messages = [
         {
             "role": "system",

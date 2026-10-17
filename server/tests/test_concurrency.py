@@ -13,7 +13,7 @@ SQLite 是单写者模型（库级写锁），两个并发请求在数据库层�
 import asyncio
 import uuid
 
-from tests.conftest import auth_headers
+from tests.conftest import auth_headers, requires_postgres
 
 
 async def test_concurrent_patch_same_rev_exactly_one_success(client, user):
@@ -70,3 +70,36 @@ async def test_concurrent_create_same_client_note_id_idempotent(client, user):
 
     listing = await client.get("/v1/notes", headers=headers)
     assert len(listing.json()["items"]) == 1
+
+
+@requires_postgres
+async def test_concurrent_first_allocate_seq_no_unique_violation():
+    """回归：sequences 首用初始化的并发竞争不再 UniqueViolation。
+
+    旧实现“先 SELECT 没有就 INSERT”：全新库上两个并发写事务都会 INSERT
+    同一主键，后到者阻塞到先者提交后吃 UniqueViolation（上面的并发创建
+    笔记在全新库上曾因此间歇 500）。现在用 ON CONFLICT DO NOTHING：
+    后到者等先者的插入落定后跳过，继续走 UPDATE 拿下一个值。
+
+    仅 PG：SQLite 单写者下两个写事务在库层面串行，没有这个窗口。
+    """
+    from app.common import allocate_seq
+    from app.db import get_sessionmaker
+    from app.models import Sequence
+
+    maker = get_sessionmaker()
+    async with maker() as sa, sa.begin():
+        # 事务 A 正在初始化 sequences 行（INSERT 未提交）
+        sa.add(Sequence(name="global", value=0))
+        await sa.flush()
+
+        async def b_allocates() -> int:
+            async with maker() as sb, sb.begin():
+                return await allocate_seq(sb)
+
+        task = asyncio.create_task(b_allocates())
+        await asyncio.sleep(0.3)
+        assert not task.done(), "B 应等待 A 的未提交初始化落定，而不是越过它"
+    # A 提交后：B 跳过冲突的 INSERT，走 UPDATE 拿到下一个值（不报错）
+    seq_b = await asyncio.wait_for(task, timeout=5)
+    assert seq_b == 1

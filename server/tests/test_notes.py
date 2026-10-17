@@ -111,6 +111,40 @@ async def test_create_note_timezone_defaults_to_settings(client, user, monkeypat
     assert got.json()["timezone"] == "Asia/Tokyo"
 
 
+async def test_create_note_naive_recorded_at_localized(client, user):
+    """P2：naive recorded_at 按笔记时区（缺省 default_timezone）解释成 UTC。
+
+    2026-10-17T09:00:00 + Asia/Shanghai → 2026-10-17T01:00:00Z。
+    """
+    r = await client.post(
+        "/v1/notes",
+        json={
+            "client_note_id": str(uuid.uuid4()),
+            "text": "随手记",
+            "recorded_at": "2026-10-17T09:00:00",
+            "timezone": "Asia/Shanghai",
+        },
+        headers=auth_headers(user),
+    )
+    assert r.status_code == 202, r.text
+    got = await client.get(f"/v1/notes/{r.json()['note_id']}", headers=auth_headers(user))
+    assert got.json()["recorded_at"] == "2026-10-17T01:00:00+00:00"
+
+    # 不带 timezone：退回 settings.default_timezone（默认 Asia/Shanghai）
+    r2 = await client.post(
+        "/v1/notes",
+        json={
+            "client_note_id": str(uuid.uuid4()),
+            "text": "随手记二",
+            "recorded_at": "2026-10-17T09:00:00",
+        },
+        headers=auth_headers(user),
+    )
+    assert r2.status_code == 202
+    got2 = await client.get(f"/v1/notes/{r2.json()['note_id']}", headers=auth_headers(user))
+    assert got2.json()["recorded_at"] == "2026-10-17T01:00:00+00:00"
+
+
 async def test_create_note_bad_timezone_422(client, user):
     for tz in ("Mars/Olympus", "UTC+8", "x" * 65):
         r = await client.post(

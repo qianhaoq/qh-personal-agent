@@ -187,10 +187,18 @@ def _parse_fire_at(value, tzname: str):
 
 
 async def _clear_prev_outputs(session: AsyncSession, note: Note) -> None:
-    """重新整理前清掉旧的建议提醒（软删），mem0 的 ADD/UPDATE 判定交给 mem0。"""
+    """重新整理前清掉旧的（尚未删除的）建议提醒（软删），mem0 的 ADD/UPDATE 判定交给 mem0。
+
+    只选 deleted_at IS NULL：把已软删的行再删一遍会重新分配 change_seq，
+    同一条提醒在 /v1/sync 流里出现多个墓碑（跳号 + 客户端重复删除事件）。
+    """
     reminders = (
         await session.execute(
-            select(Reminder).where(Reminder.note_id == note.id, Reminder.status == "suggested")
+            select(Reminder).where(
+                Reminder.note_id == note.id,
+                Reminder.status == "suggested",
+                Reminder.deleted_at.is_(None),
+            )
         )
     ).scalars().all()
     now = utcnow()

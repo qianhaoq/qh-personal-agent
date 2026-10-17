@@ -313,3 +313,80 @@ async def test_failure_marks_note_failed(client, user, monkeypatch):
     async with get_sessionmaker()() as session:
         note = await session.get(Note, note_id)
     assert note.status == "failed"
+
+
+async def test_failed_finalize_skips_note_patched_after_enqueue(client, user, monkeypatch):
+    """P1-C：最后一次失败收尾前用户 PATCH 了笔记 → 不把新 rev 的笔记标 failed。
+
+    旧收尾对 note 无条件置 failed：拿着旧 rev 的任务失败收尾时会把用户
+    刚 PATCH 出来的新版本也标成 failed。现在按入队 rev 条件更新，
+    rowcount=0 时不动 note；新 rev 的整理任务正常完成。
+    """
+    import uuid
+
+    from app.db import get_sessionmaker
+    from app.pipeline import runner
+    from app.pipeline.runner import run_pending_jobs
+    from tests.conftest import auth_headers
+
+    headers = auth_headers(user)
+    r = await client.post(
+        "/v1/notes",
+        json={"client_note_id": str(uuid.uuid4()), "text": "会失败且会被中途改掉的笔记"},
+        headers=headers,
+    )
+    note_id = r.json()["note_id"]
+
+    class BoomLLM:
+        async def chat(self, messages, response_format=None):
+            raise RuntimeError("llm down")
+
+    async def fake_get_llm():
+        return BoomLLM()
+
+    monkeypatch.setattr("app.pipeline.organize.get_llm_client", fake_get_llm)
+
+    finalize_calls = {"n": 0}
+    real_finalize = runner._finalize_failure
+
+    async def finalize_with_mid_race_patch(maker, claimed, error, retry_delay_seconds):
+        finalize_calls["n"] += 1
+        if finalize_calls["n"] == 3:
+            # 第 3 次（最后一次）失败收尾前，用户 PATCH：rev+1 并入队新任务，
+            # LLM 恢复（模拟“旧任务失败与用户修改并发，新任务随后成功”）
+            monkeypatch.undo()
+            rev = (await client.get(f"/v1/notes/{note_id}", headers=headers)).json()["rev"]
+            patched = await client.patch(
+                f"/v1/notes/{note_id}",
+                json={"text": "用户改过的最新内容", "rev": rev},
+                headers=headers,
+            )
+            assert patched.status_code == 200, patched.text
+        await real_finalize(maker, claimed, error, retry_delay_seconds)
+
+    monkeypatch.setattr(runner, "_finalize_failure", finalize_with_mid_race_patch)
+
+    # 只跑 3 个：旧任务 3 次尝试全部失败（判 failed），新 rev 的任务留在队列里。
+    # 此时检查收尾有没有污染用户的新版本（下一次运行才会执行新任务）
+    processed = await run_pending_jobs(limit=3, retry_delay_seconds=0)
+    assert processed == 3
+
+    async with get_sessionmaker()() as session:
+        note = await session.get(Note, note_id)
+    assert note.status != "failed"  # 新 rev 未被过期任务的失败收尾覆盖
+    assert note.status == "uploaded"  # PATCH 后等待重新整理
+
+    # 新 rev 的任务随后正常完成
+    await run_pending_jobs(retry_delay_seconds=0)
+    async with get_sessionmaker()() as session:
+        note = await session.get(Note, note_id)
+        jobs = (
+            await session.execute(
+                select(Job).where(Job.payload_json.contains(note_id))
+            )
+        ).scalars().all()
+    assert {j.status for j in jobs} == {"failed", "done"}
+    assert note.status == "organized"  # 不是 failed：收尾条件更新未命中新 rev
+    assert note.rev == 3  # PATCH +1，新任务整理再 +1
+    assert note.text == "用户改过的最新内容"
+    assert note.llm_calls == 1  # 只有新任务真正调用了 LLM

@@ -15,7 +15,7 @@ from app.jobs.queue import enqueue
 from app.memory.base import get_memory_store
 from app.models import Note, Reminder
 from app.schemas import NoteCreate, NotePatch, note_to_dict
-from app.timeutil import as_utc, utcnow
+from app.timeutil import to_utc, utcnow
 
 router = APIRouter(prefix="/v1/notes", tags=["notes"])
 
@@ -46,14 +46,16 @@ async def create_note(
             "rev": existing.rev,
         }
 
+    tzname = body.timezone or get_settings().default_timezone
     note = Note(
         id=new_id("nte"),
         user_id=user_id,
         client_note_id=body.client_note_id,
         text=body.text,
         source=body.source,
-        recorded_at=as_utc(body.recorded_at),
-        timezone=body.timezone or get_settings().default_timezone,
+        # naive 的 recorded_at 按笔记时区本地化，不当成 UTC
+        recorded_at=to_utc(body.recorded_at, tzname),
+        timezone=tzname,
         status="uploaded",
         rev=1,
         change_seq=await allocate_seq(session),

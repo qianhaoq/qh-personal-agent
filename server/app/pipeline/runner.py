@@ -5,11 +5,9 @@ from dataclasses import dataclass
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.common import allocate_seq
 from app.db import get_sessionmaker
-from app.jobs.queue import claim_next, mark_done, mark_failed
-from app.models import Job, Note
-from app.timeutil import utcnow
+from app.jobs.queue import claim_next, mark_done, mark_failed, mark_note_failed_if_rev
+from app.models import Job
 
 logger = logging.getLogger(__name__)
 
@@ -85,14 +83,19 @@ async def _finalize_failure(
     error: str,
     retry_delay_seconds: int,
 ) -> None:
-    """事务 3：失败收尾——退避重试，或达上限标 failed 并置 note 失败。"""
+    """事务 3：失败收尾——退避重试，或达上限标 failed 并置 note 失败。
+
+    note 的失败标记按入队时的 rev 条件更新（mark_note_failed_if_rev）：
+    任务在途期间用户已 PATCH（rev 变化，由重新入队的任务负责）或已删除
+    时不动 note，不用过期任务的失败覆盖新版本。
+    """
     async with maker() as session, session.begin():
         job = await session.get(Job, claimed.id)
         if job is None:
             return
         await mark_failed(session, job, error, retry=True, retry_delay_seconds=retry_delay_seconds)
         if job.status == "failed":
-            await _mark_note_failed(session, claimed.payload)
+            await mark_note_failed_if_rev(session, claimed.payload)
 
 
 async def execute_job(session: AsyncSession, kind: str, payload: dict) -> None:
@@ -102,14 +105,3 @@ async def execute_job(session: AsyncSession, kind: str, payload: dict) -> None:
         await organize_note(session, payload["note_id"], enqueued_rev=payload.get("rev"))
     else:
         raise ValueError(f"unknown job kind: {kind}")
-
-
-async def _mark_note_failed(session: AsyncSession, payload: dict) -> None:
-    note_id = payload.get("note_id")
-    if not note_id:
-        return
-    note = await session.get(Note, note_id)
-    if note is not None:
-        note.status = "failed"
-        note.change_seq = await allocate_seq(session)
-        note.updated_at = utcnow()

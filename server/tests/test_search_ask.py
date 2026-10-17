@@ -110,3 +110,46 @@ async def test_ask_bad_timezone_422(client, user):
         headers=auth_headers(user),
     )
     assert resp.status_code == 422
+
+
+async def test_ask_naive_client_time_localized_by_timezone(client, user, run_jobs, monkeypatch):
+    """P2：naive client_time 按请求时区解释，不再误当成 UTC。
+
+    2026-10-17T09:00:00 + Asia/Shanghai → 2026-10-17T01:00:00Z；不带
+    timezone 时用 settings.default_timezone（默认 Asia/Shanghai）。
+    """
+    await _add_note(client, user, "我对花生过敏，吃饭要注意")
+    await run_jobs()
+
+    captured: dict = {}
+
+    class SpyLLM:
+        async def chat(self, messages, response_format=None):
+            captured["messages"] = messages
+            return "根据你的记录：花生过敏"
+
+    async def fake_get_llm():
+        return SpyLLM()
+
+    monkeypatch.setattr("app.api.ask.get_llm_client", fake_get_llm)
+    resp = await client.post(
+        "/v1/ask",
+        json={
+            "text": "我吃东西要注意什么",
+            "client_time": "2026-10-17T09:00:00",
+            "timezone": "Asia/Shanghai",
+        },
+        headers=auth_headers(user),
+    )
+    assert resp.status_code == 200
+    assert "2026-10-17T01:00:00+00:00" in captured["messages"][0]["content"]
+
+    # 不带 timezone：按 default_timezone 解释
+    captured.clear()
+    resp2 = await client.post(
+        "/v1/ask",
+        json={"text": "我吃东西要注意什么", "client_time": "2026-10-17T09:00:00"},
+        headers=auth_headers(user),
+    )
+    assert resp2.status_code == 200
+    assert "2026-10-17T01:00:00+00:00" in captured["messages"][0]["content"]

@@ -32,6 +32,17 @@ from app.memory.base import set_memory_store
 from app.memory.inmemory import InMemoryStore
 from app.models import InviteCode
 
+# 是否在 PostgreSQL 下运行同一套测试
+IS_POSTGRES = bool(_TEST_DB_URL and _TEST_DB_URL.startswith("postgresql"))
+
+# 仅 PG 运行的测试统一挂这个标记：这些竞态依赖 PG 的语句级多版本快照与
+# 行锁语义；SQLite 单写者模型下并发事务天然串行，构造不出对应窗口
+# （读事务持有共享锁，读之间注入写会阻塞），所以在 SQLite 下跳过。
+requires_postgres = pytest.mark.skipif(
+    not IS_POSTGRES,
+    reason="竞态依赖 PostgreSQL 的多版本快照/行锁语义；SQLite 单写者模型下事务天然串行，无法复现",
+)
+
 
 @pytest.fixture(autouse=True)
 async def _fresh_env():

@@ -64,3 +64,28 @@ def test_sqlite_default_secret_ok():
     # （显式传参以压过 conftest 设置的 JWT_SECRET 环境变量）
     settings = Settings(database_url="sqlite+aiosqlite:///./app.sqlite3", jwt_secret=DEFAULT_JWT_SECRET)
     assert settings.jwt_secret == DEFAULT_JWT_SECRET
+
+
+def test_memory_backend_only_accepts_known_values():
+    """P2：MEMORY_BACKEND 只接受 inmemory|mem0，未知值启动即校验失败。"""
+    assert Settings(memory_backend="inmemory").memory_backend == "inmemory"
+    assert Settings(memory_backend="mem0").memory_backend == "mem0"
+    with pytest.raises(ValidationError, match="memory_backend"):
+        Settings(memory_backend="redis")
+
+
+def test_get_memory_store_unknown_backend_raises(monkeypatch):
+    """P2：即使绕过 config 校验，store 工厂也不静默退化成别的后端。"""
+    from app.config import get_settings
+    from app.memory import base as memory_base
+
+    monkeypatch.setattr(memory_base, "_store", None)
+    monkeypatch.setattr(get_settings(), "memory_backend", "bogus")
+    with pytest.raises(ValueError, match="MEMORY_BACKEND"):
+        memory_base.get_memory_store()
+
+
+def test_job_lock_timeout_seconds_default_300():
+    """P1-B：锁超时默认 300s（回收 running 任务的判定窗口）。"""
+    settings = Settings(database_url="sqlite+aiosqlite:///./app.sqlite3")
+    assert settings.job_lock_timeout_seconds == 300

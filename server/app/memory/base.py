@@ -48,10 +48,14 @@ def get_memory_store() -> MemoryStore:
             from app.memory.mem0_store import Mem0Store
 
             _store = Mem0Store()
-        else:
+        elif backend == "inmemory":
             from app.memory.inmemory import InMemoryStore
 
             _store = InMemoryStore()
+        else:
+            # config 已用 Literal 限制取值，正常到不了这里；防止未来新增后端
+            # 或绕过校验直接改配置时静默退化成错误实现
+            raise ValueError(f"未知 MEMORY_BACKEND：{backend}（只支持 inmemory | mem0）")
     return _store
 
 

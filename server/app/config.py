@@ -1,5 +1,6 @@
 """应用配置：全部来自环境变量（.env 亦可）。"""
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -37,8 +38,8 @@ class Settings(BaseSettings):
     llm_model: str = ""
     llm_timeout_seconds: float = 15.0
 
-    # 记忆层
-    memory_backend: str = "inmemory"  # inmemory | mem0
+    # 记忆层：只接受这两个值，未知值启动即报错（而不是静默退化丢记忆）
+    memory_backend: Literal["inmemory", "mem0"] = "inmemory"
     # mem0 的 embedding 单独配置（可以和 LLM 不同源）
     mem0_embedding_base_url: str = ""
     mem0_embedding_model: str = ""
@@ -46,6 +47,8 @@ class Settings(BaseSettings):
     # 流水线
     default_timezone: str = "Asia/Shanghai"
     job_max_attempts: int = 3
+    # running 状态超过该秒数视为 worker 中断，任务可被回收重跑
+    job_lock_timeout_seconds: int = 300
 
     # 整理 worker
     worker_poll_interval_seconds: float = 2.0
