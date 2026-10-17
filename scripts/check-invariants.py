@@ -306,6 +306,10 @@ def check_fallback(tree, path, parents) -> list[Finding]:
                 if child in p.body and not _implicit_test(p.test):
                     explicit = True  # any enclosing explicit selector (e.g. provider == "mock") wins
                     break
+                if child in p.orelse and isinstance(p.test, ast.Compare) and len(p.test.ops) == 1 \
+                        and isinstance(p.test.ops[0], (ast.NotEq, ast.IsNot, ast.NotIn)):
+                    explicit = True  # `if provider != "mock": ... else: MockLLM()` selects the fake explicitly
+                    break
                 if child in p.orelse and not (len(p.orelse) == 1 and isinstance(p.orelse[0], ast.If)):
                     why = why or "in an else branch"
                 elif child in p.body:
