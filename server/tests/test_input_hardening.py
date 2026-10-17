@@ -97,11 +97,13 @@ async def test_huge_int_inputs_422(client, user):
 
 async def test_extreme_datetime_inputs_422(client, user):
     """极端日期换算/本地化成 UTC 越界（astimezone OverflowError → 500）：
-    SafeDatetime 校验拦成 422；边界内的 aware 极值正常接受。"""
+    SafeDatetime 校验拦成 422；边界内的 aware 极值正常接受（aware/naive
+    统一安全界：换算/视为 UTC 后在 0001-01-02–9998-12-31，threads5 P2-4）。"""
     headers = auth_headers(user)
     rejected = [
-        # aware：换算 UTC 后越过 year 1 / year 9999
+        # aware：换算 UTC 后越过统一安全界（9998 年上界，预留 ±14h 偏移）
         "9999-12-31T23:59:59.999999-05:00",
+        "9999-12-31T23:59:59+05:00",
         "0001-01-01T00:00:00+05:00",
         # naive：按最坏 IANA 偏移（±14h）本地化后越界
         "0001-01-01T00:00:00",
@@ -123,14 +125,55 @@ async def test_extreme_datetime_inputs_422(client, user):
     )
     assert asked.status_code in _4XX, (asked.status_code, asked.text)
 
-    # 边界内的 aware 极值（换算后仍在 1–9999 年）必须照常接受
+    # 边界内的 aware 极值（换算 UTC 后仍在 0002–9998 年）必须照常接受
     ok = await client.post(
         "/v1/notes",
         json={
             "client_note_id": "dtok",
             "text": "hi",
-            "recorded_at": "9999-12-31T23:59:59+05:00",
+            "recorded_at": "9998-12-31T20:00:00+05:00",
         },
         headers=headers,
     )
     assert ok.status_code == 202, (ok.status_code, ok.text)
+
+
+async def test_aware_datetime_boundary_rejected_before_extraction_no_500(client, user, run_jobs):
+    """threads5 P2-4 / INV-7：`9999-12-31T23:59:59Z` 是合法 UTC 值，但配
+    用户时区 Asia/Shanghai 后，抽取/提醒解析的 astimezone(+8h) 会
+    OverflowError——旧校验只试「能转 UTC」放它过 schema，note 被标 failed；
+    现在 aware/naive 统一安全界，schema 层 422（绝不是 500/failed）。边界
+    内的 aware 值带着时区走完整抽取链路不炸。"""
+    headers = auth_headers(user)
+
+    rejected = await client.post(
+        "/v1/notes",
+        json={
+            "client_note_id": "aware_bad",
+            "text": "明天早上八点提醒我开会",
+            "recorded_at": "9999-12-31T23:59:59Z",
+            "timezone": "Asia/Shanghai",
+        },
+        headers=headers,
+    )
+    assert rejected.status_code in _4XX, (rejected.status_code, rejected.text)
+    assert rejected.json()["error"]["code"] == "validation_error"
+
+    ok = await client.post(
+        "/v1/notes",
+        json={
+            "client_note_id": "aware_ok",
+            "text": "明天早上八点提醒我开会",
+            "recorded_at": "9998-12-31T23:00:00Z",
+            "timezone": "Asia/Shanghai",
+        },
+        headers=headers,
+    )
+    assert ok.status_code == 202, (ok.status_code, ok.text)
+    await run_jobs()
+    note_id = ok.json()["note_id"]
+    detail = await client.get(f"/v1/notes/{note_id}", headers=headers)
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["status"] == "organized", (
+        f"边界内 aware 时间应走完抽取不炸：{detail.json()['status']}"
+    )
