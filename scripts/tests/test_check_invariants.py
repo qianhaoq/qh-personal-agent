@@ -47,6 +47,7 @@ class SeqLast(unittest.TestCase):
             seq = await allocate_seq(session)
             await session.execute(update(Note).where(Note.id == i).values(change_seq=seq))
             await session.execute(update(Note).values({Note.change_seq: seq, "updated_at": now}))
+            await session.execute(update(Note).values(**{"change_seq": seq}))
             await session.flush()
         """), [])
 
@@ -118,6 +119,18 @@ class Nul(unittest.TestCase):
         ): ...
         @router.get("/{f}")
         async def h(f: str = Path(pattern=r"^nte_[0-9a-f]{16}$")): ...
+        @router.get("/{g}")
+        async def i(g: Annotated[str, StringConstraints(pattern=r"^x$")]): ...
+        """), [])
+
+    def test_factory_router_prefix_not_leaked(self):
+        self.assertEqual(rules("""
+        def a():
+            router = APIRouter(prefix="/{tenant_id}")
+        def b():
+            router = APIRouter()
+            @router.get("/x")
+            async def g(tenant_id: str = Depends(t)): ...
         """), [])
 
     def test_router_prefix(self):
@@ -162,6 +175,10 @@ class Fallback(unittest.TestCase):
                     raise ValueError(s.backend)
         def c(s):
             return InMemoryRateLimiter(s.rate)
+        def e(s):
+            if s.provider == "mock":
+                if _client is None:
+                    _client = MockLLM()
         def d(s):
             if s.provider == "mock" and s.mock_seed is None:
                 return MockLLM()

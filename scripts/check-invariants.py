@@ -21,7 +21,8 @@ Rules:
   INV-NUL          FastAPI path params typed as bare str (str, str | None,
                    Optional[str], Annotated[str, ...] without a NUL-safe constraint).
                    Accepted: NoNulStr; Annotated metadata with reject_nul/AfterValidator,
-                   or Path/Query(pattern=...|regex=...); non-str converters ({id:int}).
+                   or any constraint call with pattern=/regex= (Path, Query, StringConstraints,
+                   Field, constr); non-str converters ({id:int}).
   INV-NO-FALLBACK  A known fake (MockLLM, FakeLLM, InMemoryStore) constructed as an
                    implicit fallback: inside an `except` handler, a bare `else:`
                    branch, or an `if` whose test is a negation / `is None` /
@@ -104,7 +105,12 @@ def _only_seq_update(call: ast.Call) -> bool:
     """execute(update(X)...values(change_seq=...)) with no other columns."""
     for n in ast.walk(call):
         if isinstance(n, ast.Call) and _name(n.func) == "values":
-            keys = {k.arg for k in n.keywords}
+            keys = set()
+            for k in n.keywords:
+                if k.arg is None and isinstance(k.value, ast.Dict) and None not in k.value.keys:
+                    keys |= {x.value if isinstance(x, ast.Constant) else _name(x) for x in k.value.keys}
+                else:
+                    keys.add(k.arg)
             for arg in n.args:  # mapping form: .values({Note.change_seq: seq})
                 if not isinstance(arg, ast.Dict) or None in arg.keys:
                     return False
@@ -192,7 +198,7 @@ def check_seq_last(tree, path, parents) -> list[Finding]:
 # ------------------------------------------------------------------ INV-NUL
 def _prefixes(tree) -> dict[str, str]:
     out = {}
-    for n in ast.walk(tree):
+    for n in tree.body:  # module-level routers only (factories may reuse the name)
         if isinstance(n, ast.Assign) and isinstance(n.value, ast.Call) and _name(n.value.func) in {"APIRouter", "FastAPI"}:
             for k in n.value.keywords:
                 if k.arg == "prefix" and isinstance(k.value, ast.Constant) and isinstance(k.value.value, str):
@@ -205,7 +211,7 @@ def _nul_safe_meta(meta: list[ast.AST]) -> bool:
         src = ast.unparse(m)
         if "reject_nul" in src or "AfterValidator" in src:
             return True
-        if isinstance(m, ast.Call) and _name(m.func) in {"Path", "Query"} and any(k.arg in {"pattern", "regex"} for k in m.keywords):
+        if isinstance(m, ast.Call) and any(k.arg in {"pattern", "regex"} for k in m.keywords):  # Path/Query/StringConstraints/constr/Field
             return True
     return False
 
@@ -277,23 +283,22 @@ def check_fallback(tree, path, parents) -> list[Finding]:
     for c in ast.walk(tree):
         if not (isinstance(c, ast.Call) and _name(c.func) in KNOWN_FAKES):
             continue
-        child, why = c, None
+        child, why, explicit = c, None, False
         for p in _ancestors(c, parents):
             if isinstance(p, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 break
             if isinstance(p, ast.ExceptHandler):
-                why = "in an except handler"
+                why = why or "in an except handler"
             elif isinstance(p, ast.If):
                 if child in p.body and not _implicit_test(p.test):
-                    break  # explicit selector branch (e.g. elif backend == "inmemory")
+                    explicit = True  # any enclosing explicit selector (e.g. provider == "mock") wins
+                    break
                 if child in p.orelse and not (len(p.orelse) == 1 and isinstance(p.orelse[0], ast.If)):
-                    why = "in an else branch"
-                elif child in p.body and _implicit_test(p.test):
-                    why = f"under `if {ast.unparse(p.test)}`"
-            if why:
-                break
+                    why = why or "in an else branch"
+                elif child in p.body:
+                    why = why or f"under `if {ast.unparse(p.test)}`"
             child = p
-        if why:
+        if why and not explicit:
             out.append(Finding(path, c.lineno, "INV-NO-FALLBACK",
                 f"{_name(c.func)}() constructed as an implicit fallback ({why}): select fakes only on an explicit "
                 "config value and raise on missing/invalid config"))
