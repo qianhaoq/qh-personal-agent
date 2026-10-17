@@ -15,7 +15,7 @@
 
 ## 服务端不变量
 
-- server 改动以 `docs/server-invariants.md`（INV-1..INV-10，随 PR #2 落地）为准评审，高发类别见 `docs/agent-pitfalls.md`。违反时注明 INV 编号，并检查同类模式在 diff 之外是否也存在。
+- server 改动以 `docs/server-invariants.md`（INV-1..INV-12，随 PR #2 落地）为准评审，高发类别见 `docs/agent-pitfalls.md`。违反时注明 INV 编号，并检查同类模式在 diff 之外是否也存在。
 - `scripts/check-invariants.py` 是 best-effort 启发式：漏检按 P2 defer，误报或崩溃才算 P1。
 
 ## 提交前自检
