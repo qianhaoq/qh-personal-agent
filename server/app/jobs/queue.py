@@ -316,45 +316,57 @@ async def mark_note_failed_on_job_failure(
     if not note_id:
         return False
     if kind == "extract":
-        if note_rev is None:
-            return False
-        result = await session.execute(
-            update(Note)
-            .where(
-                Note.id == note_id,
-                Note.rev == note_rev,
-                Note.deleted_at.is_(None),
-                Note.status != "organized",
-            )
-            .values(status="failed", updated_at=utcnow())
-            .execution_options(synchronize_session=False)
-        )
-        if result.rowcount == 0:
-            return False
-        seq = await allocate_seq(session)
-        await session.execute(
-            update(Note).where(Note.id == note_id).values(change_seq=seq)
-        )
-        return True
+        return await _mark_extract_failed(session, note_id=note_id, note_rev=note_rev)
     if kind == "memory_sync":
-        others = (
-            select(literal(1))
-            .where(
-                Job.kind == "memory_sync",
-                Job.note_id == note_id,
-                Job.status.in_(("pending", "running")),
-                Job.id != job_id,
-            )
-            .exists()
-        )
-        result = await session.execute(
-            update(Note)
-            .where(Note.id == note_id, Note.deleted_at.is_(None), ~others)
-            .values(memory_status="failed", updated_at=utcnow())
-            .execution_options(synchronize_session=False)
-        )
-        return bool(result.rowcount)
+        return await _mark_memory_sync_failed(session, note_id=note_id, job_id=job_id)
     return False
+
+
+async def _mark_extract_failed(
+    session: AsyncSession, *, note_id: str, note_rev: int | None
+) -> bool:
+    """extract 耗尽：条件 UPDATE note.status='failed' → allocate_seq → change_seq 写回。"""
+    if note_rev is None:
+        return False
+    result = await session.execute(
+        update(Note)
+        .where(
+            Note.id == note_id,
+            Note.rev == note_rev,
+            Note.deleted_at.is_(None),
+            Note.status != "organized",
+        )
+        .values(status="failed", updated_at=utcnow())
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount == 0:
+        return False
+    seq = await allocate_seq(session)
+    await session.execute(
+        update(Note).where(Note.id == note_id).values(change_seq=seq)
+    )
+    return True
+
+
+async def _mark_memory_sync_failed(session: AsyncSession, *, note_id: str, job_id: str) -> bool:
+    """memory_sync 耗尽：note.memory_status='failed'（无后继任务时），不占 seq。"""
+    others = (
+        select(literal(1))
+        .where(
+            Job.kind == "memory_sync",
+            Job.note_id == note_id,
+            Job.status.in_(("pending", "running")),
+            Job.id != job_id,
+        )
+        .exists()
+    )
+    result = await session.execute(
+        update(Note)
+        .where(Note.id == note_id, Note.deleted_at.is_(None), ~others)
+        .values(memory_status="failed", updated_at=utcnow())
+        .execution_options(synchronize_session=False)
+    )
+    return bool(result.rowcount)
 
 
 async def finalize_claim(

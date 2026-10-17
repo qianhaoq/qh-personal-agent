@@ -72,7 +72,7 @@ async def startup_create_all() -> None:
     init-db（表缺失时让首个查询快速失败，暴露部署错误），这里不建表。"""
     if get_settings().database_url.startswith("postgresql"):
         return
-    await create_all()
+    await create_all()  # invariant-ok[INV-STARTUP-DDL]: SQLite dev/test only; PG returns above and requires `python -m app.cli init-db`
 
 
 async def dispose_engine() -> None:
