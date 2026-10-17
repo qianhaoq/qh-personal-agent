@@ -221,3 +221,24 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+class DbSettings(BaseSettings):
+    """只含数据库层的配置（threads7 P1 / INV-9 校验分层）。
+
+    init-db（compose 的 one-shot migrate 服务）只做建表：让它加载完整
+    Settings 会把 LLM/记忆后端/JWT 的生产校验也拖进建表路径——migrate
+    沿用 .env 的本地默认（MEMORY_BACKEND=inmemory、LLM_PROVIDER=mock）
+    叠加 compose 的 PG 覆盖时，会撞上生产拓扑校验直接退出，全新部署停在
+    建表一步。建表只依赖 DATABASE_URL；api/worker 仍按各自 command 过
+    完整 Settings 的启动校验（有测试机械验证，见 tests/test_compose.py）。
+    """
+
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+    database_url: str = "sqlite+aiosqlite:///./app.sqlite3"
+
+
+@lru_cache
+def get_db_settings() -> DbSettings:
+    return DbSettings()

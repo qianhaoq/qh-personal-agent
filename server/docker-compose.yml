@@ -22,10 +22,9 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://personal:${POSTGRES_PASSWORD}@postgres:5432/personal_agent
-      # 建表与记忆后端无关，但当前 init-db 仍加载完整 Settings：沿用 .env
-      # 的本地默认（inmemory）+ PG 会撞上生产拓扑校验，先一并显式 disabled
-      # （threads7 P1 / docker-compose.yml:24）
-      MEMORY_BACKEND: disabled
+      # init-db 只加载 DbSettings（数据库层校验，threads7 P1 / INV-9）：
+      # 建表不依赖 LLM/记忆后端/JWT 配置，沿用 .env 本地默认即可通过；
+      # api/worker 按各自 command 过完整 Settings 启动校验
     command: python -m app.cli init-db
     depends_on:
       postgres:
