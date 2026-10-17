@@ -320,8 +320,10 @@ memory_sync(note_id)     不带 rev。短读事务取 note 当前状态 →（�
 - `test_openai_missing_base_url_rejected` / `test_openai_missing_model_rejected` / `test_openai_missing_api_key_rejected`（已有 key 用例扩展）
 - `test_openai_all_three_configured_ok`（另有 `test_openai_missing_two_fields_lists_both` 断言多项缺失一并报出）
 - `test_default_timezone_invalid_rejected`（如 `Asia/Bejing`）/ `test_default_timezone_valid_ok`
-- `test_worker_refuses_inmemory_with_postgres`（worker 启动检查，无视放行标志）
+- `test_worker_refuses_inmemory_with_postgres`（worker 启动检查，无视放行标志；disabled 不受限）
 - `test_get_memory_store_unknown_backend_raises`（即使绕过 config 校验，store 工厂也不静默退化）
+- `test_memory_backend_only_accepts_known_values`（枚举：`mem0` 等已拆分/未知值启动即拒）、`test_production_inmemory_rejection_mentions_mem0_backend_pr`（拒绝信息含 feat/mem0-backend 与 disabled 指引）、`test_production_disabled_memory_backend_ok`
+- `test_disabled_store_empty_contract` / `test_factory_returns_disabled_store` / `test_disabled_memory_sync_marks_synced` / `test_disabled_search_and_ask_return_empty_not_500`（`tests/test_disabled_memory.py`：空后端契约、工厂、memory_sync 平凡收敛、读路径不 500）
 
 ### INV-11 API 写入的乐观锁与 rev 语义（threads6 P1-2）
 
@@ -414,7 +416,7 @@ memory_sync(note_id)     不带 rev。短读事务取 note 当前状态 →（�
 4. 新增状态变更已同步更新本文档对应 INV 与测试；本文「保证代码」落点与实际文件/函数一致。
 5. 并发测试在 PG 下用独立会话/连接真并发；SQLite 下无法复现的竞态 `skipif` 并注明原因（沿用 `requires_postgres` 标记）。
 6. init-db 后核对三条部分唯一索引在 PG（`\d jobs`）与 SQLite（`sqlite_master`）都存在（或以测试断言）。
-7. 旧 dev 库处理：PG 卷重建或手动 ALTER（见第 3 节）；`.env.example` 若涉及新配置项同步更新（`test_env_example_placeholder_matches_template`、`test_env_example_local_default_inmemory_documents_mem0`、`test_env_example_documents_new_runtime_flags` 系列）。
+7. 旧 dev 库处理：PG 卷重建或手动 ALTER（见第 3 节）；`.env.example` 若涉及新配置项同步更新（`test_env_example_placeholder_matches_template`、`test_env_example_documents_memory_backend_choices`、`test_env_example_documents_new_runtime_flags` 系列）。
 8. compose 校验：`migrate` one-shot 先于 api/worker（`service_completed_successfully`）；PG 下 api/worker 启动不再建表；各服务环境按其 command 通过对应启动校验（migrate → DbSettings；api → 完整 Settings；worker → 完整 Settings + worker 拓扑校验），`tests/test_compose.py` 机械验证（threads7 P1）。
 9. 未来任何 header 值入库必须走 `NoNulStr`（INV-7 覆盖面表）。
 10. 新增携带版本的写接口（或给既有接口加 rev）：对照 INV-11——快路径/幂等命中也必须先原子校验 rev，409 体用 `error_body("conflict", …)` 两段式。
@@ -436,7 +438,7 @@ memory_sync(note_id)     不带 rev。短读事务取 note 当前状态 →（�
 | INV-7 | test_nul_in_path_param_422；test_nul_in_query_param_422；test_nul_middleware_covers_all_routes；test_lone_surrogate_in_body_rejected_422；test_invalid_utf8_body_rejected_4xx；test_deeply_nested_asr_over_depth_limit_422；test_absurdly_deep_body_recursion_guard_422；test_huge_int_inputs_422；test_extreme_datetime_inputs_422；test_aware_datetime_boundary_rejected_before_extraction_no_500；test_llm_boundary_fire_at_overflow_discarded | 双后端 |
 | INV-8 | test_login_device_bound_to_other_user_403；test_concurrent_login_same_device_all_returned_tokens_refreshable；test_concurrent_first_login_same_device_no_integrity_error；test_refresh_token_cap_evicts_oldest_keeps_current；test_refresh_rotation_revokes_only_rotated_token；test_logout_revokes_all_device_refresh_tokens；test_refresh_expired_token_rejected_401；test_refresh_race_row_deleted_while_waiting_device_lock_401_no_revoke；test_refresh_prunes_expired_rows_keeps_revoked_until_expiry | 并发项 PG 真并发；threads6 竞态项钩子注入两后端可跑 |
 | INV-9 | test_init_db_concurrent_no_error_pg；test_lifespan_skips_create_all_on_postgres；test_init_db_sqlite_creates_tables | 并发项 PG |
-| INV-10 | test_openai_missing_api_key_rejected、test_openai_missing_base_url_rejected、test_openai_missing_model_rejected；test_openai_all_three_configured_ok；test_default_timezone_invalid_rejected；test_default_timezone_valid_ok；test_worker_refuses_inmemory_with_postgres；test_get_memory_store_unknown_backend_raises | 纯配置，无 DB；mem0 相关用例随生产后端移至 feat/mem0-backend |
+| INV-10 | test_openai_missing_api_key_rejected、test_openai_missing_base_url_rejected、test_openai_missing_model_rejected；test_openai_all_three_configured_ok；test_default_timezone_invalid_rejected；test_default_timezone_valid_ok；test_worker_refuses_inmemory_with_postgres；test_get_memory_store_unknown_backend_raises；test_memory_backend_only_accepts_known_values、test_production_inmemory_rejection_mentions_mem0_backend_pr、test_production_disabled_memory_backend_ok；test_disabled_store_empty_contract、test_factory_returns_disabled_store、test_disabled_memory_sync_marks_synced、test_disabled_search_and_ask_return_empty_not_500 | 纯配置，无 DB（disabled 三条走 client 夹具但只断言空结果）；mem0 相关用例随生产后端移至 feat/mem0-backend |
 | INV-11 | test_patch_unchanged_text_with_stale_rev_409 | 双后端 |
 | INV-12 | test_refresh_race_row_deleted_while_waiting_device_lock_401_no_revoke；test_concurrent_sixth_login_eviction_vs_refresh_no_device_revoke_pg；正面样例回归 test_concurrent_patch_same_rev_exactly_one_success、test_login_device_bound_to_other_user_403 | 竞态项 PG 真并发；钩子注入项双后端 |
 

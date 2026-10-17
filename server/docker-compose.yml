@@ -22,6 +22,10 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://personal:${POSTGRES_PASSWORD}@postgres:5432/personal_agent
+      # 建表与记忆后端无关，但当前 init-db 仍加载完整 Settings：沿用 .env
+      # 的本地默认（inmemory）+ PG 会撞上生产拓扑校验，先一并显式 disabled
+      # （threads7 P1 / docker-compose.yml:24）
+      MEMORY_BACKEND: disabled
     command: python -m app.cli init-db
     depends_on:
       postgres:
@@ -34,8 +38,10 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://personal:${POSTGRES_PASSWORD}@postgres:5432/personal_agent
       # inmemory 仅单进程开发/测试：api 是多 worker、worker 是独立进程，
-      # 各自一份内存会静默丢记忆，生产固定 mem0（config 校验会拒绝 inmemory）
-      MEMORY_BACKEND: mem0
+      # 各自一份内存会静默丢记忆（config 校验会拒绝 inmemory+PG）。生产
+      # 记忆后端由后续 PR（feat/mem0-backend）提供，过渡期显式关闭记忆
+      # 功能（disabled 在任何环境允许，memory_sync 平凡收敛标 synced）
+      MEMORY_BACKEND: disabled
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
@@ -54,8 +60,9 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://personal:${POSTGRES_PASSWORD}@postgres:5432/personal_agent
-      # 同 api：独立进程不能用进程内记忆，生产固定 mem0
-      MEMORY_BACKEND: mem0
+      # 同 api：独立进程不能用进程内记忆（worker 拓扑校验拒绝 inmemory+PG），
+      # 过渡期显式 disabled，生产后端见 feat/mem0-backend
+      MEMORY_BACKEND: disabled
     command: python -m app.jobs.worker
     depends_on:
       postgres:
@@ -64,6 +71,9 @@ services:
         condition: service_completed_successfully
 
   postgres:
+    # pgvector 镜像同时是业务库：vector 扩展当前未使用，保留该镜像是为了
+    # 与 feat/mem0-backend 落地后的数据卷/镜像形态保持一致，避免合并时
+    # 二次迁移
     image: pgvector/pgvector:pg16
     restart: unless-stopped
     environment:

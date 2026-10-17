@@ -6,7 +6,7 @@ UPDATE → reminders 的条件 UPDATE），再 INSERT job 行（一律新行、
 memory_sync 用 ON CONFLICT DO NOTHING，绝不 UPDATE 既存 job 行），全部
 flush 落定之后最后 allocate_seq，再用第二条 UPDATE 写 change_seq。
 
-记忆（mem0 内部还会调 LLM/embedding）一律不在这里写删（INV-4）：
+记忆（后端内部还会调 LLM/embedding）一律不在这里写删（INV-4）：
 PATCH/DELETE 只在写事务内 enqueue memory_sync，由该 job 按 note 当前态
 幂等收敛（见 app/pipeline/memory_sync.py）。
 """
@@ -224,7 +224,7 @@ async def patch_note(
     # 旧的整理产物作废，重新入队 extract（带新 rev，执行侧据此丢弃过期
     # 任务）；同时入队 memory_sync 清旧记忆——即使 extract 永久失败，
     # 旧 rev 的记忆也会被清掉（修 C4），且这里不再提交后直删记忆
-    # （mem0 会调外部服务，也不能放进事务；入口唯一化见 INV-4）
+    # （记忆后端会调外部服务，也不能放进事务；入口唯一化见 INV-4）
     reminder_ids = await _invalidate_outputs(session, note.id)
     await enqueue(
         session,

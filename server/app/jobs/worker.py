@@ -17,13 +17,15 @@ def check_memory_backend_shareable(settings: Settings) -> None:
     """INV-10.4（threads5 P2-3）：worker 是独立进程，MEMORY_BACKEND=inmemory
     时它写的记忆对 api 进程的 /search 永远不可见——**无论放行标志**都拒绝
     inmemory+PostgreSQL（ALLOW_INMEMORY_IN_TESTS 只为单进程跑 PG 测试套件
-    的 pytest 放行，不是给独立 worker 的）。"""
+    的 pytest 放行，不是给独立 worker 的）。disabled（显式空后端，threads7
+    拆分）不受限；生产记忆后端由后续 PR（feat/mem0-backend）提供。"""
     if settings.database_url.startswith("postgresql") and settings.memory_backend == "inmemory":
         raise SystemExit(
             "worker 进程不允许 MEMORY_BACKEND=inmemory + PostgreSQL："
             "进程内记忆对 api 进程不可见（worker 写的记忆 /search 搜不到）。"
-            "请改用 mem0（先 pip install -r requirements-mem0.txt）；"
-            "单进程跑 PG 测试套件请直接跑 pytest，不要另起 worker。"
+            "生产记忆后端将由后续 PR（feat/mem0-backend）提供，过渡期可显式设 "
+            "MEMORY_BACKEND=disabled；单进程跑 PG 测试套件请直接跑 pytest，"
+            "不要另起 worker。"
         )
 
 

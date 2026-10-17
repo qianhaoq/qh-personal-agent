@@ -928,3 +928,19 @@ async def test_memory_sync_status_updates_do_not_touch_updated_at_or_change_seq(
     assert [n for n in page2.json()["notes"] if n["note_id"] == note_id] == [], (
         "updated_at 若被推进而 seq 不动，客户端永远观察不到那个新时间戳"
     )
+
+
+async def test_inmemory_list_page_cap_raises_when_full():
+    """INV-3（后端契约第 1 条）：InMemoryStore 的 list() 页上限取满即抛
+    MemoryEnumerationIncomplete（进程内字典本不截断，上限让"取不全即报错"
+    的契约可测；生产后端在 feat/mem0-backend 分支实现同一语义）。"""
+    capped = InMemoryStore(list_page_size=2)
+    for text, note in (("甲", "n1"), ("乙", "n1"), ("丙", "n2")):
+        await capped.add("usr_1", text, note_id=note)
+    with pytest.raises(MemoryEnumerationIncomplete):
+        await capped.list("usr_1")
+
+    # 上限高于存量：可证明取全，照常返回
+    roomy = InMemoryStore(list_page_size=5)
+    await roomy.add("usr_1", "甲", note_id="n1")
+    assert len(await roomy.list("usr_1")) == 1

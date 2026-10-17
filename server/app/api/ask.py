@@ -1,7 +1,7 @@
 """搜索与问答：GET /v1/search、POST /v1/ask。
 
 不依赖请求级数据库会话（P2）：鉴权在独立短会话完成（见 app.deps），
-这里只有记忆检索（mem0 内部还有 LLM/embedding）与 LLM 调用——若挂着
+这里只有记忆检索（后端内部还有 LLM/embedding）与 LLM 调用——若挂着
 打开的会话/事务，秒级外部调用期间会占住连接池，把并发请求饿死。
 """
 from typing import Annotated

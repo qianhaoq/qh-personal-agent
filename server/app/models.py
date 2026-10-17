@@ -187,4 +187,5 @@ class Job(Base):
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
-# 兼容占位：mem0 后端自身的表由 mem0 管理，不在这里定义。
+# 记忆后端自身的表（若需要）由后端实现管理（生产后端在 feat/mem0-backend
+# 分支），不在这里定义。

@@ -27,17 +27,6 @@ _HEX_DIGITS = frozenset(string.hexdigits)
 _URLSAFE_TO_STD = str.maketrans("-_", "+/")
 
 
-def _mem0ai_installed() -> bool:
-    """探测 mem0ai 是否可 import（INV-10.3）。find_spec 对损坏安装/命名空
-    包可能抛错，一律按未安装处理——启动报错好过运行期 ModuleNotFoundError。"""
-    import importlib.util
-
-    try:
-        return importlib.util.find_spec("mem0") is not None
-    except (ImportError, ValueError):  # pragma: no cover - 损坏安装路径
-        return False
-
-
 def _decode_secret(secret: str) -> bytes | None:
     """把 JWT_SECRET 解码成它编码的随机字节；不是合法编码返回 None。
 
@@ -90,17 +79,14 @@ class Settings(BaseSettings):
     # 跑 PG 测试套件的 CI/本地环境显式置 true 放行（生产环境不要设置）
     allow_mock_llm_in_prod: bool = False
 
-    # 记忆层：只接受这两个值，未知值启动即报错（而不是静默退化丢记忆）
-    memory_backend: Literal["inmemory", "mem0"] = "inmemory"
+    # 记忆层：只接受这两个值，未知值（含 mem0——生产后端已拆分至
+    # feat/mem0-backend 分支，见 docs/server-invariants.md INV-3/INV-10）
+    # 启动即报错（而不是静默退化丢记忆）
+    memory_backend: Literal["inmemory", "disabled"] = "inmemory"
     # 仅测试用：生产（postgresql）+ inmemory 默认拒绝启动，跑 PG 测试套件
     # 的 CI/本地环境显式置 true 放行（生产环境不要设置；独立 worker 进程
     # 无论该标志都拒绝，见 app.jobs.worker.check_memory_backend_shareable）
     allow_inmemory_in_tests: bool = False
-    # mem0 的 embedding 单独配置（可以和 LLM 不同源）
-    mem0_embedding_base_url: str = ""
-    mem0_embedding_model: str = ""
-    # 缺省回落 LLM_API_KEY（共用 OpenAI 兼容源时不用重复填）
-    mem0_embedding_api_key: str = ""
 
     # 流水线
     default_timezone: str = "Asia/Shanghai"
@@ -156,7 +142,8 @@ class Settings(BaseSettings):
         ——uvicorn 多 worker 与独立 worker 进程各持一份进程内状态，互相
         不可见且重启即失忆。启动即拒绝；仅在单进程跑 PG 测试套件的
         CI/本地环境可用 ALLOW_INMEMORY_IN_TESTS=true 显式放行（独立
-        worker 进程不放行，见 app.jobs.worker）。
+        worker 进程不放行，见 app.jobs.worker）。disabled（显式空后端）
+        在任何环境都允许；生产记忆后端由后续 PR（feat/mem0-backend）提供。
         """
         if (
             self.database_url.startswith("postgresql")
@@ -165,24 +152,11 @@ class Settings(BaseSettings):
         ):
             raise ValueError(
                 "生产环境（DATABASE_URL 以 postgresql 开头）不允许 "
-                "MEMORY_BACKEND=inmemory（多进程/重启即丢记忆）：请改为 "
-                "mem0（pgvector 与业务库同一个 PostgreSQL 实例）。"
-                "仅在单进程跑 PG 测试套件的 CI/本地环境可设 "
+                "MEMORY_BACKEND=inmemory：inmemory 不能跨 api/worker 进程共享，"
+                "多进程/重启即丢记忆。生产记忆后端将由后续 PR（feat/mem0-backend）"
+                "提供，过渡期可显式设 MEMORY_BACKEND=disabled（关闭记忆功能，"
+                "任何环境允许）。仅在单进程跑 PG 测试套件的 CI/本地环境可设 "
                 "ALLOW_INMEMORY_IN_TESTS=true 放行（独立 worker 进程无论该标志都拒绝）"
-            )
-        return self
-
-    @model_validator(mode="after")
-    def _require_memory_backend_installed(self) -> "Settings":
-        """INV-10.3（threads5 P2-3，任何环境）：MEMORY_BACKEND=mem0 时
-        mem0ai 必须已安装。记忆 store 是懒构造——不查的话 api 照常起，
-        首个 /search 才 500、memory_sync job 全部 ModuleNotFoundError，
-        本地按 README 装依赖（不含 mem0ai）的人要到第一次检索才发现。"""
-        if self.memory_backend == "mem0" and not _mem0ai_installed():
-            raise ValueError(
-                "MEMORY_BACKEND=mem0 但未安装 mem0ai：请执行 "
-                "pip install -r requirements-mem0.txt（Docker 镜像已装），"
-                "或本地单进程开发改用 MEMORY_BACKEND=inmemory"
             )
         return self
 
@@ -206,26 +180,6 @@ class Settings(BaseSettings):
         if missing:
             raise ValueError(
                 "LLM_PROVIDER=openai 必须同时设置 " + "、".join(missing) + "（缺任一项启动即失败，不会静默回落）"
-            )
-        return self
-
-    @model_validator(mode="after")
-    def _require_embedding_key_when_customized(self) -> "Settings":
-        """INV-10.5（threads6 P2，任何环境）：embedding 走自定义源
-        （MEM0_EMBEDDING_BASE_URL / MEM0_EMBEDDING_API_KEY 任一设置）时，
-        解析出的凭据（MEM0_EMBEDDING_API_KEY，缺省回落 LLM_API_KEY）必须
-        非空——mem0 的 openai embedder 拿空 key 不会启动报错，而是每次
-        add/search 都向 api.openai.com 发 401 请求，拖到运行期才暴露。
-        两项都不设置（完全共源）时由 _require_complete_openai_config
-        保证 LLM_API_KEY 的完备性。
-        """
-        if not (self.mem0_embedding_base_url or self.mem0_embedding_api_key):
-            return self
-        if not (self.mem0_embedding_api_key or self.llm_api_key):
-            raise ValueError(
-                "MEM0_EMBEDDING_BASE_URL/MEM0_EMBEDDING_API_KEY 已设置但缺少"
-                " embedding 凭据：请设置 MEM0_EMBEDDING_API_KEY，或与 LLM 共源"
-                "（不设置 MEM0_EMBEDDING_* 即回落 LLM_API_KEY）"
             )
         return self
 

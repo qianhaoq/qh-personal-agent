@@ -42,7 +42,7 @@ async def run_pending_jobs(
     1. 认领事务（status=running、attempts+1、写租约 locked_by/locked_at）
     2. 执行：事务划分由具体 job 实现负责——extract 内部是“短读事务 →
        事务外 LLM → 短写事务”，memory_sync 是“短读 → 事务外写记忆 →
-       复查/再入队”多个短事务，外部调用（LLM/mem0）从不在数据库事务里。
+       复查/再入队”多个短事务，外部调用（LLM/记忆后端）从不在数据库事务里。
        memory_sync 复查发现笔记状态已变时删掉本次新增的记忆并再入队
        （按 note 幂等收敛，见 app.pipeline.memory_sync）
     3. 收尾事务（带租约校验，见 finalize_claim）：成功标 done；失败则

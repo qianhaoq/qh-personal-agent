@@ -8,7 +8,7 @@ MemoryStore.add / delete / delete_by_note 调用方。
 
 1. **读**：短读事务读 note 的 (deleted_at, rev, text, status, user_id)，
    随即提交，不持锁、不占序列。
-2. **写外部**（事务外，无任何 DB 会话——mem0 内部还有 LLM/embedding）：
+2. **写外部**（事务外，无任何 DB 会话——记忆后端内部还有 LLM/embedding）：
    已删除 → 只 delete_by_note；未删除且 organized → delete_by_note 后
    add(text, metadata={note_id, source_rev=rev})，记录本次 add 返回的全部
    memory id；未删除且未 organized（uploaded/failed）→ 只 delete_by_note、
@@ -65,7 +65,7 @@ async def sync_note_memory(
 
     job_id/worker_id/locked_at 是认领快照里的租约凭证（threads5 P2-1）：
     复查时除 (rev, deleted_at) 外还必须确认自己仍持有租约——外部写
-    （mem0 的 LLM/embedding）超过锁超时后任务会被回收换主，仅比
+    （记忆后端的 LLM/embedding）超过锁超时后任务会被回收换主，仅比
     (rev, deleted_at) 挡不住「复活慢 worker 的迟到写入」。不带租约信息
     的调用（测试/未来账户级路径）按无栅栏处理。"""
     maker = get_sessionmaker()

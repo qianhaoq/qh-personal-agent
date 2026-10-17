@@ -13,7 +13,7 @@ Caddy (TLS) ──> FastAPI api ──> PostgreSQL 16 + pgvector
                     └── LLMClient ──> 整理 worker（python -m app.jobs.worker）
                                           │
                                           ├── LLM（OpenAI 兼容 / MockLLM）
-                                          └── MemoryStore（mem0 / inmemory）
+                                          └── MemoryStore（inmemory / disabled）
 ```
 
 代码结构：
@@ -31,7 +31,8 @@ app/
                  事务划分：短读快照 → 事务外 LLM → 短写（锁行复查、seq 末尾分配）
                  → 提交后写记忆（失败由 job 幂等补写），持锁期间不调外部服务
   llm/           OpenAI 兼容客户端 + MockLLM（确定性规则，含中文时间解析）
-  memory/        MemoryStore 抽象；inmemory（测试）、mem0（生产，可选安装）
+  memory/        MemoryStore 抽象；inmemory（测试/单进程）、disabled（显式空后端）
+                 生产记忆后端（mem0 + pgvector）在 feat/mem0-backend 分支（后续 PR）
   cli.py         python -m app.cli create-invite
 ```
 
@@ -52,11 +53,13 @@ cp .env.example .env          # 默认即 mock + sqlite + inmemory，可直接�
 .venv/bin/python -m app.jobs.worker                  # 整理 worker（另开一个终端）
 ```
 
-本地默认的记忆后端是 `inmemory`（不装 mem0ai 也能跑），但它**只属于单进程**：
+本地默认的记忆后端是 `inmemory`（不装额外依赖也能跑），但它**只属于单进程**：
 api 与 worker 是两个进程、各持一份内存，worker 写的记忆在 api 的 `/v1/search`
-里搜不到。完整链路请用下面的 compose + `MEMORY_BACKEND=mem0`，先
-`pip install -r requirements-mem0.txt`——配了 mem0 而未安装时启动即报错，
-不会等到第一次检索才失败。
+里搜不到。生产记忆后端（mem0 + pgvector）由后续 PR（feat/mem0-backend 分支）
+提供；在那之前的分进程部署请显式设 `MEMORY_BACKEND=disabled` 关闭记忆功能
+（compose 已如此配置）——检索/问答返回空结果，`memory_sync` 仍会把
+`memory_status` 标为 synced（空后端下「记忆 == f(note)」平凡成立），任何
+环境都允许。
 
 ### 生产（Docker Compose：caddy + api + worker + postgres）
 
@@ -80,8 +83,7 @@ docker compose exec api python -m app.cli create-invite
 | `JWT_SECRET` | HS256 签名密钥：>=32 字节随机值的编码。生成任选其一：`python -c "import secrets;print(secrets.token_urlsafe(48))"`、`openssl rand -hex 32`。生产（postgresql）启动时校验：hex 需 >=64 字符，或 base64/base64url（允许无 padding）解码 >=32 字节且解码后 >=16 种字节取值；占位值与人类可读口令（含 secret/password 字样、无法解码的字符串）会被拒绝 |
 | `LLM_PROVIDER` | `mock`（默认，确定性规则）或 `openai`（OpenAI 兼容接口）。只接受这两个值，拼错启动即报错；生产（postgresql）配 `mock` 或 `openai` 缺 `LLM_API_KEY` 都拒绝启动（不静默回落 MockLLM），跑 PG 测试套件可设 `ALLOW_MOCK_LLM_IN_PROD=true` 放行 |
 | `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | DeepSeek 示例 `https://api.deepseek.com`；腾讯混元 OpenAI 兼容地址示例见 `.env.example`。**地址与型号需按官网核实** |
-| `MEMORY_BACKEND` | `inmemory`（默认，仅单进程开发/测试）或 `mem0`（生产）。只接受这两个值，未知值启动即报错；配置 `mem0` 但未安装 mem0ai 时启动即报错并提示 `pip install -r requirements-mem0.txt`（不静默退化，也不会等到第一次 `/search` 才 500）。生产（postgresql）配置 `inmemory` 会拒绝启动（多 worker/独立 worker 进程各一份内存、重启即丢）；仅单进程跑 PG 测试套件的 CI/本地可设 `ALLOW_INMEMORY_IN_TESTS=true` 放行——**独立 worker 进程无论该标志都拒绝 inmemory+PG**（它写的记忆对 api 进程不可见） |
-| `MEM0_EMBEDDING_BASE_URL` / `MEM0_EMBEDDING_API_KEY` / `MEM0_EMBEDDING_MODEL` | mem0 的 embedding 可与 LLM 不同源：三项分别缺省回落 `LLM_BASE_URL` / `LLM_API_KEY` / `text-embedding-3-small`（共源时不必重复填）。设置了 `BASE_URL`/`API_KEY` 却解析不出任何凭据（两项 key 都空）时启动即报错（INV-10.5），而不是运行期拿空 key 向 embedding 源 401 |
+| `MEMORY_BACKEND` | `inmemory`（默认，仅单进程开发/测试）或 `disabled`（显式关闭记忆功能）。只接受这两个值，未知值（含 `mem0`——生产后端在 feat/mem0-backend 分支，后续 PR 回到枚举）启动即报错，不静默退化。`disabled` 下检索/问答返回空结果、memory_sync 平凡收敛标 synced，任何环境（含生产/worker）允许。生产（postgresql）配置 `inmemory` 会拒绝启动（多 worker/独立 worker 进程各一份内存、重启即丢；错误信息会指出 feat/mem0-backend 与 disabled 两条出路）；仅单进程跑 PG 测试套件的 CI/本地可设 `ALLOW_INMEMORY_IN_TESTS=true` 放行——**独立 worker 进程无论该标志都拒绝 inmemory+PG**（它写的记忆对 api 进程不可见） |
 | `ENABLE_DOCS` | 默认 `false`：`/docs`、`/redoc`、`/openapi.json` 不暴露；本地开发设 `true` |
 | `LOG_LEVEL` | 默认 `info`（worker 进程的 basicConfig） |
 | `CORS_ALLOW_ORIGINS` | 逗号分隔来源；默认空 = 不启用 CORS（原生 App 无需浏览器跨域），需要浏览器前端时才配 |
@@ -100,7 +102,7 @@ docker compose exec api python -m app.cli create-invite
 本机没有 Docker，因此测试跑在 `sqlite+aiosqlite` 上，没有起真实 PostgreSQL 容器。由此带来的**未覆盖差异**：
 
 - **默认只跑 SQLite 分支，PG 分支需显式指定数据库**。设置 `TEST_DATABASE_URL=postgresql+asyncpg://...` 后同一套测试在真实 PG 上再跑一遍，覆盖 PG 专属路径（`app/jobs/queue.py` 的 `FOR UPDATE SKIP LOCKED` 领取/回收、`app/api/sync.py` 的 REPEATABLE READ 一致快照与序列行锁提交顺序，见 `tests/test_sync.py` 里仅 PG 运行的测试）。日常开发不装 PG 时，这些 PG 分支只有代码审查。
-- **pgvector / mem0 后端已连真实库验证（threads6 起，部分）**。`tests/test_mem0_integration.py` 在真实 mem0ai 2.2.1 + pgvector + 确定性本地 embedder（crc32 token 哈希，无外部 API）上验证了：构造配置可被 mem0 接受（llm/embedder 配置键 `openai_base_url`、psycopg 驱动）、user/note 过滤下推不串数据、小页上限下「边取边删」穷尽循环。该文件需要独立 venv（`requirements.txt + requirements-mem0.txt`，mem0ai 与 psycopg 都不在常规测试依赖里）与 `TEST_DATABASE_URL` 指向装了 vector 扩展的 PostgreSQL，常规环境按原因跳过。**仍未验证**：mem0 infer 抽取主路径（内部会调真实 LLM，测试用 `infer=False` 绕过）与真实 embedding 供应商选型（待决策项，见 tech-arch 第 13 节）；fake client 行为对齐测试仍在 `tests/test_mem0_store.py`。
+- **mem0 生产后端整体在 feat/mem0-backend 分支开发**（threads7 拆分）。该分支含真实 mem0ai 2.2.1 + pgvector 的适配层（`mem0_store.py`）、fake client 行为对齐测试与真实库集成测试（threads6 已连真实库验证过构造配置、user/note 过滤下推与穷尽删除循环）。本仓保留 MemoryStore 接口、inmemory/disabled 实现与 INV-3 后端契约（枚举完整、不越权改动其他 note、add 不做 infer 类改写/合并），feat/mem0-backend 按同一契约验收。
 - SQLite 方言存 datetime 不保留时区偏移（值统一为 UTC 墙钟），`app/timeutil.py` 做了归一，但 PG 下 timestamptz 的行为仍建议上线前冒烟一遍。
 
 ## 已知限制（S1 骨架范围内）
@@ -109,7 +111,7 @@ docker compose exec api python -m app.cli create-invite
 - **没有限流**：tech-arch 第 6 节的 `/ask` 20 次/分钟、`/notes` 60 次/分钟、登录按 IP 限流尚未实现。
 - **笔记原文未加密**：tech-arch 的 `text_enc`（AES-GCM 应用层加密）未做，当前明文存储。
 - **删除笔记后重放同一 `client_note_id`**：返回已软删笔记的 id 与状态（幂等语义优先），不会新建。
-- **mem0 的 ADD/UPDATE/DELETE 判定**、检索打分（时间衰减、类型权重）未实现，S1 只做写入与检索。
+- **生产记忆后端未合入本分支**（feat/mem0-backend 开发中）：本仓 `MEMORY_BACKEND` 只有 inmemory/disabled；mem0 的 ADD/UPDATE/DELETE 判定、检索打分（时间衰减、类型权重）随该分支落地。
 - **spec 第 5 节的 reminders/memories/profile/me 等端点**未包含在本任务范围内，S1 骨架只实现列出的接口。
 - **`json_schema` 响应格式**：OpenAI 兼容客户端发送 `response_format=json_schema`，个别供应商可能只支持 `json_object`，需要按所选供应商调整（`app/llm/openai_compat.py`）。
 

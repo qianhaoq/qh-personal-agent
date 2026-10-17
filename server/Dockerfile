@@ -3,10 +3,10 @@ FROM python:3.12-slim
 WORKDIR /srv/app
 
 # 运行时镜像只装生产依赖（requirements-app.txt）：不装 pytest 等测试工具。
-# 生产镜像默认 MEMORY_BACKEND=mem0，mem0ai 必须随镜像安装，
-# 否则启动直接报 ImportError（不会静默退化为 inmemory）
-COPY requirements-app.txt requirements-mem0.txt ./
-RUN pip install --no-cache-dir -r requirements-app.txt -r requirements-mem0.txt
+# 记忆后端：生产实现（mem0 + pgvector）已拆分至 feat/mem0-backend 分支，
+# 随该分支回到镜像依赖；过渡期 compose 显式设 MEMORY_BACKEND=disabled
+COPY requirements-app.txt ./
+RUN pip install --no-cache-dir -r requirements-app.txt
 
 COPY app ./app
 

@@ -1,5 +1,6 @@
 """jwt_secret 与记忆后端的生产校验：postgresql 下 secret 必须是 >=32
-字节随机值的编码、MEMORY_BACKEND 不能是 inmemory，SQLite 不受影响。"""
+字节随机值的编码、MEMORY_BACKEND 不能是 inmemory（只能是 disabled），
+SQLite 不受影响。"""
 import base64
 import pathlib
 import secrets
@@ -14,22 +15,16 @@ PG_URL = "postgresql+asyncpg://u:p@localhost/db"
 GOOD_HEX = bytes(range(32)).hex()
 
 
-@pytest.fixture(autouse=True)
-def _assume_mem0ai_installed(monkeypatch):
-    """本机测试环境不装 mem0ai：INV-10.3 的安装探测统一按已安装放行，
-    「未安装」路径由专门用例单独改写探测结果模拟。"""
-    monkeypatch.setattr("app.config._mem0ai_installed", lambda: True)
-
-
 def _pg_settings(**kwargs) -> Settings:
-    """生产形态（postgresql）的合法基线：强 secret + mem0 记忆后端 + 合法 LLM。
+    """生产形态（postgresql）的合法基线：强 secret + disabled 记忆后端 +
+    合法 LLM。
 
     不带 memory_backend 的话会先撞上“生产拒绝 inmemory”的校验（PG 跑
     测试时 conftest 还设置了 ALLOW_INMEMORY_IN_TESTS，行为随运行方式
     漂移），LLM 同理（ALLOW_MOCK_LLM_IN_PROD），显式固定住。
     """
     kwargs.setdefault("jwt_secret", GOOD_HEX)
-    kwargs.setdefault("memory_backend", "mem0")
+    kwargs.setdefault("memory_backend", "disabled")
     kwargs.setdefault("allow_mock_llm_in_prod", True)
     return Settings(database_url=PG_URL, **kwargs)
 
@@ -133,11 +128,16 @@ def test_sqlite_default_secret_ok():
 
 
 def test_memory_backend_only_accepts_known_values():
-    """P2：MEMORY_BACKEND 只接受 inmemory|mem0，未知值启动即校验失败。"""
+    """P2：MEMORY_BACKEND 只接受 inmemory|disabled，未知值（含已拆分的
+    mem0——生产后端在 feat/mem0-backend 分支）启动即校验失败。"""
     assert Settings(memory_backend="inmemory").memory_backend == "inmemory"
-    assert Settings(memory_backend="mem0").memory_backend == "mem0"
+    assert Settings(memory_backend="disabled").memory_backend == "disabled"
     with pytest.raises(ValidationError, match="memory_backend"):
         Settings(memory_backend="redis")
+    # threads7 拆分：mem0 已随生产后端移出本仓，配置它必须报错而不是
+    # 静默当别的后端跑
+    with pytest.raises(ValidationError, match="memory_backend"):
+        Settings(memory_backend="mem0")
 
 
 def test_production_inmemory_memory_backend_rejected():
@@ -150,6 +150,14 @@ def test_production_inmemory_memory_backend_rejected():
         _pg_settings(memory_backend="inmemory", allow_inmemory_in_tests=False)
 
 
+def test_production_inmemory_rejection_mentions_mem0_backend_pr():
+    """threads7 拆分：拒绝信息必须指出两条出路——生产后端在
+    feat/mem0-backend，过渡期可显式 disabled（部署者按错误信息即可
+    恢复部署，而不是对着报错猜）。"""
+    with pytest.raises(ValidationError, match=r"feat/mem0-backend.*MEMORY_BACKEND=disabled"):
+        _pg_settings(memory_backend="inmemory", allow_inmemory_in_tests=False)
+
+
 def test_production_inmemory_with_explicit_test_flag_allowed():
     """ALLOW_INMEMORY_IN_TESTS=true 只为单进程跑 PG 测试套件放行（生产
     不要设；独立 worker 进程无论该标志都拒绝）。"""
@@ -157,8 +165,11 @@ def test_production_inmemory_with_explicit_test_flag_allowed():
     assert settings.memory_backend == "inmemory"
 
 
-def test_production_mem0_memory_backend_ok():
-    assert _pg_settings(memory_backend="mem0").memory_backend == "mem0"
+def test_production_disabled_memory_backend_ok():
+    """threads7：disabled（显式空后端）在任何环境都允许——不需要放行
+    标志（它是显式选择，不是要挡的危险配置）。"""
+    settings = _pg_settings(memory_backend="disabled")
+    assert settings.memory_backend == "disabled"
 
 
 def test_sqlite_inmemory_memory_backend_ok():
@@ -167,43 +178,28 @@ def test_sqlite_inmemory_memory_backend_ok():
     assert settings.memory_backend == "inmemory"
 
 
-def test_env_example_local_default_inmemory_documents_mem0():
-    """threads5 P2-3：模板本地默认 inmemory（本地安装步骤不装 mem0ai，
-    默认 mem0 会让照抄模板的人启动即报错）；mem0 行以注释给出并写明
-    安装命令与单进程局限。"""
+def test_env_example_documents_memory_backend_choices():
+    """threads7 拆分后：模板本地默认 inmemory（单进程局限写明）；
+    disabled 以注释行给出；生产后端去向（feat/mem0-backend）与 disabled
+    的过渡期语义写明；不再出现 MEM0_* 配置项（已随后端移出）。"""
     env_example = (
         pathlib.Path(__file__).resolve().parent.parent / ".env.example"
     ).read_text(encoding="utf-8")
     lines = [ln.strip() for ln in env_example.splitlines()]
     assert "MEMORY_BACKEND=inmemory" in lines
-    assert "# MEMORY_BACKEND=mem0" in lines
-    # 安装命令与单进程局限必须写明（读者据此知道何时切换 mem0）
-    assert any("pip install -r requirements-mem0.txt" in ln for ln in lines)
+    assert "# MEMORY_BACKEND=disabled" in lines
+    # 单进程局限与生产后端去向必须写明
     assert any("单进程" in ln for ln in lines)
-    # mem0 的 embedding/LLM OpenAI 兼容配置有占位说明
-    assert any(ln.startswith("# MEM0_EMBEDDING_BASE_URL=") for ln in lines)
-    assert any(ln.startswith("# MEM0_EMBEDDING_MODEL=") for ln in lines)
-    # threads6 P2 / INV-10.5：独立 embedding 凭据有说明（含回落语义）
-    assert any(ln.startswith("# MEM0_EMBEDDING_API_KEY=") for ln in lines)
-    assert any("回落 LLM_API_KEY" in ln for ln in lines)
-
-
-def test_mem0_backend_missing_mem0ai_rejected_at_startup(monkeypatch):
-    """threads5 P2-3 / INV-10.3：MEMORY_BACKEND=mem0 而未装 mem0ai——启动
-    即报错且错误信息带安装命令（记忆 store 懒构造，不查的话要等第一次
-    /search 才 500）。任何环境生效。"""
-    monkeypatch.setattr("app.config._mem0ai_installed", lambda: False)
-    with pytest.raises(ValidationError, match="requirements-mem0.txt"):
-        _pg_settings(memory_backend="mem0")
-    # SQLite 本地开发同样生效（不是只挡生产）
-    with pytest.raises(ValidationError, match="requirements-mem0.txt"):
-        Settings(database_url="sqlite+aiosqlite:///./app.sqlite3", memory_backend="mem0")
+    assert any("feat/mem0-backend" in ln for ln in lines)
+    # MEM0_* 配置已随生产后端移出本仓
+    assert not [ln for ln in lines if ln.startswith("MEM0_")], "MEM0_* 已拆分至 feat/mem0-backend"
+    assert not [ln for ln in lines if "requirements-mem0.txt" in ln]
 
 
 def test_worker_refuses_inmemory_with_postgres():
     """threads5 P2-3 / INV-10.4：独立 worker 进程无论放行标志都拒绝
     inmemory+PG——它写的记忆对 api 进程的 /search 不可见；SQLite 本地
-    开发不受限。"""
+    开发与 disabled（显式空后端，threads7）不受限。"""
     from app.jobs.worker import check_memory_backend_shareable
 
     flagged = Settings(
@@ -219,8 +215,8 @@ def test_worker_refuses_inmemory_with_postgres():
     sqlite = Settings(database_url="sqlite+aiosqlite:///./app.sqlite3", memory_backend="inmemory")
     check_memory_backend_shareable(sqlite)  # SQLite 本地开发：不抛
 
-    mem0 = _pg_settings(memory_backend="mem0")
-    check_memory_backend_shareable(mem0)  # PG + mem0：正常
+    disabled = _pg_settings(memory_backend="disabled")
+    check_memory_backend_shareable(disabled)  # PG + disabled（显式空后端）：不抛
 
 
 def test_get_memory_store_unknown_backend_raises(monkeypatch):
@@ -406,31 +402,3 @@ def test_env_example_documents_new_runtime_flags():
     assert "LOG_LEVEL=info" in lines
     assert any(ln.startswith("# CORS_ALLOW_ORIGINS=") for ln in lines)
 
-
-def test_mem0_embedding_custom_config_without_key_rejected():
-    """threads6 P2 / INV-10.5：自定义 embedding 源（MEM0_EMBEDDING_BASE_URL /
-    MEM0_EMBEDDING_API_KEY 任一设置）而解析不出凭据（两项 key 都空）——
-    启动即 ValidationError（任何环境），而不是运行期拿空 key 向 embedding
-    源 401。完全共源（都不设置）不受影响。"""
-    # 自定义 base_url，但既没有 embedding key 也没有 LLM key 可回落
-    with pytest.raises(ValidationError, match="MEM0_EMBEDDING"):
-        _pg_settings(
-            mem0_embedding_base_url="https://embed.example.com/v1",
-        )
-    # 只设置 embedding key 本身就是凭据：通过
-    assert (
-        _pg_settings(mem0_embedding_api_key="sk-embed").mem0_embedding_api_key == "sk-embed"
-    )
-    # 自定义 base_url + LLM key 回落：通过（回落链在 mem0_store 侧生效）
-    assert _pg_settings(
-        llm_api_key="sk-llm", mem0_embedding_base_url="https://embed.example.com/v1"
-    ).mem0_embedding_base_url.startswith("https://")
-    # 完全共源（什么都不设置）：校验不介入，LLM key 完备性归 LLM 校验管
-    assert _pg_settings().mem0_embedding_api_key == ""
-    # SQLite 本地开发同样生效（不是只挡生产）
-    with pytest.raises(ValidationError, match="MEM0_EMBEDDING"):
-        Settings(
-            database_url="sqlite+aiosqlite:///./app.sqlite3",
-            mem0_embedding_base_url="https://embed.example.com/v1",
-            llm_api_key="",
-        )
