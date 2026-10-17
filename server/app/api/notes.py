@@ -145,6 +145,9 @@ async def patch_note(
             text=body.text,
             rev=Note.rev + 1,
             status="uploaded",
+            # 旧记忆已随下方 _invalidate_outputs 作废；新整理提交后
+            # organize 会重新写入并把标记置回 True
+            memory_synced=False,
             change_seq=await allocate_seq(session),
             updated_at=utcnow(),
         )

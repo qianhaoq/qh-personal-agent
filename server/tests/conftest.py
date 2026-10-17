@@ -10,6 +10,7 @@
 """
 import os
 import pathlib
+import secrets
 
 # 必须在导入 app 之前设置环境
 _DB_FILE = pathlib.Path(__file__).parent / "_test.sqlite3"
@@ -19,8 +20,9 @@ if _TEST_DB_URL:
     os.environ["DATABASE_URL"] = _TEST_DB_URL
 else:
     os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{_DB_FILE}"
-# 明显的占位符（非真实密钥），长度 ≥32 字节以满足 HS256 建议
-os.environ["JWT_SECRET"] = "test-only-not-a-secret-0123456789abcdef"
+# 随机生成的合法密钥形态（64 位 hex = 32 字节）：PG 测试运行（生产形态
+# 校验）下也能通过；同时不含 secret/password 等被拒字样
+os.environ["JWT_SECRET"] = secrets.token_hex(32)
 os.environ["LLM_PROVIDER"] = "mock"
 os.environ["MEMORY_BACKEND"] = "inmemory"
 
@@ -67,8 +69,6 @@ async def client():
 
 
 async def make_invite(session_maker, uses: int = 5) -> str:
-    import secrets
-
     code = secrets.token_hex(8)
     async with session_maker() as session:
         session.add(InviteCode(code=code, max_uses=uses))

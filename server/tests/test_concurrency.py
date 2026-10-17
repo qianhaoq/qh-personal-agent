@@ -103,3 +103,165 @@ async def test_concurrent_first_allocate_seq_no_unique_violation():
     # A 提交后：B 跳过冲突的 INSERT，走 UPDATE 拿到下一个值（不报错）
     seq_b = await asyncio.wait_for(task, timeout=5)
     assert seq_b == 1
+
+
+# ---------------------------------------------------------------------------
+# P2：organize 持锁期间不调外部服务（LLM / mem0 记忆写入）
+#
+# 旧实现把 LLM 调用关在 SELECT ... FOR UPDATE 事务里、把 store.add 关在
+# allocate_seq 之后的大事务里：整理中的笔记 PATCH 要等 LLM 结束，全局
+# sequences 行锁从分配持有到（含 mem0 内部 LLM/embedding 的）提交，所有
+# 用户的写入都被串行阻塞。现在 LLM 与记忆写入都在事务之外，两个库都跑
+# 这些测试：PG 验证真实行锁语义，SQLite 单写者下若仍持有事务写锁（旧
+# 实现），这里的并发请求同样会因 database is locked 超时。
+# ---------------------------------------------------------------------------
+
+
+def _slow_llm(monkeypatch, entered: asyncio.Event, release: asyncio.Event) -> dict:
+    """LLM 第一次调用阻塞在 release 上；返回调用计数器。"""
+    import json
+
+    calls = {"llm": 0}
+
+    class SlowLLM:
+        async def chat(self, messages, response_format=None):
+            calls["llm"] += 1
+            if calls["llm"] == 1:
+                entered.set()
+                await release.wait()
+            return json.dumps(
+                {"title": "整理结果", "tags": [], "todos": [], "suggested_reminders": []},
+                ensure_ascii=False,
+            )
+
+    async def fake_get_llm():
+        return SlowLLM()
+
+    monkeypatch.setattr("app.pipeline.organize.get_llm_client", fake_get_llm)
+    return calls
+
+
+async def test_patch_during_llm_not_blocked_and_stale_result_discarded(
+    client, user, monkeypatch
+):
+    """LLM 调用期间可以对同一笔记完成 PATCH（不被行锁阻塞）；
+    之后旧任务的结果被丢弃，PATCH 重新入队的任务用新文本正常整理。"""
+    from app.db import get_sessionmaker
+    from app.models import Note
+    from app.pipeline.runner import run_pending_jobs
+
+    # SQLite 测试库文件跨测试复用（靠随机 ID 隔离），同文件里先前测试可能
+    # 留下未执行的 pending job：先排空，保证之后进入 LLM 的是本测试的任务
+    await run_pending_jobs()
+
+    headers = auth_headers(user)
+    r = await client.post(
+        "/v1/notes",
+        json={"client_note_id": str(uuid.uuid4()), "text": "第一版内容"},
+        headers=headers,
+    )
+    note_id = r.json()["note_id"]
+
+    in_llm, release = asyncio.Event(), asyncio.Event()
+    calls = _slow_llm(monkeypatch, in_llm, release)
+
+    worker = asyncio.create_task(run_pending_jobs())
+    await asyncio.wait_for(in_llm.wait(), timeout=5)  # 旧任务已进入 LLM 调用
+
+    patched = await asyncio.wait_for(
+        client.patch(
+            f"/v1/notes/{note_id}", json={"text": "第二版内容", "rev": 1}, headers=headers
+        ),
+        timeout=3,
+    )
+    assert patched.status_code == 200, patched.text
+
+    release.set()
+    await asyncio.wait_for(worker, timeout=10)
+
+    assert calls["llm"] == 2  # 旧任务确实在 LLM 里等待过，新任务又调了一次
+    async with get_sessionmaker()() as session:
+        note = await session.get(Note, note_id)
+    assert note.text == "第二版内容"
+    assert note.status == "organized"
+    assert note.llm_calls == 1  # 旧结果在写事务复查 rev 时被丢弃，未落库
+
+
+async def test_other_user_writes_during_llm_and_memory_sync(client, user, monkeypatch):
+    """整理任务在 LLM 调用与提交后记忆写入两个阶段都不持有
+    sequences 行锁：别的用户创建笔记（要分配全局 seq）不被阻塞。"""
+    from app.db import get_sessionmaker
+    from app.memory.inmemory import InMemoryStore
+    from app.models import Note
+    from app.pipeline.runner import run_pending_jobs
+    from tests.conftest import make_invite
+
+    # 同上：先排空先前测试留下的 pending job
+    await run_pending_jobs()
+
+    headers = auth_headers(user)
+    r = await client.post(
+        "/v1/notes",
+        json={"client_note_id": str(uuid.uuid4()), "text": "user1 的笔记"},
+        headers=headers,
+    )
+    user1_note_id = r.json()["note_id"]
+
+    in_llm, release_llm = asyncio.Event(), asyncio.Event()
+    in_memory, release_memory = asyncio.Event(), asyncio.Event()
+    _slow_llm(monkeypatch, in_llm, release_llm)
+
+    class SlowStore(InMemoryStore):
+        """第一次 add（整理提交后的记忆写入）阻塞在 release 上。"""
+
+        def __init__(self):
+            super().__init__()
+            self.add_calls = 0
+
+        async def add(self, user_id, text, note_id=None):
+            self.add_calls += 1
+            if self.add_calls == 1:
+                in_memory.set()
+                await release_memory.wait()
+            return await super().add(user_id, text, note_id=note_id)
+
+    store = SlowStore()
+    monkeypatch.setattr("app.pipeline.organize.get_memory_store", lambda: store)
+
+    # 另一个用户（创建笔记要分配全局 seq）
+    code = await make_invite(get_sessionmaker())
+    login = await client.post(
+        "/v1/auth/login", json={"invite_code": code, "device_id": "dev_conc_seq_other"}
+    )
+    other_headers = {"authorization": f"Bearer {login.json()['access_token']}"}
+
+    async def other_user_creates() -> str:
+        resp = await client.post(
+            "/v1/notes",
+            json={"client_note_id": str(uuid.uuid4()), "text": "另一个用户的笔记"},
+            headers=other_headers,
+        )
+        assert resp.status_code == 202, resp.text
+        return resp.json()["note_id"]
+
+    worker = asyncio.create_task(run_pending_jobs())
+    await asyncio.wait_for(in_llm.wait(), timeout=5)
+    # LLM 调用期间：seq 行未被持有
+    other_note_1 = await asyncio.wait_for(other_user_creates(), timeout=3)
+
+    release_llm.set()
+    await asyncio.wait_for(in_memory.wait(), timeout=5)
+    # 整理已提交、记忆写入（mem0 内部还有 LLM/embedding 调用）期间同样不持锁
+    other_note_2 = await asyncio.wait_for(other_user_creates(), timeout=3)
+
+    release_memory.set()
+    await asyncio.wait_for(worker, timeout=10)
+
+    # 两个用户的笔记最终都整理完成、记忆写入
+    async with get_sessionmaker()() as session:
+        for note_id in (user1_note_id, other_note_1, other_note_2):
+            note = await session.get(Note, note_id)
+            assert note.status == "organized", note_id
+            assert note.memory_synced is True, note_id
+    items = [m for m in await store.list(user["user_id"]) if m.note_id == user1_note_id]
+    assert len(items) == 1

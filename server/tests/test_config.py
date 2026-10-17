@@ -1,4 +1,6 @@
-"""jwt_secret 生产校验：postgresql 下占位/弱值即拒绝，SQLite 不受影响。"""
+"""jwt_secret 生产校验：postgresql 下必须是 >=32 字节随机值的编码，
+占位值/人类可读口令/低熵值即拒绝，SQLite 不受影响。"""
+import base64
 import pathlib
 import secrets
 
@@ -8,8 +10,8 @@ from pydantic import ValidationError
 from app.config import DEFAULT_JWT_SECRET, ENV_EXAMPLE_JWT_PLACEHOLDER, Settings
 
 PG_URL = "postgresql+asyncpg://u:p@localhost/db"
-# 长度与不同字符数都达标，且不含占位字样
-GOOD_SECRET = "0123456789abcdefghijklmnopqrstuvwxyzAB"
+# 合法的固定 hex 形态：64 个 hex 字符 = 32 字节、32 种字节取值
+GOOD_HEX = bytes(range(32)).hex()
 
 
 def test_production_default_secret_rejected():
@@ -39,6 +41,20 @@ def test_production_insecure_substring_rejected():
             Settings(database_url=PG_URL, jwt_secret=bad)
 
 
+def test_production_human_readable_passwords_rejected():
+    """人类可读口令必须被拒，即使长度/字符多样性看起来足够。
+
+    第一条能按 base64url 解出 32 字节（结构检查会放行），靠口令字样拦下；
+    第二条含 base64 字符集之外的 '!'，解码直接失败。
+    """
+    for bad in (
+        "my-super-secret-jwt-key-for-production-2026",
+        "Change_Me_To_A_Long_Random_Secret_123!",
+    ):
+        with pytest.raises(ValidationError, match="JWT_SECRET"):
+            Settings(database_url=PG_URL, jwt_secret=bad)
+
+
 def test_production_short_secret_rejected():
     with pytest.raises(ValidationError, match="JWT_SECRET"):
         Settings(database_url=PG_URL, jwt_secret="short")
@@ -55,8 +71,38 @@ def test_production_token_urlsafe_secret_ok():
     assert Settings(database_url=PG_URL, jwt_secret=secret).jwt_secret == secret
 
 
-def test_production_fixed_strong_secret_ok():
-    assert Settings(database_url=PG_URL, jwt_secret=GOOD_SECRET).jwt_secret == GOOD_SECRET
+def test_production_token_hex_secret_ok():
+    # openssl rand -hex 32 / secrets.token_hex(32) 的形态
+    secret = secrets.token_hex(32)
+    assert Settings(database_url=PG_URL, jwt_secret=secret).jwt_secret == secret
+
+
+def test_production_std_base64_secret_ok():
+    # openssl rand -base64 32 的形态（带 padding 的标准 base64）
+    secret = base64.b64encode(secrets.token_bytes(32)).decode()
+    assert Settings(database_url=PG_URL, jwt_secret=secret).jwt_secret == secret
+
+
+def test_production_fixed_strong_hex_ok():
+    assert Settings(database_url=PG_URL, jwt_secret=GOOD_HEX).jwt_secret == GOOD_HEX
+
+
+def test_production_all_zero_hex_secret_rejected():
+    # "00"*32 是 64 个 hex 字符（32 字节），但只有 1 种字节取值
+    with pytest.raises(ValidationError, match="JWT_SECRET"):
+        Settings(database_url=PG_URL, jwt_secret="00" * 32)
+
+
+def test_production_31_byte_hex_secret_rejected():
+    # 62 个 hex 字符：既不满 hex 的 64 字符要求，也不允许被当成 base64 放行
+    with pytest.raises(ValidationError, match="JWT_SECRET"):
+        Settings(database_url=PG_URL, jwt_secret=secrets.token_hex(31))
+
+
+def test_production_undecodable_secret_rejected():
+    # 不属于 hex / base64 / base64url 任何一种编码
+    with pytest.raises(ValidationError, match="JWT_SECRET"):
+        Settings(database_url=PG_URL, jwt_secret="this is not an encoding!?" * 2)
 
 
 def test_sqlite_default_secret_ok():

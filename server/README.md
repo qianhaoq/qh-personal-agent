@@ -28,6 +28,8 @@ app/
   api/           auth、notes、sync、search/ask 路由
   jobs/          数据库任务队列（PG: FOR UPDATE SKIP LOCKED；SQLite: 条件 UPDATE 抢占）
   pipeline/      自动整理（一次 LLM 结构化抽取）+ run_pending_jobs 测试入口
+                 事务划分：短读快照 → 事务外 LLM → 短写（锁行复查、seq 末尾分配）
+                 → 提交后写记忆（失败由 job 幂等补写），持锁期间不调外部服务
   llm/           OpenAI 兼容客户端 + MockLLM（确定性规则，含中文时间解析）
   memory/        MemoryStore 抽象；inmemory（测试）、mem0（生产，可选安装）
   cli.py         python -m app.cli create-invite
@@ -69,7 +71,7 @@ docker compose exec api python -m app.cli create-invite
 | 变量 | 说明 |
 |---|---|
 | `DATABASE_URL` | 生产 `postgresql+asyncpg://...`；本地/测试 `sqlite+aiosqlite:///...` |
-| `JWT_SECRET` | HS256 签名密钥，至少 32 字节随机串 |
+| `JWT_SECRET` | HS256 签名密钥：>=32 字节随机值的编码。生成任选其一：`python -c "import secrets;print(secrets.token_urlsafe(48))"`、`openssl rand -hex 32`。生产（postgresql）启动时校验：hex 需 >=64 字符，或 base64/base64url（允许无 padding）解码 >=32 字节且解码后 >=16 种字节取值；占位值与人类可读口令（含 secret/password 字样、无法解码的字符串）会被拒绝 |
 | `LLM_PROVIDER` | `mock`（默认，确定性规则）或 `openai`（OpenAI 兼容接口） |
 | `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | DeepSeek 示例 `https://api.deepseek.com`；腾讯混元 OpenAI 兼容地址示例见 `.env.example`。**地址与型号需按官网核实** |
 | `MEMORY_BACKEND` | `inmemory`（测试）或 `mem0`（生产，`pip install -r requirements-mem0.txt`）。只接受这两个值，未知值启动即报错；配置 `mem0` 但未安装 mem0ai 时也直接报错，不静默退化 |
@@ -81,7 +83,7 @@ docker compose exec api python -m app.cli create-invite
 .venv/bin/python -m pytest
 ```
 
-覆盖：登录成功/邀请码错误/未带 token 401/refresh 轮换与复用吊销；笔记幂等、乐观锁 409、删除级联；sync 增量；流水线（MockLLM）产出标题/标签/建议提醒且仅调一次 LLM、失败 3 次转 failed；用户隔离（A 读不到 B，含记忆层）；search/ask（有/无记忆）；MockLLM 中文时间解析。
+覆盖：登录成功/邀请码错误/未带 token 401/refresh 轮换与复用吊销；笔记幂等、乐观锁 409、删除级联；sync 增量；流水线（MockLLM）产出标题/标签/建议提醒且仅调一次 LLM、失败 3 次转 failed、LLM 调用期间不持锁（PATCH/他人创建不被阻塞）、记忆写入失败重试只补写不重复；用户隔离（A 读不到 B，含记忆层）；search/ask（有/无记忆）；MockLLM 中文时间解析；jwt_secret 生产校验（随机编码放行、占位/人类可读口令拒绝）。
 
 ## 测试的取舍：SQLite 而不是 testcontainers
 

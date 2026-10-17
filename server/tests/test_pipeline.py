@@ -1,12 +1,24 @@
 """自动整理流水线（MockLLM）。"""
 import json
 import uuid
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 
 from app.memory.base import get_memory_store
 from app.models import Job, Note, Reminder
 from app.timeutil import to_iso
+from tests.conftest import auth_headers
+
+
+def _freeze_now(monkeypatch, fixed: datetime) -> None:
+    """固定 organize 眼中的“服务器当前时间”。
+
+    整理会丢弃早于服务器当前时间的 fire_at（见 test_fire_at_before_
+    server_now_discarded），用固定过去/未来时间的测试不固定 now 的话，
+    断言会随真实时钟漂移。
+    """
+    monkeypatch.setattr("app.pipeline.organize.utcnow", lambda: fixed)
 
 
 async def _create_and_organize(client, user, text, run_jobs) -> Note:
@@ -29,7 +41,10 @@ async def _create_and_organize(client, user, text, run_jobs) -> Note:
         return await session.get(Note, note_id)
 
 
-async def test_organize_produces_title_tags_reminders(client, user, run_jobs):
+async def test_organize_produces_title_tags_reminders(client, user, run_jobs, monkeypatch):
+    # 该用例的 recorded_at（2026-10-16）与推算出的 fire_at 相对真实时钟
+    # 可能已是过去，固定 now 保证“未来时间仍生成”的断言不随日期漂移
+    _freeze_now(monkeypatch, datetime(2026, 10, 16, 8, 0, tzinfo=UTC))
     note = await _create_and_organize(
         client, user, "明天下午三点提醒我去医院体检，还要买火车票", run_jobs
     )
@@ -106,9 +121,10 @@ async def test_repatch_reorganizes(client, user, run_jobs):
 
 
 async def test_first_llm_failure_leaves_no_side_effects(client, user, monkeypatch):
-    """LLM 第一次失败：整理事务整体回滚，note/提醒/记忆都不留半成品。
+    """LLM 第一次失败：note/提醒/记忆都不留半成品。
 
-    之前认领、执行、失败标记在同一个事务里，异常被吞掉后
+    LLM 调用发生在任何写事务之前，失败时根本没有副作用可回滚。之前
+    （单事务时代）认领、执行、失败标记在同一个事务里，异常被吞掉后
     “organizing 状态 + 规范化文本”等部分副作用会随事务一起提交。
     """
     from app.db import get_sessionmaker
@@ -164,6 +180,82 @@ async def test_first_llm_failure_leaves_no_side_effects(client, user, monkeypatc
     assert note.status == "organized"
 
 
+async def test_memory_failure_retries_backfill_only(client, user, monkeypatch):
+    """P2：记忆写入移到写事务提交之后，失败靠 job 重试幂等补写。
+
+    第一次：LLM 成功、note 已 organized（rev+1、提醒已建），store.add
+    在写入之后失败 → DB 副作用保留，job 回 pending 重试。
+    重试：organize 发现 note 已 organized 且 memory_synced=False，跳过
+    LLM 只补写记忆（delete_by_note 后 add），即使上次 add 已部分写入
+    也不会重复。
+    """
+    from app.db import get_sessionmaker
+    from app.memory.inmemory import InMemoryStore
+    from app.pipeline.runner import run_pending_jobs
+
+    class WriteThenFailStore(InMemoryStore):
+        """第一次 add：先写入再抛错（模拟“写入成功但结果确认前失败”）。"""
+
+        def __init__(self):
+            super().__init__()
+            self.add_calls = 0
+
+        async def add(self, user_id, text, note_id=None):
+            self.add_calls += 1
+            item = await super().add(user_id, text, note_id=note_id)
+            if self.add_calls == 1:
+                raise RuntimeError("memory backend down after write")
+            return item
+
+    store = WriteThenFailStore()
+    monkeypatch.setattr("app.pipeline.organize.get_memory_store", lambda: store)
+
+    r = await client.post(
+        "/v1/notes",
+        json={"client_note_id": str(uuid.uuid4()), "text": "周末和朋友聚餐"},
+        headers=auth_headers(user),
+    )
+    note_id = r.json()["note_id"]
+
+    # 第一次执行：整理落库，记忆失败，job 待重试
+    processed = await run_pending_jobs(limit=1, retry_delay_seconds=0)
+    assert processed == 1
+    async with get_sessionmaker()() as session:
+        note = await session.get(Note, note_id)
+        job = (
+            await session.execute(
+                select(Job).where(Job.kind == "organize_note", Job.payload_json.contains(note_id))
+            )
+        ).scalars().one()
+    assert note.status == "organized"  # DB 副作用已提交，不再随记忆失败回滚
+    assert note.memory_synced is False
+    assert note.rev == 2 and note.llm_calls == 1
+    assert job.status == "pending"
+    assert job.attempts == 1
+    assert "memory backend down" in (job.last_error or "")
+    assert store.add_calls == 1
+    assert len([m for m in await store.list(user["user_id"]) if m.note_id == note_id]) == 1
+
+    # 重试：只补写记忆，不再调 LLM / 重新整理
+    await run_pending_jobs(retry_delay_seconds=0)
+    async with get_sessionmaker()() as session:
+        note = await session.get(Note, note_id)
+        job = (
+            await session.execute(
+                select(Job).where(Job.kind == "organize_note", Job.payload_json.contains(note_id))
+            )
+        ).scalars().one()
+    assert job.status == "done"
+    assert job.attempts == 2
+    assert note.status == "organized"
+    assert note.memory_synced is True
+    assert note.rev == 2  # 没有再整理
+    assert note.llm_calls == 1  # 没有再调 LLM
+    assert store.add_calls == 2
+    items = [m for m in await store.list(user["user_id"]) if m.note_id == note_id]
+    assert len(items) == 1  # delete_by_note 后再 add：最终写入且不重复
+
+
 async def test_stale_organize_job_skipped_after_patch(client, user, run_jobs):
     """入队时的 rev 与执行时不一致：任务跳过，由 PATCH 重新入队的任务整理。"""
     from app.db import get_sessionmaker
@@ -192,11 +284,14 @@ async def test_stale_organize_job_skipped_after_patch(client, user, run_jobs):
 
 
 async def test_relative_time_uses_recorded_at_and_keeps_original_text(
-    client, user, run_jobs
+    client, user, run_jobs, monkeypatch
 ):
     """相对时间以 recorded_at 为参照；规范化文本只喂 LLM，不覆盖原文。"""
     from app.db import get_sessionmaker
 
+    # fire_at 是 2026-01-02：把 now 固定在它之前，只验证“以 recorded_at
+    # 为参照”本身，不和“早于服务器 now 丢弃”的规则互相干扰
+    _freeze_now(monkeypatch, datetime(2026, 1, 1, 0, 0, tzinfo=UTC))
     text = "嗯，那个，明天上午十点交周报"
     r = await client.post(
         "/v1/notes",
@@ -263,6 +358,55 @@ async def test_past_or_broken_fire_at_discarded(client, user, monkeypatch, run_j
         assert (
             await session.execute(select(Reminder).where(Reminder.note_id == note_id))
         ).scalars().all() == []
+
+
+async def test_fire_at_before_server_now_discarded(client, user, monkeypatch, run_jobs):
+    """P2：按 recorded_at 推算的提醒可能落在服务器当前时间之前（旧录音
+    补整理时“明天”是录音那天 的明天）。早于 now 的 fire_at 不生成
+    建议提醒；正常的未来时间仍生成。
+    """
+    from app.db import get_sessionmaker
+
+    _freeze_now(monkeypatch, datetime(2026, 10, 16, 20, 0, tzinfo=UTC))
+    headers = auth_headers(user)
+
+    # 2020 年的旧录音：“明天九点”按 recorded_at 推算落在 now 之前 → 不生成
+    old = await client.post(
+        "/v1/notes",
+        json={
+            "client_note_id": str(uuid.uuid4()),
+            "text": "明天九点开会",
+            "recorded_at": "2020-01-01T00:00:00+00:00",
+        },
+        headers=headers,
+    )
+    # 正常录音：recorded_at 在 now 之后 → 生成
+    new = await client.post(
+        "/v1/notes",
+        json={
+            "client_note_id": str(uuid.uuid4()),
+            "text": "明天九点开会",
+            "recorded_at": "2026-10-20T08:00:00+00:00",
+        },
+        headers=headers,
+    )
+    old_id, new_id = old.json()["note_id"], new.json()["note_id"]
+    await run_jobs()
+
+    async with get_sessionmaker()() as session:
+        for note_id in (old_id, new_id):
+            note = await session.get(Note, note_id)
+            assert note.status == "organized"  # 提醒被丢弃不影响整理本身
+        old_reminders = (
+            await session.execute(select(Reminder).where(Reminder.note_id == old_id))
+        ).scalars().all()
+        new_reminders = (
+            await session.execute(select(Reminder).where(Reminder.note_id == new_id))
+        ).scalars().all()
+    assert old_reminders == []
+    assert len(new_reminders) == 1
+    # “明天九点”：2026-10-20（当地 16:00）的明天 09:00 +08
+    assert to_iso(new_reminders[0].fire_at) == "2026-10-21T01:00:00+00:00"
 
 
 async def test_enqueue_uses_configured_max_attempts(client, user, monkeypatch):

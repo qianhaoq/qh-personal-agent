@@ -1,4 +1,7 @@
 """应用配置：全部来自环境变量（.env 亦可）。"""
+import base64
+import binascii
+import string
 from functools import lru_cache
 from typing import Literal
 
@@ -9,11 +12,39 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 DEFAULT_JWT_SECRET = "dev-insecure-secret-change-me"
 # .env.example 里的占位值（测试会读取 .env.example 校验与此常量一致）
 ENV_EXAMPLE_JWT_PLACEHOLDER = "change-me-to-a-long-random-secret"
-# 明显的占位/示例字样，出现在生产密钥里即拒绝（大小写不敏感）
-_INSECURE_SUBSTRINGS = ("change-me", "changeme", "example", "placeholder")
-# 生产密钥的最低强度：长度与不同字符数
-_MIN_SECRET_LENGTH = 32
-_MIN_SECRET_DISTINCT_CHARS = 16
+# 明显的占位/人类可读口令字样，出现在生产密钥里即拒绝（大小写不敏感）。
+# secret/password 用来挡人类可读口令（如 my-super-secret-...）：随机编码里
+# 出现连续 6/8 个字母单词的概率约 1e-9（hex 编码里不可能出现）
+_INSECURE_SUBSTRINGS = ("change-me", "changeme", "example", "placeholder", "secret", "password")
+# 生产密钥的结构要求：>=32 字节随机值的编码（hex 或 base64/base64url）
+_MIN_SECRET_BYTES = 32
+_MIN_HEX_CHARS = 64  # 32 字节 = 64 个 hex 字符
+# 解码后不同字节取值数的下限（防 "00"*32 这类低熵值只靠长度过关）
+_MIN_SECRET_DISTINCT_BYTES = 16
+_HEX_DIGITS = frozenset(string.hexdigits)
+# base64url 的 -_ 换成标准 base64 的 +/ 后统一走严格的标准解码
+_URLSAFE_TO_STD = str.maketrans("-_", "+/")
+
+
+def _decode_secret(secret: str) -> bytes | None:
+    """把 JWT_SECRET 解码成它编码的随机字节；不是合法编码返回 None。
+
+    - 全部字符都是 hex 数字时按 hex 处理：需 >=64 个字符（解码 >=32 字节）
+      且长度为偶数；不满足直接拒绝，不回退按 base64 解释——否则 31 字节
+      的 hex（62 个字符）会被当成 46 字节的 base64 放行，绕过长度要求
+    - 其余按 base64 / base64url 处理（允许无 padding），严格校验字符集
+    """
+    if all(c in _HEX_DIGITS for c in secret):
+        if len(secret) < _MIN_HEX_CHARS or len(secret) % 2:
+            return None
+        return bytes.fromhex(secret)
+    padded = secret + "=" * (-len(secret) % 4)
+    for candidate in (padded, padded.translate(_URLSAFE_TO_STD)):
+        try:
+            return base64.b64decode(candidate, validate=True)
+        except (binascii.Error, ValueError):
+            continue
+    return None
 
 
 class Settings(BaseSettings):
@@ -59,7 +90,8 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _reject_insecure_jwt_secret_in_production(self) -> "Settings":
-        """生产（postgresql）下 JWT_SECRET 必须是强随机值；SQLite 开发测试不受影响。"""
+        """生产（postgresql）下 JWT_SECRET 必须是 >=32 字节随机值的编码；
+        SQLite 开发测试不受影响。"""
         if not self.database_url.startswith("postgresql"):
             return self
         secret = self.jwt_secret
@@ -68,17 +100,26 @@ class Settings(BaseSettings):
             problems.append("使用了默认/模板占位值")
         lowered = secret.lower()
         if any(word in lowered for word in _INSECURE_SUBSTRINGS):
-            problems.append("包含 change-me/changeme/example/placeholder 等占位字样")
-        if len(secret) < _MIN_SECRET_LENGTH:
-            problems.append(f"长度不足（{len(secret)} < {_MIN_SECRET_LENGTH}）")
-        if len(set(secret)) < _MIN_SECRET_DISTINCT_CHARS:
-            problems.append(f"不同字符数不足（{len(set(secret))} < {_MIN_SECRET_DISTINCT_CHARS}）")
+            problems.append("包含 change-me/secret/password 等占位或人类可读口令字样")
+        raw = _decode_secret(secret)
+        if raw is None:
+            problems.append(
+                "不是合法的 hex/base64 编码（hex 需 >=64 位偶数长，"
+                "或 base64/base64url 解码 >=32 字节）"
+            )
+        else:
+            if len(raw) < _MIN_SECRET_BYTES:
+                problems.append(f"解码后只有 {len(raw)} 字节（< {_MIN_SECRET_BYTES}）")
+            if len(set(raw)) < _MIN_SECRET_DISTINCT_BYTES:
+                problems.append(
+                    f"解码后不同字节取值数不足（{len(set(raw))} < {_MIN_SECRET_DISTINCT_BYTES}）"
+                )
         if problems:
             raise ValueError(
                 "生产环境（DATABASE_URL 以 postgresql 开头）的 JWT_SECRET 不安全："
                 + "；".join(problems)
-                + "。请设置 JWT_SECRET 为随机值（如 `python -c \"import secrets;"
-                  "print(secrets.token_urlsafe(48))\"`）"
+                + "。请用随机值生成，如 `python -c \"import secrets;"
+                  "print(secrets.token_urlsafe(48))\"` 或 `openssl rand -hex 32`"
             )
         return self
 

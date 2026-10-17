@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from sqlalchemy import (
     JSON,
     BigInteger,
+    Boolean,
     DateTime,
     ForeignKey,
     Index,
@@ -78,12 +79,16 @@ class Note(Base):
     asr_meta_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     recorded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     timezone: Mapped[str] = mapped_column(String(64), default="Asia/Shanghai")
-    # uploaded -> organizing -> organized | failed
+    # uploaded -> organized | failed（整理期间不再落库 organizing 中间态：
+    # LLM 调用在事务外，没有可以承载它的短事务）
     status: Mapped[str] = mapped_column(String(16), default="uploaded", index=True)
     category: Mapped[str | None] = mapped_column(String(32), nullable=True)
     tags: Mapped[list | None] = mapped_column(JSON, nullable=True)
     todos: Mapped[list | None] = mapped_column(JSON, nullable=True)
     llm_calls: Mapped[int] = mapped_column(Integer, default=0)
+    # 整理产物已写入 MemoryStore。记忆写入在 DB 事务提交之后（mem0 内部
+    # 还有 LLM/embedding 调用），失败靠 job 重试补写（见 pipeline/organize）
+    memory_synced: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     rev: Mapped[int] = mapped_column(Integer, default=1)
     change_seq: Mapped[int] = mapped_column(BigInteger, default=0, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
