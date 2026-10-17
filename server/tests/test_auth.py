@@ -416,3 +416,107 @@ async def test_concurrent_first_login_same_device_no_integrity_error(client):
             await session.execute(select(Device).where(Device.id == "dev_first"))
         ).scalars().all()
     assert len(rows) == 1
+
+
+# ---------------------------------------------------------------------------
+# threads6 P1-3 / INV-8 / INV-12：refresh 轮换 0 行后的锁内重读归因
+# ---------------------------------------------------------------------------
+
+
+async def test_refresh_race_row_deleted_while_waiting_device_lock_401_no_revoke(
+    client, invite_code, monkeypatch
+):
+    """threads6 P1-3：refresh 读到活行后、拿到 device 行锁之前，该 token 行
+    被并发路径删除（第 6 次登录的上限修剪 / logout）→ 轮换 0 行。锁内重读
+    归因：行不存在 → 普通 401，**不吊销设备**（挤出/登出的既定语义）；
+    同设备其他 token 照常可用。旧行为在这里按重放吊销了整台设备。"""
+    from sqlalchemy import delete as sa_delete
+
+    from app.api import auth as auth_api
+    from app.auth.tokens import hash_refresh_token
+    from app.db import get_sessionmaker
+    from app.models import Device, RefreshToken
+
+    device_id = "dev_race_del"
+    first = await client.post(
+        "/v1/auth/login", json={"invite_code": invite_code, "device_id": device_id}
+    )
+    second = await client.post(
+        "/v1/auth/login", json={"invite_code": invite_code, "device_id": device_id}
+    )
+    assert first.status_code == 200 and second.status_code == 200
+    t1, t2 = first.json()["refresh_token"], second.json()["refresh_token"]
+
+    real_lock_device = auth_api._lock_device
+
+    async def lock_device_after_deleting_token(session, device_id):
+        # 注入「读行之后、拿锁之前」窗口里发生的删除（同一事务内可见，
+        # 与真实并发提交后的可见性等价）
+        async with session.begin_nested():
+            await session.execute(
+                sa_delete(RefreshToken).where(
+                    RefreshToken.token_hash == hash_refresh_token(t1)
+                )
+            )
+        return await real_lock_device(session, device_id)
+
+    monkeypatch.setattr(auth_api, "_lock_device", lock_device_after_deleting_token)
+
+    resp = await client.post("/v1/auth/refresh", json={"refresh_token": t1})
+    assert resp.status_code == 401, resp.text
+    assert resp.json()["error"]["code"] == "unauthorized"
+
+    # 设备未被吊销：另一枚 token 照常刷新
+    other = await client.post("/v1/auth/refresh", json={"refresh_token": t2})
+    assert other.status_code == 200, other.text
+    async with get_sessionmaker()() as session:
+        device = await session.get(Device, device_id)
+    assert device.revoked_at is None
+
+
+@requires_postgres
+async def test_concurrent_sixth_login_eviction_vs_refresh_no_device_revoke_pg(
+    client, invite_code
+):
+    """threads6 P1-3（PG 真并发）：设备已有 5 枚活 token，并发执行「第 6 次
+    登录（上限修剪挤掉最老一枚）」与「用最老那枚刷新」。合法结果 ∈
+    {401 unauthorized, 200}（刷新先拿 device 锁则轮换成功；登录先落定则行
+    已删、锁内重读归因 401）——任何交错下都不得 refresh_reused、不得吊销
+    设备，幸存的 token 必须仍可刷新。"""
+    import asyncio
+
+    from app.db import get_sessionmaker
+    from app.models import Device
+
+    device_id = "dev_evict_race"
+    tokens = []
+    for i in range(5):
+        r = await client.post(
+            "/v1/auth/login",
+            json={"invite_code": invite_code, "device_id": device_id, "device_name": f"n{i}"},
+        )
+        assert r.status_code == 200, r.text
+        tokens.append(r.json()["refresh_token"])
+
+    refresh_task = client.post("/v1/auth/refresh", json={"refresh_token": tokens[0]})
+    login_task = client.post(
+        "/v1/auth/login",
+        json={"invite_code": invite_code, "device_id": device_id, "device_name": "n5"},
+    )
+    refreshed, sixth = await asyncio.gather(refresh_task, login_task)
+
+    assert sixth.status_code == 200, sixth.text
+    assert refreshed.status_code in (200, 401), refreshed.text
+    if refreshed.status_code == 401:
+        assert refreshed.json()["error"]["code"] == "unauthorized", (
+            "行被挤出后的刷新必须是普通 401，绝不能按重放吊销设备"
+        )
+
+    async with get_sessionmaker()() as session:
+        device = await session.get(Device, device_id)
+    assert device.revoked_at is None, "任何交错下设备都不得被吊销"
+
+    # 幸存 token 可用：第 6 次登录返回的、以及中间那几枚
+    for token in (sixth.json()["refresh_token"], tokens[2]):
+        resp = await client.post("/v1/auth/refresh", json={"refresh_token": token})
+        assert resp.status_code == 200, (token, resp.status_code, resp.text)

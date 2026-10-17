@@ -256,7 +256,21 @@ async def refresh(body: RefreshRequest, session: AsyncSession = Depends(get_db_s
             await _append_refresh_token(session, device_id, token_user_id, result["refresh_token"], now)
             await session.commit()
             return result
-        # rowcount==0：并发请求已先轮换 → 与重放同样按复用吊销设备（原语义）
+        # rowcount==0 不能直接断定为重放（threads6 P1-3 / INV-8/INV-12）：
+        # 首次读行（无锁）与拿到 device 行锁之间存在窗口，期间这行可能已被
+        # 第 6 次登录的上限修剪或 logout 删除（挤出/登出的既定语义是普通
+        # 401、不吊销设备），也可能恰好跨过 expires_at。锁内重读该行归因：
+        current = (
+            await session.execute(select(RefreshToken).where(RefreshToken.id == row.id))
+        ).scalar_one_or_none()
+        if current is None:
+            # 行已不存在（被挤出/登出删除）：普通 401，不吊销设备
+            raise ApiError(401, "unauthorized", "invalid refresh token")
+        if current.revoked_at is None:
+            # 未作废却没轮换成功：UPDATE 里的 now 是请求起始时刻，只可能是
+            # 等锁期间跨过了过期时刻 → 按过期 401（不吊销设备）
+            raise ApiError(401, "unauthorized", "refresh token 已过期")
+        # revoked_at 非空：确系被轮换/吊销后的重放 → 复用检测吊销整台设备
         return await _revoke_device_for_reuse(session, device_id)
 
     raise ApiError(401, "unauthorized", "invalid refresh token")
