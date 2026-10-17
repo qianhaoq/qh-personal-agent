@@ -31,7 +31,9 @@
         /workspace/.agent-tmp/mem0venv/bin/python -m pytest \\
         tests/test_mem0_integration.py -q
 
-跳过条件（各自带原因，常规环境全跳过、不算失败）：
+跳过条件（各自带原因，常规环境全跳过、不算失败）。设了 TEST_DATABASE_URL 且
+处于 CI（CI=true）或 REQUIRE_MEM0=1 时，下列除「TEST_DATABASE_URL 未设置」外的
+条件一律改为**失败**，防止 CI 依赖安装坏掉后静默 skip：
 - mem0 未安装（本机按 README 只装 requirements-dev.txt，不含 mem0ai）；
 - TEST_DATABASE_URL 未设置（pgvector 需要 PostgreSQL 目标库）；
 - 目标库未安装 vector 扩展（需要数据库超级用户执行
@@ -46,19 +48,33 @@ import zlib
 
 import pytest
 
-pytest.importorskip(
-    "mem0",
-    reason="未安装 mem0ai：本文件验证真实后端，请用 requirements-mem0.txt 的独立 venv 运行（见模块 docstring）",
-)
-
 TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL", "").strip()
 if not TEST_DATABASE_URL:
+    # 无 PG 目标库（如 CI 的 SQLite job）：本文件不适用，永远 skip
     pytest.skip(
         "TEST_DATABASE_URL 未设置：pgvector 集成需要 PostgreSQL 目标库", allow_module_level=True
     )
 if not TEST_DATABASE_URL.startswith("postgresql"):
     pytest.skip(
         f"TEST_DATABASE_URL 不是 postgresql URL：{TEST_DATABASE_URL!r}", allow_module_level=True
+    )
+
+# 有 PG 目标库时，CI（CI=true）或显式 REQUIRE_MEM0=1 下缺依赖/缺 vector 扩展
+# 必须失败而不是静默 skip：否则 CI 装依赖的步骤坏掉也看不出来
+REQUIRE_MEM0 = os.environ.get("REQUIRE_MEM0") == "1" or os.environ.get("CI", "").lower() == "true"
+
+
+def _skip_or_fail(reason: str) -> None:
+    if REQUIRE_MEM0:
+        pytest.fail(f"[REQUIRE_MEM0/CI] {reason}", pytrace=False)
+    pytest.skip(reason, allow_module_level=True)
+
+
+try:
+    import mem0  # noqa: F401
+except ImportError:
+    _skip_or_fail(
+        "未安装 mem0ai：本文件验证真实后端，请用 requirements-mem0.txt 的独立 venv 运行（见模块 docstring）"
     )
 
 
@@ -83,12 +99,11 @@ def _vector_extension_installed() -> bool:
 try:
     _VECTOR_OK = _vector_extension_installed()
 except Exception as exc:  # noqa: BLE001 - 连不上/无权限都按环境不具备跳过
-    pytest.skip(f"无法连接 TEST_DATABASE_URL 检查 vector 扩展：{exc}", allow_module_level=True)
+    _skip_or_fail(f"无法连接 TEST_DATABASE_URL 检查 vector 扩展：{exc}")
 if not _VECTOR_OK:
-    pytest.skip(
+    _skip_or_fail(
         "目标库未安装 vector 扩展：sudo -u postgres psql <db> "
-        "-c 'CREATE EXTENSION IF NOT EXISTS vector'",
-        allow_module_level=True,
+        "-c 'CREATE EXTENSION IF NOT EXISTS vector'"
     )
 
 
