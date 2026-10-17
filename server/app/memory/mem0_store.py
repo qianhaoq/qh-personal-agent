@@ -1,7 +1,8 @@
 """mem0 后端适配器（钉住 mem0ai==2.2.1，见 requirements-mem0.txt）。
 
 - mem0ai 的 import 放在构造内：MEMORY_BACKEND=mem0 而未安装 mem0ai 时，
-  构造直接抛 ImportError（生产配置错误应当暴露，见 app.memory.base）。
+  构造直接抛 ImportError（生产配置错误应当暴露，见 app.memory.base）；
+  启动期的安装探测在 app.config（INV-10.3）。
 - 向量库 pgvector 与业务库同一个 PostgreSQL 实例；mem0 内部的 LLM/embedding 走
   OpenAI 兼容配置。
 - mem0 是同步库，这里用 asyncio.to_thread 包一层。
@@ -11,8 +12,14 @@
 mem0 2.x API 适配（2.2.1 实测，钉版本防漂移）：
 - search/get_all **拒绝**顶层 user_id/agent_id/run_id（ValueError），作用域
   一律走 `filters={"user_id": ...}`；search 的条数参数是 `top_k`（无 limit）。
-- get_all 默认 top_k=20 会截断：delete_by_note 需要全量，显式放大到
-  _LIST_TOP_K。
+- get_all 的 filters 透传到 pgvector list() 且支持 **metadata 键**
+  （`payload->>'note_id' = ...`）：delete_by_note 按 (user_id, note_id)
+  精确枚举，不再按 user 全量拉回后过滤。
+- get_all **没有游标/offset 分页**（只有 top_k 截断）：全量语义的枚举
+  用「边取边删」的循环推进（每轮删掉本轮取到的，下一轮自然前进）；
+  list() 无法推进，一页取满即抛 MemoryEnumerationIncomplete（INV-3：
+  取不全就报错，绝不当成已取全）。页大小可注入（list_page_size），
+  测试用极小值模拟超限。
 - add 的返回有两种形状：infer=True 主路径返回**裸 list**，
   infer=False 原始路径返回 {"results": [...]}——两种都归一。
 - delete 对不存在的 id 抛 ValueError：按「已删除」处理（幂等），不中断
@@ -21,11 +28,11 @@ mem0 2.x API 适配（2.2.1 实测，钉版本防漂移）：
 from __future__ import annotations
 
 from app.config import get_settings
-from app.memory.base import MemoryItem
+from app.memory.base import MemoryEnumerationIncomplete, MemoryItem
 
-# list() 用于 delete_by_note/delete_all 的全量枚举：必须盖住单用户全部
-# 记忆，否则 mem0 get_all 的默认 top_k=20 会静默截断、留下删不净的记忆
-_LIST_TOP_K = 1000
+# 全量枚举的单页上限默认值：只影响「取不满一页才算删净/取全」的判定，
+# 不再被当成「单用户记忆总数不会超过」的假设（threads5 P1-1）
+_LIST_PAGE_SIZE = 200
 
 
 def _item_from_result(user_id: str, r: dict) -> MemoryItem:
@@ -55,7 +62,7 @@ def _results_of(result: object) -> list[dict]:
 class Mem0Store:
     """实现 app.memory.base.MemoryStore 的接口（鸭子类型，避免继承时触发顶层 import）。"""
 
-    def __init__(self) -> None:
+    def __init__(self, *, list_page_size: int = _LIST_PAGE_SIZE) -> None:
         from mem0 import Memory  # mem0 未安装时在这里才报 ImportError
 
         settings = get_settings()
@@ -85,6 +92,7 @@ class Mem0Store:
             },
         }
         self._client = Memory.from_config(config)
+        self._page = list_page_size
 
     async def add(
         self, user_id: str, text: str, *, note_id: str | None = None, source_rev: int | None = None
@@ -120,12 +128,20 @@ class Mem0Store:
         return items
 
     async def list(self, user_id: str) -> list[MemoryItem]:
+        """全量列举（INV-3：枚举必须完整）。get_all 无游标分页——一页取满
+        即无法证明已取全，抛错让 job 失败重试，绝不静默截断。"""
         import asyncio
 
         results = await asyncio.to_thread(
-            self._client.get_all, filters={"user_id": user_id}, top_k=_LIST_TOP_K
+            self._client.get_all, filters={"user_id": user_id}, top_k=self._page
         )
-        return [_item_from_result(user_id, r) for r in _results_of(results)]
+        items = [_item_from_result(user_id, r) for r in _results_of(results)]
+        if len(items) >= self._page:
+            raise MemoryEnumerationIncomplete(
+                f"mem0 get_all 取满一页（{len(items)}/{self._page}）且无游标可推进，"
+                "无法证明已取全——按不完整处理（INV-3），放大后端或分批删除"
+            )
+        return items
 
     async def delete(self, user_id: str, memory_ids: list[str]) -> int:
         import asyncio
@@ -144,21 +160,46 @@ class Mem0Store:
             count += 1
         return count
 
-    async def delete_by_note(self, user_id: str, note_id: str) -> int:
-        # list() 返回 MemoryItem（dataclass），按属性访问而不是 dict
-        count = 0
-        for item in await self.list(user_id):
-            if item.note_id == note_id:
-                await self.delete(user_id, [item.id])
-                count += 1
-        return count
-
-    async def delete_all(self, user_id: str) -> int:
+    async def _delete_filtered(self, filters: dict) -> int:
+        """按 filters（user_id [+ note_id]，pgvector metadata 过滤）边取边删，
+        返回确切删除数。每轮删掉本轮取到的，下一轮自然前进（mem0 get_all
+        无游标，这是唯一的穷尽方式）；取满一页且同一批 id 重复出现（删除
+        未生效）时抛错——绝不把「删不动」当成已删完（INV-3）。"""
         import asyncio
 
-        items = await self.list(user_id)
-        await asyncio.to_thread(self._client.delete_all, user_id=user_id)
-        return len(items)
+        count = 0
+        seen_batches: set[frozenset[str]] = set()
+        while True:
+            results = await asyncio.to_thread(
+                self._client.get_all, filters=dict(filters), top_k=self._page
+            )
+            ids = [
+                r.get("id") or r.get("memory_id") or ""
+                for r in _results_of(results)
+            ]
+            ids = [mid for mid in ids if mid]
+            if not ids:
+                return count
+            if len(ids) >= self._page:
+                batch = frozenset(ids)
+                if batch in seen_batches:
+                    raise MemoryEnumerationIncomplete(
+                        f"mem0 get_all 连续取到同一批 {len(ids)} 条（删除未生效），"
+                        "无法推进枚举——按不完整处理（INV-3）"
+                    )
+                seen_batches.add(batch)
+            count += await self.delete(filters["user_id"], ids)
+            if len(ids) < self._page:
+                return count
+
+    async def delete_by_note(self, user_id: str, note_id: str) -> int:
+        # 直接按 (user_id, note_id) 在后端过滤枚举（INV-3），不再拉全用户
+        return await self._delete_filtered({"user_id": user_id, "note_id": note_id})
+
+    async def delete_all(self, user_id: str) -> int:
+        # 与 delete_by_note 同一套穷尽循环（比 client.delete_all 多给出确切
+        # 删除数；两者的每 id 删除路径相同）
+        return await self._delete_filtered({"user_id": user_id})
 
 
 def _pg_connection_string(async_url: str) -> str:

@@ -1,10 +1,16 @@
-"""进程内记忆实现：字符级/关键词混合相似度，测试与本地开发用。"""
+"""进程内记忆实现：字符级/关键词混合相似度，测试与本地开发用。
+
+枚举语义与 Mem0Store 对齐（threads5 P1-1，INV-3）：list() 可注入页上限
+（list_page_size），用户记忆数达到上限即抛 MemoryEnumerationIncomplete——
+进程内字典本身不会截断，上限只是让「取不全即报错」的行为在两个后端
+都可测。
+"""
 from __future__ import annotations
 
 from difflib import SequenceMatcher
 
 from app.common import new_id
-from app.memory.base import MemoryItem, MemoryStore
+from app.memory.base import MemoryEnumerationIncomplete, MemoryItem, MemoryStore
 
 
 def similarity(a: str, b: str) -> float:
@@ -32,8 +38,11 @@ def _tokenize(text: str) -> set[str]:
 
 
 class InMemoryStore(MemoryStore):
-    def __init__(self) -> None:
+    def __init__(self, *, list_page_size: int | None = None) -> None:
         self._items: dict[str, MemoryItem] = {}  # memory_id -> item
+        # list() 的页上限（None = 不限）：注入小值即可模拟「一页取满且
+        # 无法推进」的枚举不完整（INV-3）
+        self.list_page_size = list_page_size
 
     async def add(
         self, user_id: str, text: str, *, note_id: str | None = None, source_rev: int | None = None
@@ -66,7 +75,13 @@ class InMemoryStore(MemoryStore):
         return results
 
     async def list(self, user_id: str) -> list[MemoryItem]:
-        return [item for item in self._items.values() if item.user_id == user_id]
+        items = [item for item in self._items.values() if item.user_id == user_id]
+        if self.list_page_size is not None and len(items) >= self.list_page_size:
+            raise MemoryEnumerationIncomplete(
+                f"inmemory list 取满一页（{len(items)}/{self.list_page_size}），"
+                "按不完整处理（INV-3）"
+            )
+        return items
 
     async def delete(self, user_id: str, memory_ids: list[str]) -> int:
         """按 id 精确删（只删属于该用户的）：复查不一致时清理本次新增用。"""

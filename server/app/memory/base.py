@@ -2,11 +2,23 @@
 
 记忆归属（INV-3，docs/server-invariants.md）：每条由本服务写入的记忆
 metadata 必含 note_id 与 source_rev——记忆只属于 note 的当前 rev。
-写删记忆的唯一入口是 memory_sync job（app/pipeline/memory_sync.py）。"""
+写删记忆的唯一入口是 memory_sync job（app/pipeline/memory_sync.py）。
+
+枚举完整性（threads5 P1-1，INV-3）：凡是「全量」语义的枚举（list /
+delete_by_note / delete_all）必须完整——一页取满又无法推进时抛
+MemoryEnumerationIncomplete 让 job 失败重试，绝不当成已取全/已同步
+（固定大 top_k 当全量会在超限用户身上留下删不净的记忆且 job 报成功）。
+"""
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+
+
+class MemoryEnumerationIncomplete(RuntimeError):
+    """全量枚举无法证明完整（一页取满且无游标可推进/删除未生效）。
+
+    调用方（memory_sync job）应让任务失败重试，不得视为已同步。"""
 
 
 @dataclass

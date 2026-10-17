@@ -14,7 +14,7 @@ import uuid
 import pytest
 from sqlalchemy import select, update
 
-from app.memory.base import set_memory_store
+from app.memory.base import MemoryEnumerationIncomplete, set_memory_store
 from app.memory.inmemory import InMemoryStore
 from app.models import Job, Note
 from tests.conftest import auth_headers
@@ -103,6 +103,55 @@ async def test_no_stale_rev_memory_after_repatch(client, user, run_jobs):
     # 搜新内容：命中
     search2 = await client.get("/v1/search", params={"q": "游泳"}, headers=headers)
     assert [m for m in search2.json()["items"] if m["note_id"] == note_id], "新记忆应可检索"
+
+
+async def test_memory_sync_fails_not_marks_synced_when_enumeration_incomplete(
+    client, user, run_jobs
+):
+    """threads5 P1-1 / INV-3：delete_by_note 枚举不完整（一页取满删不动）→
+    memory_sync 抛错让 job 失败重试至耗尽——绝不把「取不全」当成已同步
+    （memory_status 落 failed，绝非 synced）。"""
+    from app.pipeline.runner import run_pending_jobs
+
+    note_id = await _create_note(client, user, "同步时枚举会不完整的笔记")
+
+    class CappedEnumerationStore(InMemoryStore):
+        """delete_by_note 见到存量 ≥ 页上限（取满且删不动）即抛
+        MemoryEnumerationIncomplete，模拟超限后端。"""
+
+        def __init__(self, cap: int = 1):
+            super().__init__(list_page_size=cap)
+
+        async def delete_by_note(self, user_id, note_id):
+            stale = [
+                m
+                for m in self._items.values()
+                if m.user_id == user_id and m.note_id == note_id
+            ]
+            if len(stale) >= self.list_page_size:
+                raise MemoryEnumerationIncomplete(
+                    f"取满一页（{len(stale)}/{self.list_page_size}）且无法推进"
+                )
+            return await super().delete_by_note(user_id, note_id)
+
+    capped = CappedEnumerationStore(cap=1)
+    # 预置一条存量记忆：让每次 memory_sync 的 delete_by_note 都取满页
+    await capped.add(user["user_id"], "旧 rev 的存量记忆", note_id=note_id, source_rev=0)
+    set_memory_store(capped)
+
+    for _ in range(20):
+        if await run_pending_jobs(retry_delay_seconds=0) == 0:
+            break
+
+    note = await _note(note_id)
+    assert note.status == "organized", "extract 与记忆后端故障无关，照常完成"
+    assert note.memory_status == "failed", "枚举不完整绝不能置 synced"
+    jobs = await _memsync_jobs(note_id)
+    assert jobs and {j.status for j in jobs} == {"failed"}, "任务必须失败而非报成功"
+    # 存量记忆原样保留：删没删成未知，绝不假装已同步
+    #（不走 _items/list——capped 的页上限对 list 同样生效）
+    leftover = [m for m in capped._items.values() if m.note_id == note_id]
+    assert leftover, "存量记忆必须原样保留（未被悄悄标记为已同步）"
 
 
 # ---------------------------------------------------------------------------
