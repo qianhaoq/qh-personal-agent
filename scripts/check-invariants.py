@@ -194,6 +194,9 @@ def check_seq_last(tree, path, parents) -> list[Finding]:
         if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) or fn.name == SEQ_FUNC:
             continue
         sessions = _session_names(fn)
+        local = {a.arg for a in ast.walk(fn.args) if isinstance(a, ast.arg)} | {
+            n.id for n in ast.walk(fn) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+        _SA = _sqlalchemy_names(tree) - local  # locally rebound names no longer mean sqlalchemy
         calls = sorted(
             (c for c in ast.walk(fn) if isinstance(c, ast.Call)
              and next((p for p in _ancestors(c, parents) if isinstance(p, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))), None) is fn),

@@ -47,6 +47,10 @@ class SeqLast(unittest.TestCase):
 
         """), [])
 
+    def test_shadowed_sqlalchemy_update_ok(self):
+        src = SA + "async def f(session, update):\n    update(X).values(text=1, change_seq=await allocate_seq(session))\n"
+        self.assertEqual(rules(src), [])
+
     def test_bare_update_not_from_sqlalchemy_ok(self):
         src = "from builders import update\nasync def g(session):\n    update(x).values(text=t, change_seq=await allocate_seq(session))\n"
         self.assertEqual(ci.check_source(src, "server/app/x.py"), [])
