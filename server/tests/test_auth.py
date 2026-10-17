@@ -520,3 +520,63 @@ async def test_concurrent_sixth_login_eviction_vs_refresh_no_device_revoke_pg(
     for token in (sixth.json()["refresh_token"], tokens[2]):
         resp = await client.post("/v1/auth/refresh", json={"refresh_token": token})
         assert resp.status_code == 200, (token, resp.status_code, resp.text)
+
+
+async def test_refresh_prunes_expired_rows_keeps_revoked_until_expiry(client, invite_code):
+    """threads6 P2 / INV-8：登录/轮换追加新行时顺手清掉该设备的已过期行
+    （expires_at <= now，无论是否作废）；已作废但未过期的行保留到过期
+    为止——有效期内重放仍触发 refresh_reused 吊销设备。"""
+    from datetime import timedelta
+
+    from app.auth.tokens import hash_refresh_token
+    from app.db import get_sessionmaker
+    from app.models import RefreshToken
+    from app.timeutil import utcnow
+
+    device_id = "dev_prune"
+
+    async def _row(token: str) -> RefreshToken | None:
+        async with get_sessionmaker()() as session:
+            return (
+                await session.execute(
+                    select(RefreshToken).where(
+                        RefreshToken.token_hash == hash_refresh_token(token)
+                    )
+                )
+            ).scalar_one_or_none()
+
+    t1 = (await client.post(
+        "/v1/auth/login", json={"invite_code": invite_code, "device_id": device_id}
+    )).json()["refresh_token"]
+    # 直接把 t1 的行改成已过期（未作废）
+    async with get_sessionmaker()() as session:
+        row = (
+            await session.execute(
+                select(RefreshToken).where(
+                    RefreshToken.token_hash == hash_refresh_token(t1)
+                )
+            )
+        ).scalar_one()
+        row.expires_at = utcnow() - timedelta(hours=1)
+        await session.commit()
+
+    # 登录路径的追加清理：过期行删除
+    t2 = (await client.post(
+        "/v1/auth/login", json={"invite_code": invite_code, "device_id": device_id}
+    )).json()["refresh_token"]
+    assert await _row(t1) is None, "登录追加时应清掉已过期行"
+
+    # 轮换 t2：t2 的行作废但未过期 → 保留；t3 正常可用
+    rotated = await client.post("/v1/auth/refresh", json={"refresh_token": t2})
+    assert rotated.status_code == 200, rotated.text
+    t3 = rotated.json()["refresh_token"]
+    t2_row = await _row(t2)
+    assert t2_row is not None and t2_row.revoked_at is not None, "作废未过期的行必须保留"
+
+    usable = await client.post("/v1/auth/refresh", json={"refresh_token": t3})
+    assert usable.status_code == 200, usable.text
+
+    # 保留的作废行仍承担重放检测：有效期内重放 t2 → 吊销设备
+    replay = await client.post("/v1/auth/refresh", json={"refresh_token": t2})
+    assert replay.status_code == 401
+    assert replay.json()["error"]["code"] == "refresh_reused"

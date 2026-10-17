@@ -11,7 +11,7 @@ refresh_tokens 表——同设备同账号并发登录各自追加一行、互�
 不碰 sequences。
 """
 from fastapi import APIRouter, Depends
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.tokens import (
@@ -92,10 +92,17 @@ def _device_upsert(device_id: str, user_id: str, body: LoginRequest, now):
 async def _append_refresh_token(
     session: AsyncSession, device_id: str, user_id: str, token: str, now
 ) -> None:
-    """追加一枚 refresh token 并修剪最老的超限行（INV-8）。
+    """追加一枚 refresh token 并顺手清理设备上的陈旧行（INV-8）。
 
     调用方已完成 device 行 upsert/加锁（锁序 device → refresh_tokens）。
-    修剪条件排除本行、只删「未过期未作废」里最新的 4 枚之外的最老行：
+    清理两类（threads6 P2）：
+    - **已过期**（expires_at <= now，无论是否作废）：留着对任何路径都
+      无意义——重放只会得到与「行不存在」等价的普通 401，却让表随时间
+      无限膨胀；
+    - **未过期未作废**里最新的 4 枚之外的最老行（原每设备上限修剪）。
+
+    **已作废但未过期**的行保留到过期为止：这正是重放检测的依据（轮换
+    掉的 token 在有效期内被重放要吊销整台设备）。修剪条件排除本行：
     本次返回的 token 一定保留；并发登录在 device 行锁上串行化，修剪不会
     误删别的已提交响应的 token。
     """
@@ -123,7 +130,15 @@ async def _append_refresh_token(
     )
     await session.execute(
         delete(RefreshToken)
-        .where(*live, RefreshToken.id.not_in(keep))
+        .where(
+            RefreshToken.device_id == device_id,
+            RefreshToken.id != row.id,
+            # 已过期一律删；未过期的只做每设备上限修剪（作废行留到过期）
+            or_(
+                RefreshToken.expires_at <= now,
+                and_(RefreshToken.revoked_at.is_(None), RefreshToken.id.not_in(keep)),
+            ),
+        )
         .execution_options(synchronize_session=False)
     )
 
