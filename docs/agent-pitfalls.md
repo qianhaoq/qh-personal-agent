@@ -2,7 +2,7 @@
 
 > **事实来源**：服务端不变量以 [docs/server-invariants.md](server-invariants.md) 为准（随 PR #2 落地；落地前以 #2 中 AGENTS.md「写代码」各条为准）。本文只收集“同一类问题被 Codex 反复提出”的模式、正反例和怎么被发现的，帮助后来的 agent 少走回头路。两者冲突时以 server-invariants.md 为准，并回来改本文。
 >
-> 机检是**低误报的启发式**（AST），只覆盖常见写法，不证明代码满足不变量；它漏掉的情况仍由评审和 PG 并发测试兜底。能机械检查的规则由 `scripts/check-invariants.py` 在 CI 的 `ci / Invariant Check (non-required)` 里执行；豁免写 `# invariant-ok[<规则id>]: <理由>`（不带规则 id 的 `# invariant-ok: <理由>` 只在该行恰好一条发现时生效），评审时要能说清理由。
+> 机检是 **best-effort 启发式**（AST），只覆盖常见写法，不证明代码满足不变量。漏检按 `P2: defer — heuristic checker; PG concurrency tests + human/Codex review are the backstop` Resolve；只有误报或 CI 坏了才算针对检查器的 P1。不要为补全覆盖面继续扩 AST。能机械检查的规则由 `scripts/check-invariants.py` 在 CI 的 `ci / Invariant Check (non-required)` 里执行；豁免写 `# invariant-ok[<规则id>]: <理由>`（不带规则 id 的 `# invariant-ok: <理由>` 只在该行恰好一条发现时生效），评审时要能说清理由。
 
 ## 统计（PR #2 共 5 轮 Codex + PR #3，2026-10-17）
 

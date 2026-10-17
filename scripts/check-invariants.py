@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 """Mechanical server-invariant checks (AST based, low false-positive).
 
+BEST-EFFORT HEURISTIC (gate policy, authorized by 专业研发): this script
+catches common, mechanically recognizable violations. It is NOT a proof that
+code satisfies the invariants. Completeness gaps (missed control-flow paths,
+aliases, dependency-injected path params, fakes built outside functions,
+comment-parsing edge cases, etc.) are NOT P0/P1 findings against this
+checker; resolve them as
+  P2: defer — heuristic checker; PG concurrency tests + human/Codex review are the backstop
+Only false positives that block legitimate code, or a broken CI job, count
+as P1 against the checker. Do not expand the AST rules just to chase coverage.
+
 Every rule traces to docs/server-invariants.md (source of truth, lands with
 PR #2) and is explained in docs/agent-pitfalls.md. Until that doc is on main
 the rule text lives in the AGENTS.md "写代码" bullets added by #2.

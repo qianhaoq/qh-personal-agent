@@ -50,6 +50,10 @@ Codex / 评审 bot 评审本仓 PR 时：
 - 并发相关改动没有 PG 并发测试，按 P1 报。
 - 豁免标记 `# invariant-ok:` 后面的理由站不住时，按违反不变量处理。
 
+### `scripts/check-invariants.py` 是 best-effort 启发式
+
+该检查器的目标是抓住高发、可机械识别的违规（见 docs/agent-pitfalls.md），**不是**形式化证明代码满足不变量。漏检（遗漏的控制流路径、别名、依赖注入的 path 参数、函数外构造假实现、注释解析边角情况等）**不算 P0/P1**，按 `P2: defer — heuristic checker; PG concurrency tests + human/Codex review are the backstop` Resolve。只有**误报**（把合法代码判错并挡住合并）或 CI job 本身坏了，才算针对检查器的 P1。不要为补全覆盖面继续扩 AST 检查。
+
 ## 交接
 
 - 工作交给下一个 bot 时，**单独私信**那个 bot，并标记**优先级**把它唤醒；不要只在群里 @ 或只留 PR 评论。消息里写清：仓库、PR 链接、head SHA、已完成什么、下一步要它做什么。
