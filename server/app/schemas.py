@@ -63,27 +63,43 @@ def _reject_invalid_unicode_everywhere(obj: object, depth: int = 0) -> None:
             _reject_invalid_unicode_everywhere(item, depth + 1)
 
 
+def utc_safe_datetime(value: datetime | None) -> datetime | None:
+    """把 datetime 安全换算成 UTC（threads6 P2 / INV-7；公开函数——请求体
+    校验与 LLM 输出解析共用，不允许各写一套边界）。aware 值换算、naive 值
+    视为 UTC，结果必须落在 [_NAIVE_DT_MIN, _NAIVE_DT_MAX]（按最坏 IANA
+    偏移 ±14h 预留）。换算溢出（year 1 / 9999 边界上的 astimezone）或
+    越界返回 None：schema 侧据此 422，抽取侧据此**丢弃该条提醒**而不是
+    上抛异常把笔记标 failed。"""
+    if value is None:
+        return None
+    try:
+        utc_value = (
+            value.astimezone(UTC) if value.tzinfo is not None else value.replace(tzinfo=UTC)
+        )
+    except (OverflowError, ValueError):
+        return None
+    if not _NAIVE_DT_MIN <= utc_value.replace(tzinfo=None) <= _NAIVE_DT_MAX:
+        return None
+    return utc_value
+
+
 def _check_datetime_representable(value: datetime | None) -> datetime | None:
     """时间字段必须能安全换算成 UTC（4c1c9be P2-4）。threads5 P2-4 起
     aware 与 naive 用**同一条**安全界：换算/视为 UTC 后的值必须落在
     [0001-01-02, 9998-12-31 23:59:59.999999]（按最坏 IANA 偏移 ±14h
     预留）。此前 aware 只试「能转成 UTC」——`9999-12-31T23:59:59Z` 能过
     schema，却在抽取/提醒解析按用户时区 `astimezone` 时 OverflowError →
-    note 被标 failed 而不是 422。"""
+    note 被标 failed 而不是 422。threads6 P2 起界判定统一走
+    utc_safe_datetime（LLM 输出侧复用，见 INV-7）。"""
     if value is None:
         return value
-    if value.tzinfo is not None:
-        try:
-            utc_value = value.astimezone(UTC).replace(tzinfo=None)
-        except (OverflowError, ValueError) as exc:
-            raise ValueError("带时区的时间换算成 UTC 后超出可表示范围") from exc
-        if not _NAIVE_DT_MIN <= utc_value <= _NAIVE_DT_MAX:
+    if utc_safe_datetime(value) is None:
+        if value.tzinfo is not None:
             raise ValueError(
                 f"带时区的时间换算成 UTC 后需在 {_NAIVE_DT_MIN.year}–"
                 f"{_NAIVE_DT_MAX.year} 年之间（与不带时区同一条安全界，"
                 "预留最坏 ±14h 时区偏移）"
             )
-    elif not _NAIVE_DT_MIN <= value <= _NAIVE_DT_MAX:
         raise ValueError(
             f"不带时区的时间需在 {_NAIVE_DT_MIN.year}–{_NAIVE_DT_MAX.year} 年之间"
             "（本地化成 UTC 后须仍可表示）"

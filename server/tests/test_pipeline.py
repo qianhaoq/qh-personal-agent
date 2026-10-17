@@ -428,6 +428,76 @@ async def test_past_or_broken_fire_at_discarded(client, user, monkeypatch, run_j
         ).scalars().all() == []
 
 
+async def test_llm_boundary_fire_at_overflow_discarded(client, user, monkeypatch, run_jobs):
+    """threads6 P2 / INV-7：LLM 输出的时间套用与请求体相同的 ±14h 安全界
+    （utc_safe_datetime）——`astimezone` 溢出或越界的 fire_at 只丢弃该条
+    suggested reminder，笔记照常 organized；正常未来时间保留。旧行为里
+    naive `9999-12-31T23:59:59`（配 America/New_York）会在换 UTC 时
+    OverflowError 上抛，耗尽重试把整条笔记标 failed。"""
+    from zoneinfo import ZoneInfo
+
+    from app.db import get_sessionmaker
+    from app.schemas import utc_safe_datetime
+
+    # 界判定函数本身：溢出 / 越界 / 正常
+    assert utc_safe_datetime(datetime(9999, 12, 31, 23, 59, 59, tzinfo=ZoneInfo("America/New_York"))) is None
+    assert utc_safe_datetime(datetime(9999, 12, 31, 23, 59, 59, tzinfo=UTC)) is None
+    assert utc_safe_datetime(datetime(1, 1, 1, tzinfo=UTC)) is None
+    assert utc_safe_datetime(datetime(2027, 1, 1, 9, 0, tzinfo=UTC)) == datetime(
+        2027, 1, 1, 9, 0, tzinfo=UTC
+    )
+
+    _freeze_now(monkeypatch, datetime(2026, 10, 16, 20, 0, tzinfo=UTC))
+
+    class BoundaryLLM:
+        async def chat(self, messages, response_format=None):
+            return json.dumps(
+                {
+                    "title": "t",
+                    "tags": [],
+                    "todos": [],
+                    "suggested_reminders": [
+                        # aware 越上界（> 9998-12-31 预留界）
+                        {"title": "上界外", "fire_at": "9999-12-31T23:59:59+00:00"},
+                        # naive + 用户时区 America/New_York：换 UTC 必溢出
+                        {"title": "换算溢出", "fire_at": "9999-12-31T23:59:59"},
+                        # aware 越下界（< 0001-01-02 预留界）
+                        {"title": "下界外", "fire_at": "0001-01-01T00:00:00+00:00"},
+                        # 正常未来时间：必须保留
+                        {"title": "正常提醒", "fire_at": "2027-01-01T09:00:00+00:00"},
+                    ],
+                },
+                ensure_ascii=False,
+            )
+
+    async def fake_get_llm():
+        return BoundaryLLM()
+
+    monkeypatch.setattr("app.pipeline.extract.get_llm_client", fake_get_llm)
+    r = await client.post(
+        "/v1/notes",
+        json={
+            "client_note_id": str(uuid.uuid4()),
+            "text": "随口一提",
+            "recorded_at": "2026-10-16T08:00:00+00:00",
+            "timezone": "America/New_York",
+        },
+        headers=auth_headers(user),
+    )
+    note_id = r.json()["note_id"]
+    await run_jobs()
+
+    async with get_sessionmaker()() as session:
+        note = await session.get(Note, note_id)
+        # 界外时间只能丢提醒，不能丢笔记
+        assert note.status == "organized", "换算溢出必须丢弃提醒而不是把笔记标 failed"
+        reminders = (
+            await session.execute(select(Reminder).where(Reminder.note_id == note_id))
+        ).scalars().all()
+        assert [r_.title for r_ in reminders] == ["正常提醒"]
+        assert to_iso(reminders[0].fire_at) == "2027-01-01T09:00:00+00:00"
+
+
 async def test_fire_at_before_server_now_discarded(client, user, monkeypatch, run_jobs):
     """按 recorded_at 推算的提醒可能落在服务器当前时间之前（旧录音补抽取时
     “明天”是录音那天的明天）。早于 now 的 fire_at 不生成建议提醒；

@@ -38,6 +38,7 @@ from app.db import get_sessionmaker
 from app.jobs.queue import enqueue, is_postgres
 from app.llm.base import EXTRACTION_SCHEMA, get_llm_client
 from app.models import Note, Reminder
+from app.schemas import utc_safe_datetime
 from app.timeutil import as_utc, utcnow
 
 # 去口头禅
@@ -261,7 +262,13 @@ async def _apply_extraction(
 
 
 def _parse_fire_at(value, tzname: str):
-    """校验 LLM 输出的时间；naive 值按用户时区解释，统一转 UTC 存储。"""
+    """校验 LLM 输出的时间；naive 值按用户时区解释，统一转 UTC 存储。
+
+    threads6 P2 / INV-7：换算成 UTC 后还要过 schemas 的同一条 ±14h 安全界
+    （utc_safe_datetime）——`astimezone` 溢出（naive 9999-12-31 配
+    America/New_York 这类「语法合法、换算必炸」）或越界的值返回 None，
+    该条 suggested reminder 被丢弃，而不是异常上抛耗尽重试把笔记标
+    failed。"""
     if not value:
         return None
     try:
@@ -274,4 +281,4 @@ def _parse_fire_at(value, tzname: str):
         except (ZoneInfoNotFoundError, ValueError):
             # 未知时区名：退回默认时区而不是丢弃提醒
             dt = dt.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
-    return as_utc(dt)
+    return utc_safe_datetime(dt)
