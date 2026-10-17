@@ -100,7 +100,7 @@ docker compose exec api python -m app.cli create-invite
 本机没有 Docker，因此测试跑在 `sqlite+aiosqlite` 上，没有起真实 PostgreSQL 容器。由此带来的**未覆盖差异**：
 
 - **默认只跑 SQLite 分支，PG 分支需显式指定数据库**。设置 `TEST_DATABASE_URL=postgresql+asyncpg://...` 后同一套测试在真实 PG 上再跑一遍，覆盖 PG 专属路径（`app/jobs/queue.py` 的 `FOR UPDATE SKIP LOCKED` 领取/回收、`app/api/sync.py` 的 REPEATABLE READ 一致快照与序列行锁提交顺序，见 `tests/test_sync.py` 里仅 PG 运行的测试）。日常开发不装 PG 时，这些 PG 分支只有代码审查。
-- **pgvector / mem0 后端未连真实库验证**。测试全部使用 `InMemoryStore`；`Mem0Store`（pgvector + OpenAI 兼容 embedding）有按 mem0ai 2.2.1 签名建模的 fake client 行为对齐测试（`tests/test_mem0_store.py`，本机不装 mem0ai），但未连真实 pgvector 验证。embedding 选型本身也是待决策项（见 tech-arch 第 13 节）。
+- **pgvector / mem0 后端已连真实库验证（threads6 起，部分）**。`tests/test_mem0_integration.py` 在真实 mem0ai 2.2.1 + pgvector + 确定性本地 embedder（crc32 token 哈希，无外部 API）上验证了：构造配置可被 mem0 接受（llm/embedder 配置键 `openai_base_url`、psycopg 驱动）、user/note 过滤下推不串数据、小页上限下「边取边删」穷尽循环。该文件需要独立 venv（`requirements.txt + requirements-mem0.txt`，mem0ai 与 psycopg 都不在常规测试依赖里）与 `TEST_DATABASE_URL` 指向装了 vector 扩展的 PostgreSQL，常规环境按原因跳过。**仍未验证**：mem0 infer 抽取主路径（内部会调真实 LLM，测试用 `infer=False` 绕过）与真实 embedding 供应商选型（待决策项，见 tech-arch 第 13 节）；fake client 行为对齐测试仍在 `tests/test_mem0_store.py`。
 - SQLite 方言存 datetime 不保留时区偏移（值统一为 UTC 墙钟），`app/timeutil.py` 做了归一，但 PG 下 timestamptz 的行为仍建议上线前冒烟一遍。
 
 ## 已知限制（S1 骨架范围内）

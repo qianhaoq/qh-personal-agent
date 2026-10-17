@@ -299,8 +299,11 @@ mem0 版本钉死：`server/requirements-mem0.txt` 写 `mem0ai==2.2.1`（4c1c9be
 3. **`MEMORY_BACKEND=mem0` ⇒ mem0ai 必须已安装**（threads5 P2-3：`importlib.util.find_spec("mem0")` 探测，失败即启动报错并提示 `pip install -r requirements-mem0.txt`——记忆 store 是懒构造，不查的话 api 照常起、首个 `/search` 才 500，`memory_sync` job 全部 ModuleNotFoundError）。任何环境生效。
 4. **inmemory 只属于单进程**：进程内状态跨 api/worker 两进程互不可见。生产（postgresql）+ inmemory 默认拒绝启动；仅单进程跑 PG 测试套件可设 `ALLOW_INMEMORY_IN_TESTS=true` 放行（原 `ALLOW_INMEMORY_IN_PROD` 改名：名字带 IN_PROD 误导部署者以为生产可开；**worker 进程无论该标志都拒绝 inmemory+PG**，`app/jobs/worker.py::check_memory_backend_shareable`）；SQLite 本地开发允许 inmemory，但 `.env.example` 与 README 写明其单进程局限（worker 写的记忆对 api 进程的 /search 不可见，完整链路用 compose/mem0）。`.env.example` 的本地默认值因此是 `inmemory`，mem0 行注释给出（未安装时启动即报第 3 条的错）。
 5. **`MEM0_EMBEDDING_API_KEY`（未设回退 `LLM_API_KEY`）**（threads6 P2）：mem0 的 embedding 可以与聊天 LLM 不同源（如 LLM 用 DeepSeek、embedding 用 OpenAI）——`MEM0_EMBEDDING_BASE_URL` 指向别的供应商时，embedding 端点的凭证不能想当然复用 `LLM_API_KEY`。取值顺序：`MEM0_EMBEDDING_API_KEY` → 未设则 `LLM_API_KEY`（同源部署零配置）。**启动校验**：设置了 `MEM0_EMBEDDING_BASE_URL` 或 `MEM0_EMBEDDING_API_KEY`（即显式自定义了 embedding 配置）而按上述顺序解析出的 key 为空时，启动即 ValueError——否则应用能正常启动，但 mem0 的每次 add/search 都在 embedding 端点上鉴权失败，memory_sync job 全部耗尽重试（问题被掩盖到队列里）。
+6. **mem0 2.2.1 适配层的两个实测事实**（threads6 集成验证，fake client 测不出——`from_config` 收任意 dict、不碰真实工厂）：
+   - llm/embedder 的 OpenAI 兼容配置键是 **`openai_base_url`**：`BaseLlmConfig`/`BaseEmbedderConfig` 都不收 `base_url`，传错键第一次构造 store 就 TypeError（`test_mem0_config_keys_match_real_backend` 把键名钉住）。
+   - mem0ai **不依赖任何 PostgreSQL 驱动**：pgvector 后端运行期才 `import psycopg`（缺了回落 psycopg2，再缺 ImportError）——`requirements-mem0.txt` 显式带 `psycopg[binary,pool]`，否则只装 mem0ai 的生产镜像第一次构造 store 就 ImportError。
 
-**保证代码**：`app/config.py`（`_require_complete_openai_config`、`_validate_default_timezone`、`_require_memory_backend_installed`、`_reject_inmemory_memory_backend_in_production`、`_require_embedding_key_when_customized`）、`app/memory/mem0_store.py`（embedder `api_key` 用回退链）、`app/jobs/worker.py::check_memory_backend_shareable`、`server/.env.example`、`server/README.md`。
+**保证代码**：`app/config.py`（`_require_complete_openai_config`、`_validate_default_timezone`、`_require_memory_backend_installed`、`_reject_inmemory_memory_backend_in_production`、`_require_embedding_key_when_customized`）、`app/memory/mem0_store.py`（embedder `api_key` 用回退链；llm/embedder 配置键 `openai_base_url`）、`requirements-mem0.txt`（psycopg 驱动）、`app/jobs/worker.py::check_memory_backend_shareable`、`server/.env.example`、`server/README.md`。
 
 **验证测试**：
 - `test_openai_missing_base_url_rejected` / `test_openai_missing_model_rejected` / `test_openai_missing_api_key_rejected`（已有 key 用例扩展）
@@ -308,9 +311,11 @@ mem0 版本钉死：`server/requirements-mem0.txt` 写 `mem0ai==2.2.1`（4c1c9be
 - `test_default_timezone_invalid_rejected`（如 `Asia/Bejing`）/ `test_default_timezone_valid_ok`
 - `test_mem0_backend_missing_mem0ai_rejected_at_startup`（threads5 P2-3：错误信息含安装命令）
 - `test_mem0_embedding_api_key_falls_back_to_llm_key`（threads6 P2 / INV-10.5：设了 `MEM0_EMBEDDING_API_KEY` 用它，未设回退 `LLM_API_KEY`——用捕获 config 的假 mem0 断言传给 embedder 的 key）
+- `test_mem0_config_keys_match_real_backend`（threads6 集成实测：mem0 2.2.1 的配置键是 `openai_base_url`，传 `base_url` 构造即 TypeError——fake 测不出，键名钉死防回退）
 - `test_mem0_embedding_custom_config_without_key_rejected`（threads6 P2：自定义了 embedding 配置而无任何可用 key → 启动 ValueError）
 - `test_worker_refuses_inmemory_with_postgres`（worker 启动检查，无视放行标志）
 - `test_env_example_local_default_inmemory_documents_mem0`（模板本地默认 inmemory、mem0 行与安装说明齐全）
+- `test_mem0_constructs_and_scopes_user_and_note` / `test_mem0_delete_by_note_paginates_past_page_cap`（threads6 真实集成：真 mem0ai 2.2.1 + pgvector + 确定性本地 embedder——user/note 过滤下推、小页上限下的穷尽删除；常规环境按原因跳过，运行方式见 `tests/test_mem0_integration.py` 模块 docstring）
 
 ### INV-11 API 写入的乐观锁与 rev 语义（threads6 P1-2）
 

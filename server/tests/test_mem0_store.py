@@ -330,3 +330,14 @@ def test_mem0_embedding_api_key_falls_back_to_llm_key(fake_mem0, monkeypatch):
     last = fake_mem0.Memory.last_config
     assert last["embedder"]["config"]["api_key"] == "sk-embed", "独立凭据优先"
     assert last["llm"]["config"]["api_key"] == "sk-llm", "LLM 部分不受 embedding 配置影响"
+
+
+def test_mem0_config_keys_match_real_backend(fake_mem0):
+    """集成实测（threads6）：mem0 2.2.1 的 OpenAI 兼容配置键是
+    **openai_base_url**——llm/embedder 配置传 base_url 会在构造时直接
+    TypeError（BaseLlmConfig/BaseEmbedderConfig 都不收这个键），而 fake 的
+    from_config 收任意 dict 测不出来。这里把键名钉住防回退。"""
+    _make_store(fake_mem0)
+    config = fake_mem0.Memory.last_config
+    assert config["llm"]["config"].keys() == {"openai_base_url", "api_key", "model"}
+    assert config["embedder"]["config"].keys() == {"openai_base_url", "api_key", "model"}

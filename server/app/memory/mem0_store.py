@@ -77,7 +77,10 @@ class Mem0Store:
             "llm": {
                 "provider": "openai",
                 "config": {
-                    "base_url": settings.llm_base_url,
+                    # mem0 2.2.1 的配置键是 openai_base_url（BaseLlmConfig/
+                    # OpenAIConfig 不收 base_url——集成测试实测：传 base_url
+                    # 构造直接 TypeError，fake 测不出来）
+                    "openai_base_url": settings.llm_base_url,
                     "api_key": settings.llm_api_key,
                     "model": settings.llm_model,
                 },
@@ -85,7 +88,8 @@ class Mem0Store:
             "embedder": {
                 "provider": "openai",
                 "config": {
-                    "base_url": settings.mem0_embedding_base_url or settings.llm_base_url,
+                    "openai_base_url": settings.mem0_embedding_base_url
+                    or settings.llm_base_url,
                     # INV-10.5（threads6 P2）：独立凭据缺省回落 LLM key——
                     # 自定义 embedding 源却拿 LLM 的 key 打过去，运行期必 401
                     "api_key": settings.mem0_embedding_api_key or settings.llm_api_key,
