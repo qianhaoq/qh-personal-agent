@@ -12,12 +12,14 @@ Source of truth: docs/server-invariants.md (lands with PR #2; its rules win).
 Rationale and examples: docs/agent-pitfalls.md.
 
 Rules (checker id -> docs/server-invariants.md id):
-  INV-SEQ-LAST     [INV-1 锁顺序] In the transaction that calls allocate_seq(sess), no DB write
+  INV-SEQ-LAST     [INV-1 锁顺序] ERROR only for allocate_seq evaluated inside
+                   update(...).values() that also writes business columns.
+                   WARNING (never fails CI; source-order heuristic, no control-flow
+                   analysis): in the transaction that calls allocate_seq(sess), no DB write
                    on that same session after it: sess.add/add_all/merge/delete/
                    execute(...) (except an UPDATE that only sets change_seq/
                    updated_at), or enqueue(sess, ...). Scope ends at sess.commit()/
                    rollback() or the end of the enclosing `with ... begin()` block.
-                   Also: allocate_seq evaluated inside .values() that writes other columns.
   INV-NUL          [INV-7 外部输入硬化] FastAPI path params typed as bare str (str, str | None,
                    Optional[str], Annotated[str, ...] without a NUL-safe constraint). Only the
                    decorator path is read (router prefixes are not resolved).
@@ -62,10 +64,12 @@ class Finding:
     line: int
     rule: str
     msg: str
+    warning: bool = False
 
     def __str__(self) -> str:
         inv = SOURCE_INV[self.rule]
-        return (f"{self.path}:{self.line}: error [{self.rule} / {inv}] {self.msg} "
+        kind = "warning" if self.warning else "error"
+        return (f"{self.path}:{self.line}: {kind} [{self.rule} / {inv}] {self.msg} "
                 f"(docs/server-invariants.md {inv}; docs/agent-pitfalls.md#{self.rule.lower()})")
 
 
@@ -189,7 +193,8 @@ def check_seq_last(tree, path, parents) -> list[Finding]:
             for p in _ancestors(seq, parents):
                 if p is fn:
                     break
-                if isinstance(p, ast.Call) and _name(p.func) == "values":
+                if isinstance(p, ast.Call) and _name(p.func) == "values" and isinstance(p.func, ast.Attribute) \
+                        and any(isinstance(n, ast.Call) and _name(n.func) == "update" for n in ast.walk(p.func.value)):
                     extra = sorted({k.arg for k in p.keywords if k.arg} - SEQ_COLUMNS)
                     if extra:
                         out.append(Finding(path, seq.lineno, "INV-SEQ-LAST",
@@ -217,7 +222,7 @@ def check_seq_last(tree, path, parents) -> list[Finding]:
                 if bad:
                     out.append(Finding(path, c.lineno, "INV-SEQ-LAST",
                         f"{bad} after {SEQ_FUNC}() (line {seq.lineno}) in the same transaction: flush business rows and "
-                        "jobs first, call allocate_seq last, then only write change_seq"))
+                        "jobs first, call allocate_seq last, then only write change_seq", warning=True))
     return out
 
 
@@ -371,8 +376,10 @@ def main(argv: list[str]) -> int:
             print(f"{rel}: warning: skipped ({type(e).__name__}: {e})")
     for x in findings:
         print(x)
-    print(f"check-invariants: {len(findings)} error(s), {warnings} warning(s)")
-    return 1 if findings else 0
+    errors = [x for x in findings if not x.warning]
+    warnings += len(findings) - len(errors)
+    print(f"check-invariants: {len(errors)} error(s), {warnings} warning(s)")
+    return 1 if errors else 0
 
 
 if __name__ == "__main__":

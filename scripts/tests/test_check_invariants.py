@@ -22,7 +22,26 @@ def rules(src):
     return [(f.rule, f.line) for f in ci.check_source(textwrap.dedent(src), "server/app/x.py")]
 
 
+def errors(src):
+    return [(f.rule, f.line) for f in ci.check_source(textwrap.dedent(src), "server/app/x.py") if not f.warning]
+
+
 class SeqLast(unittest.TestCase):
+    def test_enqueue_after_allocate_is_warning_only(self):
+        src = """
+        async def create(session):
+            note.change_seq = await allocate_seq(session)
+            await enqueue(session, "organize_note", {})
+        """
+        self.assertEqual(rules(src), [("INV-SEQ-LAST", 4)])
+        self.assertEqual(errors(src), [])
+
+    def test_values_on_non_update_builder_ok(self):
+        self.assertEqual(rules("""
+        async def f(session):
+            payload.values(text=t, change_seq=await allocate_seq(session))
+        """), [])
+
     def test_enqueue_after_allocate_flagged(self):
         self.assertEqual(rules("""
         async def create(session):

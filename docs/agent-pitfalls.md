@@ -109,7 +109,9 @@ seq = await allocate_seq(s)
 await s.execute(update(Note).where(Note.id == nid).values(change_seq=seq))
 ```
 
-机检 `INV-SEQ-LAST`：在调用 `allocate_seq(sess)` 的同一事务里，之后出现同一 session 的 `sess.add/add_all/merge/delete/execute(…)`（只写 change_seq/updated_at 的 UPDATE 除外）或 `enqueue(sess, …)`。遇到 `sess.commit()/rollback()` 或离开 `with … begin()` 块就停止检查。其他对象上的方法（`set.add`、`store.delete`）不算。
+机检 `INV-SEQ-LAST`：
+- **错误**：`allocate_seq` 嵌在 `update(...).values()` 里，且这个 `.values()` 还写了其他业务列。
+- **警告**（不让 CI 失败，只按源码顺序判断，不做控制流分析）：在调用 `allocate_seq(sess)` 的同一事务里，之后又出现同一 session 的 `sess.add/add_all/merge/delete/execute(DML)`（只写 change_seq/updated_at 的 UPDATE 除外）或 `enqueue(sess, …)`。遇到 `sess.commit()/rollback()` 或离开 `with … begin()` 块就停止检查。
 
 ## 8. sync：单快照 + 前缀 cursor（依赖 INV-1；无单独 INV） <a id="sync"></a>
 
