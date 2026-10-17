@@ -1,13 +1,14 @@
 """管理 CLI：python -m app.cli <command>。
 
 用法：
+    python -m app.cli init-db                # 一次性建表（PG 咨询锁串行化）
     python -m app.cli create-invite [--uses N] [--expires-hours H]
 """
 import argparse
 import asyncio
 import secrets
 
-from app.db import create_all
+from app.db import init_db, startup_create_all
 from app.models import InviteCode
 from app.timeutil import utcnow
 
@@ -15,7 +16,8 @@ from app.timeutil import utcnow
 async def create_invite(uses: int, expires_hours: float | None) -> None:
     from app.db import get_sessionmaker
 
-    await create_all()
+    # PG 下不在此建表（init-db 的职责），表缺失时快速失败
+    await startup_create_all()
     code = secrets.token_hex(8)
     from datetime import timedelta
 
@@ -31,12 +33,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="app.cli")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    sub.add_parser("init-db", help="一次性建表（PG 在事务内 pg_advisory_xact_lock 串行化）")
+
     p_invite = sub.add_parser("create-invite", help="创建邀请码")
     p_invite.add_argument("--uses", type=int, default=1, help="可注册账号数")
     p_invite.add_argument("--expires-hours", type=float, default=None, help="有效时长（小时）")
 
     args = parser.parse_args()
-    if args.command == "create-invite":
+    if args.command == "init-db":
+        asyncio.run(init_db())
+        print("database schema ready")
+    elif args.command == "create-invite":
         asyncio.run(create_invite(args.uses, args.expires_hours))
 
 

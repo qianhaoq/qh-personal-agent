@@ -15,6 +15,18 @@ services:
       api:
         condition: service_healthy
 
+  # one-shot 建表（INV-9）：PG 下 init-db 在事务内 pg_advisory_xact_lock
+  # 串行化，api/worker 等 migrate 成功退出后才启动（各自不再 create_all）
+  migrate:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://personal:${POSTGRES_PASSWORD}@postgres:5432/personal_agent
+    command: python -m app.cli init-db
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   api:
     build: .
     restart: unless-stopped
@@ -33,6 +45,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
   worker:
     build: .
@@ -46,6 +60,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
   postgres:
     image: pgvector/pgvector:pg16

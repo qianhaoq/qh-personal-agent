@@ -6,7 +6,7 @@ from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.config import get_settings
-from app.db import create_all, dispose_engine
+from app.db import dispose_engine, startup_create_all
 from app.errors import (
     ApiError,
     api_error_handler,
@@ -14,11 +14,15 @@ from app.errors import (
     unhandled_exception_handler,
     validation_exception_handler,
 )
+from app.middleware import NulRejectMiddleware
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await create_all()  # S1 启动时建表，后续换 Alembic（见 README）
+    # PG 下不在启动时建表（多进程并发 create_all 会撞 DDL，见 INV-9）：
+    # 先跑 python -m app.cli init-db；表缺失时首个查询快速失败，暴露
+    # 部署错误。SQLite（本地开发/测试）保留启动建表
+    await startup_create_all()
     yield
     await dispose_engine()
 
@@ -47,6 +51,9 @@ def create_app() -> FastAPI:
     app.add_exception_handler(StarletteHTTPException, http_exception_handler)
     app.add_exception_handler(RequestValidationError, validation_exception_handler)
     app.add_exception_handler(Exception, unhandled_exception_handler)
+
+    # NUL 拒绝中间件（INV-7）：path/query 解码后含 \x00 → 422，不进路由
+    app.add_middleware(NulRejectMiddleware)
 
     if settings.cors_allow_origins:
         from fastapi.middleware.cors import CORSMiddleware

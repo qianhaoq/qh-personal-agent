@@ -4,6 +4,7 @@ import binascii
 import string
 from functools import lru_cache
 from typing import Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -156,25 +157,55 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def _require_complete_openai_config(self) -> "Settings":
+        """INV-10.1（修 C3，任何环境）：LLM_PROVIDER=openai 时
+        LLM_API_KEY / LLM_BASE_URL / LLM_MODEL 三者必须齐备——缺任何一项
+        启动即 ValueError，而不是运行期拼出相对 /chat/completions URL 或
+        空 model，让每次 extract/ask 都失败。"""
+        if self.llm_provider != "openai":
+            return self
+        missing = [
+            name
+            for name, value in (
+                ("LLM_API_KEY", self.llm_api_key),
+                ("LLM_BASE_URL", self.llm_base_url),
+                ("LLM_MODEL", self.llm_model),
+            )
+            if not value
+        ]
+        if missing:
+            raise ValueError(
+                "LLM_PROVIDER=openai 必须同时设置 " + "、".join(missing) + "（缺任一项启动即失败，不会静默回落）"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_default_timezone(self) -> "Settings":
+        """INV-10.2（修 C7，任何环境）：DEFAULT_TIMEZONE 必须是合法 IANA
+        时区名。请求省略 timezone 时该值会落到每条新笔记上，拼错的名字
+        会让 naive recorded_at 静默按 UTC 解释、提醒解析回退别的时区。"""
+        try:
+            ZoneInfo(self.default_timezone)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(
+                f"DEFAULT_TIMEZONE 必须是合法 IANA 时区名：{self.default_timezone}"
+            ) from exc
+        return self
+
+    @model_validator(mode="after")
     def _reject_misconfigured_llm_in_production(self) -> "Settings":
         """P2：生产（postgresql）下 LLM 配置错误必须启动报错，而不是静默
         回落 MockLLM（整理/问答全变假实现，问题被掩盖到用户侧）。
 
-        - LLM_PROVIDER=openai 但缺 LLM_API_KEY：拒绝（get_llm_client 也
-          不会再静默回落）；
         - LLM_PROVIDER=mock：拒绝（假实现），仅跑 PG 测试套件的 CI/本地
           环境可设 ALLOW_MOCK_LLM_IN_PROD=true 放行。
+        - openai 缺 key/base_url/model 的拒绝在任何环境生效
+          （_require_complete_openai_config）。
         provider 拼错由 Literal 校验直接报错（任何环境）。
         """
         if not self.database_url.startswith("postgresql"):
             return self
-        if self.llm_provider == "openai":
-            if not self.llm_api_key:
-                raise ValueError(
-                    "生产环境（DATABASE_URL 以 postgresql 开头）"
-                    "LLM_PROVIDER=openai 必须设置 LLM_API_KEY：缺 key 不会静默回落 MockLLM"
-                )
-        elif self.llm_provider == "mock" and not self.allow_mock_llm_in_prod:
+        if self.llm_provider == "mock" and not self.allow_mock_llm_in_prod:
             raise ValueError(
                 "生产环境（DATABASE_URL 以 postgresql 开头）不允许 LLM_PROVIDER=mock"
                 "（整理/问答会是确定性假实现）：请配置 openai。"

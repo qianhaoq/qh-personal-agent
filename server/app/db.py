@@ -1,4 +1,5 @@
 """SQLAlchemy 2 async 引擎与会话。"""
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
@@ -39,6 +40,39 @@ async def create_all() -> None:
     engine = get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+
+# init-db 的并发互斥键（任意固定 bigint，只属于本服务）
+_INIT_DB_ADVISORY_KEY = 918273645070
+
+
+async def init_db() -> None:
+    """一次性建表：python -m app.cli init-db（INV-9，修 C6）。
+
+    PG 下在单个事务内先 pg_advisory_xact_lock 再 create_all：DDL 事务性 +
+    咨询锁，多进程/并发执行安全且串行化（api/worker 启动时不再各自建表，
+    docker-compose 由 one-shot migrate 服务先跑本命令）。SQLite 直接
+    create_all（单文件库无并发部署场景）。
+    """
+    from app import models  # noqa: F401 确保模型已注册
+
+    engine = get_engine()
+    if get_settings().database_url.startswith("postgresql"):
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("SELECT pg_advisory_xact_lock(:key)"), {"key": _INIT_DB_ADVISORY_KEY}
+            )
+            await conn.run_sync(Base.metadata.create_all)
+        return
+    await create_all()
+
+
+async def startup_create_all() -> None:
+    """api/worker 启动路径：SQLite（本地开发/测试）建表；PG 必须先跑
+    init-db（表缺失时让首个查询快速失败，暴露部署错误），这里不建表。"""
+    if get_settings().database_url.startswith("postgresql"):
+        return
+    await create_all()
 
 
 async def dispose_engine() -> None:
