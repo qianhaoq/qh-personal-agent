@@ -109,6 +109,31 @@ def _only_seq_update(call: ast.Call) -> bool:
     return False
 
 
+def _is_dml(call: ast.Call) -> bool:
+    """execute(update/insert/delete(...)) — SELECTs and other reads are not writes."""
+    return any(isinstance(n, ast.Call) and _name(n.func) in {"update", "insert", "delete"} for n in ast.walk(call))
+
+
+def _exclusive(a, b, parents) -> bool:
+    """a and b sit in different arms (body / orelse) of the same if."""
+    anc_b = {id(x): x for x in _ancestors(b, parents)}
+    child = a
+    for p in _ancestors(a, parents):
+        if id(p) in anc_b:
+            if not isinstance(p, ast.If):
+                return False
+            cb = b
+            for x in _ancestors(b, parents):
+                if x is p:
+                    break
+                cb = x
+            in_body = lambda n: n in p.body
+            in_else = lambda n: n in p.orelse
+            return (in_body(child) and in_else(cb)) or (in_else(child) and in_body(cb))
+        child = p
+    return False
+
+
 def check_seq_last(tree, path, parents) -> list[Finding]:
     out = []
     for fn in ast.walk(tree):
@@ -121,7 +146,7 @@ def check_seq_last(tree, path, parents) -> list[Finding]:
             key=_pos,
         )
         for seq in (c for c in calls if _name(c.func) == SEQ_FUNC):
-            sess = _name(seq.args[0]) if seq.args else None
+            sess = seq.args[0].id if seq.args and isinstance(seq.args[0], ast.Name) else None
             if sess not in sessions:
                 continue
             # allocate_seq nested in a .values() that writes business columns
@@ -142,14 +167,16 @@ def check_seq_last(tree, path, parents) -> list[Finding]:
                 if txn is not None and txn not in _ancestors(c, parents):
                     break  # left the transaction block
                 f = c.func
-                recv = _name(f.value) if isinstance(f, ast.Attribute) else None
+                recv = f.value.id if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) else None
                 if recv == sess and f.attr in TXN_END:
                     break
                 bad = None
+                if _exclusive(c, seq, parents):
+                    continue
                 if recv == sess and f.attr in SESSION_WRITES:
-                    if not (f.attr == "execute" and _only_seq_update(c)):
+                    if f.attr != "execute" or (_is_dml(c) and not _only_seq_update(c)):
                         bad = f"{sess}.{f.attr}()"
-                elif isinstance(f, ast.Name) and f.id.startswith("enqueue") and any(_name(a) == sess for a in c.args):
+                elif isinstance(f, ast.Name) and f.id.startswith("enqueue") and any(isinstance(a, ast.Name) and a.id == sess for a in c.args):
                     bad = f"{f.id}({sess}, ...)"
                 if bad:
                     out.append(Finding(path, c.lineno, "INV-SEQ-LAST",
@@ -214,7 +241,12 @@ def check_nul(tree, path, parents) -> list[Finding]:
                     name, _, conv = m.partition(":")
                     if conv in {"", "str", "path"}:
                         params.add(name)
+        pos = fn.args.args
+        defaults = dict(zip([a.arg for a in pos[len(pos) - len(fn.args.defaults):]], fn.args.defaults))
+        defaults.update({a.arg: d for a, d in zip(fn.args.kwonlyargs, fn.args.kw_defaults) if d is not None})
         for a in fn.args.args + fn.args.kwonlyargs:
+            if a.arg in defaults and _nul_safe_meta([defaults[a.arg]]):
+                continue  # note_id: str = Path(pattern=...)
             if a.arg in params and _bare_str(a.annotation):
                 out.append(Finding(path, a.lineno, "INV-NUL",
                     f"path parameter '{a.arg}' of {fn.name}() is a bare str: use NoNulStr (or a Path pattern) so %00 is a 422, not a PG 500"))
@@ -230,6 +262,8 @@ def _implicit_test(t) -> bool:
         if isinstance(t.ops[0], (ast.Is, ast.Eq)) and isinstance(r, ast.Constant) and r.value in (None, ""):
             return True
     if isinstance(t, ast.BoolOp):
+        if isinstance(t.op, ast.And):  # an explicit selector term keeps the whole branch explicit
+            return all(_implicit_test(v) for v in t.values)
         return any(_implicit_test(v) for v in t.values)
     return False
 

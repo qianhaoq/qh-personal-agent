@@ -63,6 +63,21 @@ class SeqLast(unittest.TestCase):
                 await enqueue(s2, "sync", {})
         """), [])
 
+    def test_codex_round_false_positives_ok(self):
+        self.assertEqual(rules("""
+        async def a(session):
+            seq = await allocate_seq(session)
+            await session.execute(select(Note.id))
+        async def b(session, flag):
+            if flag:
+                seq = await allocate_seq(session)
+            else:
+                session.add(row)
+        async def c(self, other):
+            seq = await allocate_seq(self.session)
+            other.session.add(audit)
+        """), [])
+
     def test_scope_ends_with_begin_block(self):
         self.assertEqual(rules("""
         async def f(maker):
@@ -100,6 +115,8 @@ class Nul(unittest.TestCase):
             d,
             e: int,
         ): ...
+        @router.get("/{f}")
+        async def h(f: str = Path(pattern=r"^nte_[0-9a-f]{16}$")): ...
         """), [])
 
     def test_router_prefix(self):
@@ -144,6 +161,10 @@ class Fallback(unittest.TestCase):
                     raise ValueError(s.backend)
         def c(s):
             return InMemoryRateLimiter(s.rate)
+        def d(s):
+            if s.provider == "mock" and s.mock_seed is None:
+                return MockLLM()
+            raise ValueError(s.provider)
         """), [])
 
 
