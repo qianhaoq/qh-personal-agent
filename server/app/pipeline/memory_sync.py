@@ -115,13 +115,15 @@ async def sync_note_memory(
         # 在换主执行完成之后才落地，把新持有者写的记忆删掉且再无后继任务
         # ——「删己 id」对账不了这部分损害，唯一可靠的兜底是让队列再收敛
         # 一次（ON CONFLICT DO NOTHING 与已有 pending 去重；迟到执行不得
-        # 置位/写 note，但允许留下这一个 INSERT，见 INV-6）
-        if added:
-            await store.delete(user_id, [m.id for m in added])
-        async with maker() as session, session.begin():
-            await enqueue(
-                session, "memory_sync", {"note_id": note_id}, note_id=note_id, dedupe_pending=True
-            )
+        # 置位/写 note，但允许留下这一个 INSERT，见 INV-6）。
+        # 删己 id 与补偿入队必须 try/finally（threads7 P1 / INV-5）：本执行
+        # 租约已丢、收尾会被 finalize_claim 放弃，清理抛异常再吞掉入队就
+        # 再无任何收敛途径——异常照常上抛，入队绝不缺席
+        try:
+            if added:
+                await store.delete(user_id, [m.id for m in added])
+        finally:
+            await _compensating_requeue(maker, note_id)
         return
 
     if unchanged:
@@ -130,9 +132,22 @@ async def sync_note_memory(
         return
 
     # 状态已变：只删本次 add 产生的 memory id（修 C9），再入队（pending
-    # 去重合并），由下一个任务按新状态收敛；本 job 仍算 done
-    if added:
-        await store.delete(user_id, [m.id for m in added])
+    # 去重合并），由下一个任务按新状态收敛；本 job 仍算 done。同丢租约
+    # 路径：删己 id 抛异常也必须留下后继任务（threads7 P1 / INV-5），
+    # 异常上抛由 runner 记录错误并按租约收尾（重试或让位给 pending）
+    try:
+        if added:
+            await store.delete(user_id, [m.id for m in added])
+    finally:
+        await _compensating_requeue(maker, note_id)
+
+
+async def _compensating_requeue(
+    maker: async_sessionmaker[AsyncSession], note_id: str
+) -> None:
+    """补偿再入队（INV-5）：与调用方的「删己 id」清理构成 try/finally 的
+    finally 侧——清理抛异常也一定入队（ON CONFLICT DO NOTHING 与既有
+    pending 去重合并）。"""
     async with maker() as session, session.begin():
         await enqueue(
             session, "memory_sync", {"note_id": note_id}, note_id=note_id, dedupe_pending=True
