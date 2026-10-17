@@ -65,7 +65,7 @@ async def run_pending_jobs(
         processed += 1
 
         try:
-            await execute_job(claimed.kind, claimed.payload)
+            await execute_job(claimed.kind, claimed.payload, claim=claimed)
         except Exception as exc:  # noqa: BLE001 队列要兜住所有错误
             logger.warning("job %s (%s) failed: %s", claimed.id, claimed.kind, exc)
             await _finalize(maker, claimed, str(exc), retry_delay_seconds, me)
@@ -120,9 +120,11 @@ async def _finalize(
         )
 
 
-async def execute_job(kind: str, payload: dict) -> None:
+async def execute_job(kind: str, payload: dict, *, claim: _Claimed | None = None) -> None:
     """执行一个 job。事务划分由具体实现负责（extract / memory_sync 都是
-    多个短事务 + 事务外调用，见各自模块的 docstring）。"""
+    多个短事务 + 事务外调用，见各自模块的 docstring）。claim 携带租约
+    凭证：memory_sync 复查时据此确认自己仍是持有者（threads5 P2-1，
+    INV-5 第 3 步/INV-6 的租约栅栏）。"""
     if kind == "extract":
         from app.pipeline.extract import extract_note
 
@@ -130,6 +132,11 @@ async def execute_job(kind: str, payload: dict) -> None:
     elif kind == "memory_sync":
         from app.pipeline.memory_sync import sync_note_memory
 
-        await sync_note_memory(payload["note_id"])
+        await sync_note_memory(
+            payload["note_id"],
+            job_id=claim.id if claim is not None else None,
+            worker_id=claim.locked_by if claim is not None else None,
+            locked_at=claim.locked_at if claim is not None else None,
+        )
     else:
         raise ValueError(f"unknown job kind: {kind}")

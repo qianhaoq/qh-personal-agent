@@ -4,9 +4,11 @@
 协议（写/删/复查/再入队）、C4（PATCH 后 extract 永久失败旧记忆清掉）、
 C9（复查不一致只删本次 add 的 id）、删除后不复活、worker 中断回收收敛、
 耗尽标 failed 的条件；4c1c9be P2-1/P2-2 的两 worker 交错（已删除路径
-无条件 delete_by_note、DELETE vs 慢 add + 崩溃后不留孤儿记忆）。交错
-窗口用 DelayedAddStore 类钩子注入（真实 HTTP 请求落在钩子窗口里），
-不依赖数据库层并发语义，两后端都跑。
+无条件 delete_by_note、DELETE vs 慢 add + 崩溃后不留孤儿记忆）；threads5
+的租约栅栏（P2-1：复查确认持有租约，丢租约只删己 id）、枚举不完整即
+失败（P1-1）、内部置位不碰 updated_at/change_seq（P2-2）。交错窗口用
+DelayedAddStore 类钩子注入（真实 HTTP 请求落在钩子窗口里），不依赖
+数据库层并发语义，两后端都跑。
 """
 import asyncio
 import uuid
@@ -715,3 +717,104 @@ async def test_memory_sync_attempts_exhausted_marks_failed_only_without_newer_jo
     note = await _note(note_id)
     assert note.memory_status == "failed"
     assert note.status == "organized"  # memory 失败不污染 note.status（修 C5）
+
+
+async def test_memory_sync_recheck_fences_reclaimed_lease_deletes_own_ids(
+    client, user, run_jobs
+):
+    """threads5 P2-1 / INV-5/INV-6：add 挂起期间租约过期被回收换主、新持有者
+    已把 job 跑完 → 复活的慢 worker 复查发现租约已丢：只删自己刚写的 id、
+    不置位、不再入队——终态恰好一组记忆（不再是「迟到 worker 再写一组」）。"""
+    from datetime import timedelta
+
+    from app.config import get_settings
+    from app.db import get_sessionmaker
+    from app.jobs.queue import enqueue
+    from app.pipeline.runner import run_pending_jobs
+    from app.timeutil import utcnow
+
+    note_id = await _create_note(client, user, "租约被回收后迟到的写入")
+    await run_jobs()  # organized rev=2；初次收敛已完成
+
+    store = DelayedAddStore()
+    store.target_note_id = note_id
+    set_memory_store(store)
+
+    maker = get_sessionmaker()
+    async with maker() as session, session.begin():
+        await enqueue(session, "memory_sync", {"note_id": note_id}, note_id=note_id)
+
+    # 慢 worker 认领后在 add 里挂起（外部写超过锁超时的窗口）
+    worker1 = asyncio.create_task(run_pending_jobs(limit=1, worker_id="wkr_old"))
+    await asyncio.wait_for(store.entered.wait(), timeout=5)
+
+    # 租约过期 → 新 worker 回收换主并把同一 job 跑完（写下「正主」一组记忆）
+    async with maker() as session, session.begin():
+        await session.execute(
+            update(Job)
+            .where(Job.kind == "memory_sync", Job.note_id == note_id, Job.status == "running")
+            .values(
+                locked_at=utcnow()
+                - timedelta(seconds=get_settings().job_lock_timeout_seconds + 60)
+            )
+        )
+    assert await run_pending_jobs(limit=1, worker_id="wkr_new") == 1
+    winner_ids = [m.id for m in await store.list(user["user_id"])]
+    assert winner_ids, "前置失败：新持有者应已写下一组记忆"
+    note = await _note(note_id)
+    assert note.memory_status == "synced"
+
+    # 复查前把 memory_status 复位（模拟期间一次不动 rev 的内部推进）：若慢
+    # worker 的复查只比 (rev, deleted_at)，它会再次把这里覆盖成 synced
+    async with maker() as session, session.begin():
+        await session.execute(update(Note).where(Note.id == note_id).values(memory_status="pending"))
+
+    store.release.set()
+    await asyncio.wait_for(worker1, timeout=10)
+
+    own_ids = [m.id for m in store.added_in_window]
+    assert own_ids and not set(own_ids) & set(winner_ids)
+    assert store.deleted_ids == [own_ids], "租约已丢：只删自己刚写的 id，别的不碰"
+    note = await _note(note_id)
+    assert note.memory_status == "pending", "丢租约的执行不得置位"
+    # 终态恰好一组记忆：正主的那组原样保留，迟到的写入被自己清掉
+    assert [m.id for m in await store.list(user["user_id"])] == winner_ids
+    # 不再入队：没有留下 pending/running 的 memory_sync
+    jobs = await _memsync_jobs(note_id)
+    assert not [j for j in jobs if j.status in ("pending", "running")]
+
+
+async def test_memory_sync_status_updates_do_not_touch_updated_at_or_change_seq(
+    client, user, run_jobs
+):
+    """threads5 P2-2 / INV-2.6：memory_status 是内部字段（不进 API 响应）——
+    重放 memory_sync 前后 note 的 updated_at 与 change_seq 都不动，
+    /v1/sync 按 cursor 也拉不到这条 note。"""
+    from app.db import get_sessionmaker
+    from app.jobs.queue import enqueue
+
+    note_id = await _create_note(client, user, "内部状态更新不应产生可观察时间戳")
+    await run_jobs()
+    note = await _note(note_id)
+    assert note.memory_status == "synced"
+
+    headers = auth_headers(user)
+    before_seq, before_updated = note.change_seq, note.updated_at
+    page = await client.get("/v1/sync", params={"since": before_seq}, headers=headers)
+    assert [n for n in page.json()["notes"] if n["note_id"] == note_id] == []
+
+    # 冗余重放一次 memory_sync（置位路径再次执行，值不变）
+    maker = get_sessionmaker()
+    async with maker() as session, session.begin():
+        await enqueue(session, "memory_sync", {"note_id": note_id}, note_id=note_id)
+    await run_jobs()
+
+    after = await _note(note_id)
+    assert after.memory_status == "synced", "重放照常置位（值不变）"
+    assert after.change_seq == before_seq, "内部置位不得分配 change_seq"
+    assert after.updated_at == before_updated, "内部置位不得推进 updated_at"
+
+    page2 = await client.get("/v1/sync", params={"since": before_seq}, headers=headers)
+    assert [n for n in page2.json()["notes"] if n["note_id"] == note_id] == [], (
+        "updated_at 若被推进而 seq 不动，客户端永远观察不到那个新时间戳"
+    )

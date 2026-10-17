@@ -349,7 +349,9 @@ async def _mark_extract_failed(
 
 
 async def _mark_memory_sync_failed(session: AsyncSession, *, note_id: str, job_id: str) -> bool:
-    """memory_sync 耗尽：note.memory_status='failed'（无后继任务时），不占 seq。"""
+    """memory_sync 耗尽：note.memory_status='failed'（无后继任务时），不占
+    seq、不碰 updated_at（INV-2.6：内部状态更新不得产生客户端观察不到的
+    时间戳——`updated_at=Note.updated_at` 自赋值抑制列级 onupdate）。"""
     others = (
         select(literal(1))
         .where(
@@ -363,7 +365,7 @@ async def _mark_memory_sync_failed(session: AsyncSession, *, note_id: str, job_i
     result = await session.execute(
         update(Note)
         .where(Note.id == note_id, Note.deleted_at.is_(None), ~others)
-        .values(memory_status="failed", updated_at=utcnow())
+        .values(memory_status="failed", updated_at=Note.updated_at)
         .execution_options(synchronize_session=False)
     )
     return bool(result.rowcount)
