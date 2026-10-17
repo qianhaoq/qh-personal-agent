@@ -87,13 +87,13 @@ async def test_memory_and_search_isolated(client, user, run_jobs):
 
 
 async def test_delete_note_of_other_user_via_memory(client, user):
-    """记忆删除也必须按 user_id 隔离。"""
+    """记忆删除也必须按 user_id 隔离（delete(ids) 只删属于自己的）。"""
     store = get_memory_store()
-    item_a = await store.add(user["user_id"], "A 的记忆", note_id="nte_a")
+    (item_a,) = await store.add(user["user_id"], "A 的记忆", note_id="nte_a")
 
     code_b = await _make_invite()
     user_b, _ = await _new_user(client, code_b, "dev_iso_b3")
 
-    ok = await store.delete(user_b["user_id"], item_a.id)
-    assert ok is False
+    deleted = await store.delete(user_b["user_id"], [item_a.id])
+    assert deleted == 0
     assert len(await store.list(user["user_id"])) == 1

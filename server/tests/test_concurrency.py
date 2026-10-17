@@ -1,4 +1,5 @@
-"""并发安全：同 rev 并发 PATCH、同 refresh token 并发刷新、并发幂等创建。
+"""并发安全：同 rev 并发 PATCH、同 refresh token 并发刷新、并发幂等创建、
+extract/PATCH/DELETE 的锁序重叠。
 
 SQLite 是单写者模型（库级写锁），两个并发请求在数据库层面实际被串行化，
 因此这些测试在 SQLite 下验证的是**条件更新的语义**——即便两个请求都读到
@@ -11,6 +12,7 @@ SQLite 是单写者模型（库级写锁），两个并发请求在数据库层�
 文件）；不设置则用 SQLite。
 """
 import asyncio
+import json
 import uuid
 
 from tests.conftest import auth_headers, requires_postgres
@@ -106,29 +108,22 @@ async def test_concurrent_first_allocate_seq_no_unique_violation():
 
 
 # ---------------------------------------------------------------------------
-# P2：organize 持锁期间不调外部服务（LLM / mem0 记忆写入）
+# P2：extract 持锁期间不调外部服务（LLM / mem0 记忆写入）。
 #
 # 旧实现把 LLM 调用关在 SELECT ... FOR UPDATE 事务里、把 store.add 关在
-# allocate_seq 之后的大事务里：整理中的笔记 PATCH 要等 LLM 结束，全局
+# allocate_seq 之后的大事务里：抽取中的笔记 PATCH 要等 LLM 结束，全局
 # sequences 行锁从分配持有到（含 mem0 内部 LLM/embedding 的）提交，所有
 # 用户的写入都被串行阻塞。现在 LLM 与记忆写入都在事务之外，两个库都跑
 # 这些测试：PG 验证真实行锁语义，SQLite 单写者下若仍持有事务写锁（旧
 # 实现），这里的并发请求同样会因 database is locked 超时。
-# ---------------------------------------------------------------------------
-# P1：同一 note 上 PATCH 与 organize 写回的加锁顺序（防 AB-BA 死锁）
 #
-# 旧 PATCH 把 allocate_seq 写在条件更新的 .values() 里（先锁 sequences
-# 再锁 note），organize 写回先 FOR UPDATE note 再 allocate_seq：两者在
-# 同一 note 上重叠时 PG 报 DeadlockDetected（SQLite 无行锁、单写者串行，
-# 构造不出这个环，故仅 PG 运行）。现在全仓统一为“先锁业务行（note →
-# reminders），最后才 allocate_seq，change_seq 用第二条 UPDATE 写回”。
+# 新模型下记忆写入是独立的 memory_sync job（事务外调 store），锁语义
+# 相同：memory_sync 的外部调用阶段不持任何数据库锁/连接事务。
 # ---------------------------------------------------------------------------
 
 
 def _slow_llm(monkeypatch, entered: asyncio.Event, release: asyncio.Event) -> dict:
     """LLM 第一次调用阻塞在 release 上；返回调用计数器。"""
-    import json
-
     calls = {"llm": 0}
 
     class SlowLLM:
@@ -145,7 +140,7 @@ def _slow_llm(monkeypatch, entered: asyncio.Event, release: asyncio.Event) -> di
     async def fake_get_llm():
         return SlowLLM()
 
-    monkeypatch.setattr("app.pipeline.organize.get_llm_client", fake_get_llm)
+    monkeypatch.setattr("app.pipeline.extract.get_llm_client", fake_get_llm)
     return calls
 
 
@@ -153,14 +148,10 @@ async def test_patch_during_llm_not_blocked_and_stale_result_discarded(
     client, user, monkeypatch
 ):
     """LLM 调用期间可以对同一笔记完成 PATCH（不被行锁阻塞）；
-    之后旧任务的结果被丢弃，PATCH 重新入队的任务用新文本正常整理。"""
+    之后旧任务的结果被丢弃，PATCH 重新入队的任务用新文本正常抽取。"""
     from app.db import get_sessionmaker
     from app.models import Note
     from app.pipeline.runner import run_pending_jobs
-
-    # SQLite 测试库文件跨测试复用（靠随机 ID 隔离），同文件里先前测试可能
-    # 留下未执行的 pending job：先排空，保证之后进入 LLM 的是本测试的任务
-    await run_pending_jobs()
 
     headers = auth_headers(user)
     r = await client.post(
@@ -196,16 +187,15 @@ async def test_patch_during_llm_not_blocked_and_stale_result_discarded(
 
 
 async def test_other_user_writes_during_llm_and_memory_sync(client, user, monkeypatch):
-    """整理任务在 LLM 调用与提交后记忆写入两个阶段都不持有
-    sequences 行锁：别的用户创建笔记（要分配全局 seq）不被阻塞。"""
+    """extract 在 LLM 调用阶段、memory_sync 在记忆写入阶段（mem0 内部
+    还有 LLM/embedding）都不持有 sequences 行锁：别的用户创建笔记（要分配
+    全局 seq）不被阻塞。"""
     from app.db import get_sessionmaker
+    from app.memory.base import set_memory_store
     from app.memory.inmemory import InMemoryStore
     from app.models import Note
     from app.pipeline.runner import run_pending_jobs
     from tests.conftest import make_invite
-
-    # 同上：先排空先前测试留下的 pending job
-    await run_pending_jobs()
 
     headers = auth_headers(user)
     r = await client.post(
@@ -220,21 +210,21 @@ async def test_other_user_writes_during_llm_and_memory_sync(client, user, monkey
     _slow_llm(monkeypatch, in_llm, release_llm)
 
     class SlowStore(InMemoryStore):
-        """第一次 add（整理提交后的记忆写入）阻塞在 release 上。"""
+        """第一次 add（memory_sync job 的外部写）阻塞在 release 上。"""
 
         def __init__(self):
             super().__init__()
             self.add_calls = 0
 
-        async def add(self, user_id, text, note_id=None):
+        async def add(self, user_id, text, *, note_id=None, source_rev=None):
             self.add_calls += 1
             if self.add_calls == 1:
                 in_memory.set()
                 await release_memory.wait()
-            return await super().add(user_id, text, note_id=note_id)
+            return await super().add(user_id, text, note_id=note_id, source_rev=source_rev)
 
     store = SlowStore()
-    monkeypatch.setattr("app.pipeline.organize.get_memory_store", lambda: store)
+    set_memory_store(store)
 
     # 另一个用户（创建笔记要分配全局 seq）
     code = await make_invite(get_sessionmaker())
@@ -259,39 +249,47 @@ async def test_other_user_writes_during_llm_and_memory_sync(client, user, monkey
 
     release_llm.set()
     await asyncio.wait_for(in_memory.wait(), timeout=5)
-    # 整理已提交、记忆写入（mem0 内部还有 LLM/embedding 调用）期间同样不持锁
+    # 抽取已提交、memory_sync 的外部写期间同样不持锁
     other_note_2 = await asyncio.wait_for(other_user_creates(), timeout=3)
 
     release_memory.set()
     await asyncio.wait_for(worker, timeout=10)
 
-    # 两个用户的笔记最终都整理完成、记忆写入
+    # 两个用户的笔记最终都抽取完成、记忆同步
     async with get_sessionmaker()() as session:
         for note_id in (user1_note_id, other_note_1, other_note_2):
             note = await session.get(Note, note_id)
             assert note.status == "organized", note_id
-            assert note.memory_synced is True, note_id
+            assert note.memory_status == "synced", note_id
     items = [m for m in await store.list(user["user_id"]) if m.note_id == user1_note_id]
     assert len(items) == 1
 
 
+# ---------------------------------------------------------------------------
+# P1：同一 note 上 PATCH 与 extract 写回的加锁顺序（防 AB-BA 死锁）。
+#
+# 全局规则：先锁业务行（note → reminders），最后才 allocate_seq，
+# change_seq 用第二条 UPDATE 写回。仅 PG：SQLite 无行锁、单写者串行，
+# 构造不出这个环。
+# ---------------------------------------------------------------------------
+
+
 @requires_postgres
 async def test_patch_and_organize_writeback_overlap_no_deadlock(client, user, monkeypatch):
-    """P1：同一 note 上 PATCH 与 organize 写回重叠不产生 AB-BA 死锁。
+    """P1：同一 note 上 PATCH 与 extract 写回重叠不产生 AB-BA 死锁。
 
-    用 Event 让 organize 写回停在“已持有 note 行锁、即将请求 sequences
+    用 Event 让 extract 写回停在“已持有 note 行锁、即将请求 sequences
     锁”的位置（allocate_seq 前的业务行已全部 flush），此时发起 PATCH 并
-    留出它在自己的第一把锁上阻塞的时间，再放行 organize：旧代码 PATCH
-    会先抢到 sequences 锁再等 note，organize 反向等 sequences → PG
-    DeadlockDetected（organize 事务被 abort、任务失败、PATCH 200 落在
-    回滚后的旧 rev 上）；新代码 PATCH 只等 note 锁，organize 顺利提交，
-    PATCH 复查 rev 得到确定的 409，状态一致。
+    留出它在自己的第一把锁上阻塞的时间，再放行 extract：任何顺序违反
+    （如 PATCH 先抢 sequences 再等 note）都会以 PG DeadlockDetected→500
+    暴露。正确实现里 PATCH 只等 note 锁，extract 顺利提交，PATCH 复查
+    rev 得到确定的 409。
     """
     from sqlalchemy import select
 
     from app.db import get_sessionmaker
     from app.models import Job, Note
-    from app.pipeline import organize as organize_mod
+    from app.pipeline import extract as extract_mod
     from app.pipeline.runner import run_pending_jobs
 
     headers = auth_headers(user)
@@ -302,21 +300,21 @@ async def test_patch_and_organize_writeback_overlap_no_deadlock(client, user, mo
     )
     note_id = r.json()["note_id"]
 
-    organize_holds_note = asyncio.Event()
-    release_organize = asyncio.Event()
-    real_allocate_seq = organize_mod.allocate_seq
+    extract_holds_note = asyncio.Event()
+    release_extract = asyncio.Event()
+    real_allocate_seq = extract_mod.allocate_seq
 
     async def allocate_seq_paused(session, name="global", count=1):
-        # 走到这里说明 organize 已 flush 完全部业务行（持有 note 行锁），
+        # 走到这里说明 extract 已 flush 完全部业务行（持有 note 行锁），
         # 正要请求 sequences 锁
-        organize_holds_note.set()
-        await release_organize.wait()
+        extract_holds_note.set()
+        await release_extract.wait()
         return await real_allocate_seq(session, name=name, count=count)
 
-    monkeypatch.setattr(organize_mod, "allocate_seq", allocate_seq_paused)
+    monkeypatch.setattr(extract_mod, "allocate_seq", allocate_seq_paused)
 
-    worker = asyncio.create_task(run_pending_jobs())
-    await asyncio.wait_for(organize_holds_note.wait(), timeout=5)
+    worker = asyncio.create_task(run_pending_jobs(limit=1))
+    await asyncio.wait_for(extract_holds_note.wait(), timeout=5)
 
     patch_task = asyncio.create_task(
         client.patch(
@@ -324,28 +322,209 @@ async def test_patch_and_organize_writeback_overlap_no_deadlock(client, user, mo
         )
     )
     await asyncio.sleep(0.3)  # 让 PATCH 走到它需要的第一把锁（note 行）上阻塞
-    assert not patch_task.done(), "PATCH 应阻塞在 organize 持有的 note 行锁上"
+    assert not patch_task.done(), "PATCH 应阻塞在 extract 持有的 note 行锁上"
 
-    release_organize.set()
+    release_extract.set()
     patched = await asyncio.wait_for(patch_task, timeout=5)
     await asyncio.wait_for(worker, timeout=10)
+    await run_pending_jobs()  # 排空同事务入队的 memory_sync
 
-    # organize 先提交（rev 1→2），PATCH 的条件更新不再命中 → 409（不是
+    # extract 先提交（rev 1→2），PATCH 的条件更新不再命中 → 409（不是
     # DeadlockDetected 引发的 500），最终状态一致
     assert patched.status_code == 409, patched.text
     assert patched.json()["error"]["code"] == "conflict"
     async with get_sessionmaker()() as session:
         note = await session.get(Note, note_id)
         job = (
-            await session.execute(
-                select(Job).where(Job.kind == "organize_note", Job.payload_json.contains(note_id))
-            )
+            await session.execute(select(Job).where(Job.kind == "extract", Job.note_id == note_id))
         ).scalar_one()
     assert note.status == "organized"
     assert note.rev == 2
     assert note.text == "第一版内容"  # 409 的 PATCH 没有落库
-    assert note.memory_synced is True
-    assert job.status == "done"  # 整理任务没有被死锁打断
+    assert note.memory_status == "synced"
+    assert job.status == "done"  # 抽取任务没有被死锁打断
+
+
+# ---------------------------------------------------------------------------
+# QA（PR #2 复测）：同一 note 上 PATCH、DELETE、extract 写回三方重叠。
+#
+# 三条路径都是先锁业务行（note 的条件 UPDATE / FOR UPDATE）→ reminders
+# → jobs INSERT → 最后 allocate_seq。用 Event 让 extract 写回停在“已持有
+# note 行锁、即将请求 sequences 锁”的位置，同时发出 PATCH 与 DELETE
+# （各自独立会话/连接，真实并发地阻塞在 note 行锁上），重复 20 轮：PG 上
+# 任何顺序违反都会以 DeadlockDetected→500 或锁等待超时暴露。仅 PG。
+# ---------------------------------------------------------------------------
+
+
+@requires_postgres
+async def test_patch_delete_organize_three_way_overlap_no_deadlock(client, user, monkeypatch):
+    from sqlalchemy import select
+
+    from app.db import get_sessionmaker
+    from app.memory.base import get_memory_store
+    from app.models import Job, Note, Reminder
+    from app.pipeline import extract as extract_mod
+    from app.pipeline.runner import run_pending_jobs
+
+    headers = auth_headers(user)
+    rounds = 20
+    gate: dict[str, asyncio.Event] = {"entered": asyncio.Event(), "release": asyncio.Event()}
+    real_allocate_seq = extract_mod.allocate_seq
+
+    async def allocate_seq_paused(session, name="global", count=1):
+        # 到这里说明 extract 已 flush 完业务行（持有 note 行锁），正要请求
+        # sequences 锁：把三方重叠钉在这个时刻
+        gate["entered"].set()
+        await gate["release"].wait()
+        return await real_allocate_seq(session, name=name, count=count)
+
+    monkeypatch.setattr(extract_mod, "allocate_seq", allocate_seq_paused)
+
+    await run_pending_jobs()  # 排空残留 job，保证每轮先被领走的是本轮任务
+    note_ids: list[str] = []
+    for i in range(rounds):
+        gate["entered"] = asyncio.Event()
+        gate["release"] = asyncio.Event()
+        created = await client.post(
+            "/v1/notes",
+            json={"client_note_id": str(uuid.uuid4()), "text": f"第 {i} 轮三方重叠"},
+            headers=headers,
+        )
+        assert created.status_code == 202, created.text
+        note_id = created.json()["note_id"]
+        note_ids.append(note_id)
+
+        worker = asyncio.create_task(run_pending_jobs(limit=1))
+        await asyncio.wait_for(gate["entered"].wait(), timeout=5)
+
+        # 三者同时进入：PATCH 与 DELETE（独立请求/会话）都阻塞在 extract
+        # 持有的 note 行锁上
+        patch_task = asyncio.create_task(
+            client.patch(
+                f"/v1/notes/{note_id}",
+                json={"text": "并发 PATCH 的新内容", "rev": 1},
+                headers=headers,
+            )
+        )
+        delete_task = asyncio.create_task(client.delete(f"/v1/notes/{note_id}", headers=headers))
+        await asyncio.sleep(0.15)
+        assert not patch_task.done() and not delete_task.done(), "两请求应在 note 行锁上等待"
+
+        gate["release"].set()
+        patched, deleted = await asyncio.gather(patch_task, delete_task)
+        await asyncio.wait_for(worker, timeout=10)
+
+        # 无 DeadlockDetected 引发的 500；结果必为合法的串行化结果之一：
+        # extract 先提交（rev+1）→ PATCH 409、DELETE 204；或 DELETE 先
+        # 落定 → PATCH 404、DELETE 204
+        assert patched.status_code in (409, 404), (i, patched.status_code, patched.text)
+        assert deleted.status_code == 204, (i, deleted.status_code, deleted.text)
+        # 每轮收尾：排空本轮入队的全部 job（DELETE 的 memory_sync 等），
+        # 避免下一轮的 run_pending_jobs(limit=1) 领到旧任务
+        await run_pending_jobs()
+
+    # 最终状态一致：全部已删除 → 无存活提醒、无记忆、job 全部收尾
+    async with get_sessionmaker()() as session:
+        notes = (
+            await session.execute(select(Note).where(Note.id.in_(note_ids)))
+        ).scalars().all()
+        live_reminders = (
+            await session.execute(
+                select(Reminder).where(
+                    Reminder.note_id.in_(note_ids), Reminder.deleted_at.is_(None)
+                )
+            )
+        ).scalars().all()
+        relevant_jobs = [
+            j
+            for j in (
+                await session.execute(
+                    select(Job).where(
+                        Job.kind.in_(("extract", "memory_sync")), Job.note_id.in_(note_ids)
+                    )
+                )
+            ).scalars().all()
+        ]
+    assert all(n.deleted_at is not None for n in notes)
+    assert live_reminders == []
+    assert relevant_jobs and {j.status for j in relevant_jobs} <= {"done", "failed"}
+    assert [m for m in await get_memory_store().list(user["user_id"]) if m.note_id in note_ids] == []
+
+
+@requires_postgres
+async def test_extract_finalize_concurrent_patch_no_deadlock(client, user, monkeypatch):
+    """INV-1：extract 耗尽失败收尾（jobs→note→sequences 单向）与用户
+    PATCH（note→reminders→jobs→sequences）同 note 并行，不产生死锁。
+
+    钩子把收尾停在“已锁 job 行、已条件更新 note 行、即将 allocate_seq”
+    的位置，PATCH 在独立会话里同时到达：正确锁序下 PATCH 只等 note 行锁
+    （收尾提交后即放行）；任何反向顺序都会以 DeadlockDetected/锁超时暴露。
+    """
+    from sqlalchemy import select
+
+    from app.db import get_sessionmaker
+    from app.jobs import queue as queue_mod
+    from app.models import Job, Note
+    from app.pipeline.runner import run_pending_jobs
+
+    class BoomLLM:
+        async def chat(self, messages, response_format=None):
+            raise RuntimeError("llm down")
+
+    async def fake_get_llm():
+        return BoomLLM()
+
+    monkeypatch.setattr("app.pipeline.extract.get_llm_client", fake_get_llm)
+
+    headers = auth_headers(user)
+    r = await client.post(
+        "/v1/notes",
+        json={"client_note_id": str(uuid.uuid4()), "text": "收尾与 PATCH 并发"},
+        headers=headers,
+    )
+    note_id = r.json()["note_id"]
+
+    entered, release = asyncio.Event(), asyncio.Event()
+    real_allocate_seq = queue_mod.allocate_seq
+
+    async def allocate_seq_paused(session, name="global", count=1):
+        # 收尾已持有 job 行锁并条件更新了 note 行（rev 仍为 1），正要请求
+        # sequences 锁——与 PATCH 的重叠窗口钉在这里
+        entered.set()
+        await release.wait()
+        return await real_allocate_seq(session, name=name, count=count)
+
+    monkeypatch.setattr(queue_mod, "allocate_seq", allocate_seq_paused)
+
+    worker = asyncio.create_task(run_pending_jobs(retry_delay_seconds=0, worker_id="wkr_fin"))
+    await asyncio.wait_for(entered.wait(), timeout=5)
+
+    patch_task = asyncio.create_task(
+        client.patch(
+            f"/v1/notes/{note_id}", json={"text": "并发 PATCH 的内容", "rev": 1}, headers=headers
+        )
+    )
+    await asyncio.sleep(0.3)
+    assert not patch_task.done(), "PATCH 应阻塞在收尾持有的 note 行锁上（而不是死锁）"
+
+    release.set()
+    patched = await asyncio.wait_for(patch_task, timeout=5)
+    await asyncio.wait_for(worker, timeout=10)
+
+    # 收尾先提交（note.status=failed，rev 仍 1）；PATCH 条件更新命中 → 200
+    assert patched.status_code == 200, patched.text
+    async with get_sessionmaker()() as session:
+        note = await session.get(Note, note_id)
+        job = (
+            await session.execute(
+                select(Job).where(
+                    Job.kind == "extract", Job.note_id == note_id, Job.note_rev == 1
+                )
+            )
+        ).scalar_one()
+    assert job.status == "failed"
+    assert note.rev == 2
+    assert note.text == "并发 PATCH 的内容"
 
 
 async def test_concurrent_first_login_same_invite_single_user(client, invite_code):
@@ -379,8 +558,6 @@ async def test_concurrent_first_login_same_invite_single_user(client, invite_cod
     assert len(user_ids) == 1, f"同一邀请码不应创建多个用户：{user_ids}"
 
     async with get_sessionmaker()() as session:
-        # SQLite 测试库跨测试复用（靠随机 ID 隔离），不能数全表 user：
-        # 只数本次邀请码落定的那个
         users = (
             await session.execute(select(User).where(User.id.in_(user_ids)))
         ).scalars().all()
@@ -391,116 +568,13 @@ async def test_concurrent_first_login_same_invite_single_user(client, invite_cod
 
 
 # ---------------------------------------------------------------------------
-# QA（PR #2 复测）：同一 note 上 PATCH、DELETE、organize 写回三方重叠。
-#
-# 加锁顺序（全局规则见 app.common.allocate_seq）：三条路径都是先锁
-# 业务行（note 的条件 UPDATE / FOR UPDATE）→ reminders → jobs INSERT
-# → 最后 allocate_seq。用 Event 让 organize 写回停在“已持有 note 行锁、
-# 即将请求 sequences 锁”的位置，同时发出 PATCH 与 DELETE（各自独立
-# 会话/连接，真实并发地阻塞在 note 行锁上），重复 20 轮：PG 上任何
-# 顺序违反（如先 allocate_seq 再锁 note）都会以 DeadlockDetected→500
-# 或锁等待超时暴露。仅 PG：SQLite 无行锁、单写者串行，构造不出重叠窗口。
+# P2：ask 的 LLM 调用不占数据库连接（连接池压到 1 仍能服务其他请求）。
 # ---------------------------------------------------------------------------
 
 
 @requires_postgres
-async def test_patch_delete_organize_three_way_overlap_no_deadlock(client, user, monkeypatch):
-    from sqlalchemy import select
-
-    from app.db import get_sessionmaker
-    from app.memory.base import get_memory_store
-    from app.models import Job, Note, Reminder
-    from app.pipeline import organize as organize_mod
-    from app.pipeline.runner import run_pending_jobs
-
-    headers = auth_headers(user)
-    rounds = 20
-    gate: dict[str, asyncio.Event] = {"entered": asyncio.Event(), "release": asyncio.Event()}
-    real_allocate_seq = organize_mod.allocate_seq
-
-    async def allocate_seq_paused(session, name="global", count=1):
-        # 到这里说明 organize 已 flush 完业务行（持有 note 行锁），正要请求
-        # sequences 锁：把三方重叠钉在这个时刻
-        gate["entered"].set()
-        await gate["release"].wait()
-        return await real_allocate_seq(session, name=name, count=count)
-
-    monkeypatch.setattr(organize_mod, "allocate_seq", allocate_seq_paused)
-
-    await run_pending_jobs()  # 排空残留 job，保证每轮先被领走的是本轮任务
-    note_ids: list[str] = []
-    for i in range(rounds):
-        gate["entered"] = asyncio.Event()
-        gate["release"] = asyncio.Event()
-        created = await client.post(
-            "/v1/notes",
-            json={"client_note_id": str(uuid.uuid4()), "text": f"第 {i} 轮三方重叠"},
-            headers=headers,
-        )
-        assert created.status_code == 202, created.text
-        note_id = created.json()["note_id"]
-        note_ids.append(note_id)
-
-        worker = asyncio.create_task(run_pending_jobs(limit=1))
-        await asyncio.wait_for(gate["entered"].wait(), timeout=5)
-
-        # 三者同时进入：PATCH 与 DELETE（独立请求/会话）都阻塞在 organize
-        # 持有的 note 行锁上
-        patch_task = asyncio.create_task(
-            client.patch(
-                f"/v1/notes/{note_id}",
-                json={"text": "并发 PATCH 的新内容", "rev": 1},
-                headers=headers,
-            )
-        )
-        delete_task = asyncio.create_task(client.delete(f"/v1/notes/{note_id}", headers=headers))
-        await asyncio.sleep(0.15)
-        assert not patch_task.done() and not delete_task.done(), "两请求应在 note 行锁上等待"
-
-        gate["release"].set()
-        patched, deleted = await asyncio.gather(patch_task, delete_task)
-        await asyncio.wait_for(worker, timeout=10)
-
-        # 无 DeadlockDetected 引发的 500；结果必为合法的串行化结果之一：
-        # organize 先提交（rev+1）→ PATCH 409、DELETE 204；或 DELETE 先
-        # 落定 → PATCH 404、DELETE 204
-        assert patched.status_code in (409, 404), (i, patched.status_code, patched.text)
-        assert deleted.status_code == 204, (i, deleted.status_code, deleted.text)
-        # 每轮收尾：清掉本轮 DELETE 入队的 cleanup job，避免下一轮的
-        # run_pending_jobs(limit=1) 领到它而不是新 organize job
-        await run_pending_jobs()
-
-    # 最终状态一致：全部已删除 → 无存活提醒、无记忆、job 全部收尾
-    async with get_sessionmaker()() as session:
-        notes = (
-            await session.execute(select(Note).where(Note.id.in_(note_ids)))
-        ).scalars().all()
-        live_reminders = (
-            await session.execute(
-                select(Reminder).where(
-                    Reminder.note_id.in_(note_ids), Reminder.deleted_at.is_(None)
-                )
-            )
-        ).scalars().all()
-        relevant_jobs = [
-            j
-            for j in (
-                await session.execute(select(Job).where(Job.kind.in_(("organize_note", "cleanup_memory"))))
-            ).scalars().all()
-            if any(nid in (j.payload_json or "") for nid in note_ids)
-        ]
-    assert all(n.deleted_at is not None for n in notes)
-    assert live_reminders == []
-    assert relevant_jobs and {j.status for j in relevant_jobs} <= {"done", "failed"}
-    assert [m for m in await get_memory_store().list(user["user_id"]) if m.note_id in note_ids] == []
-
-
-@requires_postgres
 async def test_ask_slow_llm_single_connection_pool_still_serves(client, user, run_jobs, monkeypatch):
-    """P2：ask 的 LLM 调用不占数据库连接——把引擎池压到 pool_size=1、
-    max_overflow=0，慢 LLM 等待期间另一个需要数据库的请求仍能完成。
-
-    旧实现里鉴权依赖挂着的请求级会话在鉴权查询后就一直开着（事务未
+    """旧实现里鉴权依赖挂着的请求级会话在鉴权查询后就一直开着（事务未
     提交、连接未还），ask 的 LLM 秒级调用期间这唯一连接被占死，其他
     请求（含鉴权）全部排队。现在鉴权在独立短会话完成即还连接，ask
     处理中根本没有打开的会话。

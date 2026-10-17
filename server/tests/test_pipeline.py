@@ -1,29 +1,26 @@
-"""自动整理流水线（MockLLM）。"""
+"""extract 抽取流水线（MockLLM）。记忆写删的测试见 test_memory_sync.py。"""
 import json
 import uuid
 from datetime import UTC, datetime
 
 from sqlalchemy import select
 
-from app.memory.base import get_memory_store
 from app.models import Job, Note, Reminder
 from app.timeutil import to_iso
 from tests.conftest import auth_headers
 
 
 def _freeze_now(monkeypatch, fixed: datetime) -> None:
-    """固定 organize 眼中的“服务器当前时间”。
+    """固定 extract 眼中的“服务器当前时间”。
 
     整理会丢弃早于服务器当前时间的 fire_at（见 test_fire_at_before_
     server_now_discarded），用固定过去/未来时间的测试不固定 now 的话，
     断言会随真实时钟漂移。
     """
-    monkeypatch.setattr("app.pipeline.organize.utcnow", lambda: fixed)
+    monkeypatch.setattr("app.pipeline.extract.utcnow", lambda: fixed)
 
 
-async def _create_and_organize(client, user, text, run_jobs) -> Note:
-    import uuid
-
+async def _create_and_extract(client, user, text, run_jobs) -> Note:
     r = await client.post(
         "/v1/notes",
         json={
@@ -41,11 +38,20 @@ async def _create_and_organize(client, user, text, run_jobs) -> Note:
         return await session.get(Note, note_id)
 
 
-async def test_organize_produces_title_tags_reminders(client, user, run_jobs, monkeypatch):
+async def _extract_job(note_id: str) -> Job:
+    from app.db import get_sessionmaker
+
+    async with get_sessionmaker()() as session:
+        return (
+            await session.execute(select(Job).where(Job.kind == "extract", Job.note_id == note_id))
+        ).scalar_one()
+
+
+async def test_extract_produces_title_tags_reminders(client, user, run_jobs, monkeypatch):
     # 该用例的 recorded_at（2026-10-16）与推算出的 fire_at 相对真实时钟
     # 可能已是过去，固定 now 保证“未来时间仍生成”的断言不随日期漂移
     _freeze_now(monkeypatch, datetime(2026, 10, 16, 8, 0, tzinfo=UTC))
-    note = await _create_and_organize(
+    note = await _create_and_extract(
         client, user, "明天下午三点提醒我去医院体检，还要买火车票", run_jobs
     )
     assert note.status == "organized"
@@ -54,6 +60,7 @@ async def test_organize_produces_title_tags_reminders(client, user, run_jobs, mo
     assert any("体检" in t["text"] for t in note.todos)
     assert note.rev == 2  # organized 后 rev+1
     assert note.llm_calls == 1  # 只调用一次 LLM
+    assert note.memory_status == "synced"  # 同事务入队的 memory_sync 已跑完
 
     # 建议提醒已写入
     from app.db import get_sessionmaker
@@ -70,16 +77,9 @@ async def test_organize_produces_title_tags_reminders(client, user, run_jobs, mo
     assert fire, "应至少解析出一个 fire_at"
 
 
-async def test_organize_writes_memory(client, user, run_jobs):
-    note = await _create_and_organize(client, user, "周末和朋友聚餐", run_jobs)
-    store = get_memory_store()
-    items = [m for m in await store.list(user["user_id"]) if m.note_id == note.id]
-    assert items, "笔记应写入 MemoryStore"
-
-
 async def test_llm_called_once_across_retries_and_idempotent(client, user, run_jobs):
-    note = await _create_and_organize(client, user, "记得明天买牛奶", run_jobs)
-    # 再跑一遍队列（无新 job）不会重复整理
+    note = await _create_and_extract(client, user, "记得明天买牛奶", run_jobs)
+    # 再跑一遍队列（无新 job）不会重复抽取
     await run_jobs()
     from app.db import get_sessionmaker
 
@@ -89,13 +89,13 @@ async def test_llm_called_once_across_retries_and_idempotent(client, user, run_j
     assert refreshed.status == "organized"
 
 
-async def test_repatch_reorganizes(client, user, run_jobs):
+async def test_repatch_reextracts(client, user, run_jobs):
     r = await client.post(
         "/v1/notes",
         json={"client_note_id": "cn_r1", "text": "随便记一句"},
         headers={"authorization": f"Bearer {user['access_token']}"},
     )
-    note_id, rev = r.json()["note_id"], r.json()["rev"]
+    note_id = r.json()["note_id"]
     await run_jobs()
 
     # 整理后 rev 变成 2，客户端要先拉最新版本再改
@@ -103,6 +103,7 @@ async def test_repatch_reorganizes(client, user, run_jobs):
         f"/v1/notes/{note_id}", headers={"authorization": f"Bearer {user['access_token']}"}
     )
     rev = current.json()["rev"]
+    assert rev == 2
 
     patch = await client.patch(
         f"/v1/notes/{note_id}",
@@ -117,17 +118,18 @@ async def test_repatch_reorganizes(client, user, run_jobs):
     async with get_sessionmaker()() as session:
         note = await session.get(Note, note_id)
     assert note.status == "organized"
-    assert note.llm_calls == 2  # 重新整理了一次
+    assert note.llm_calls == 2  # 重新抽取了一次
 
 
 async def test_first_llm_failure_leaves_no_side_effects(client, user, monkeypatch):
     """LLM 第一次失败：note/提醒/记忆都不留半成品。
 
-    LLM 调用发生在任何写事务之前，失败时根本没有副作用可回滚。之前
-    （单事务时代）认领、执行、失败标记在同一个事务里，异常被吞掉后
-    “organizing 状态 + 规范化文本”等部分副作用会随事务一起提交。
+    LLM 调用发生在任何写事务之前，失败时根本没有副作用可回滚。job 回
+    pending 重试；记忆此时也不该有任何写入（memory_sync 只在 apply 提交
+    后才由同事务入队）。
     """
     from app.db import get_sessionmaker
+    from app.memory.base import get_memory_store
     from app.pipeline.runner import run_pending_jobs
 
     text = "嗯，那个，明天上午十点交周报"
@@ -149,27 +151,33 @@ async def test_first_llm_failure_leaves_no_side_effects(client, user, monkeypatc
     async def fake_get_llm():
         return BoomLLM()
 
-    monkeypatch.setattr("app.pipeline.organize.get_llm_client", fake_get_llm)
+    monkeypatch.setattr("app.pipeline.extract.get_llm_client", fake_get_llm)
     processed = await run_pending_jobs(limit=1, retry_delay_seconds=0)
     assert processed == 1
 
     async with get_sessionmaker()() as session:
         note = await session.get(Note, note_id)
         assert note.text == text  # 原文未被规范化覆盖
-        assert note.status == "uploaded"  # organizing 已回滚
+        assert note.status == "uploaded"  # 无中间态残留
         assert note.rev == 1
         assert note.llm_calls == 0
         assert (
             await session.execute(select(Reminder).where(Reminder.note_id == note_id))
         ).scalars().all() == []
         job = (
-            await session.execute(
-                select(Job).where(Job.kind == "organize_note", Job.payload_json.contains(note_id))
-            )
+            await session.execute(select(Job).where(Job.kind == "extract", Job.note_id == note_id))
         ).scalars().one()
         assert job.status == "pending"
         assert job.attempts == 1
+        assert job.note_rev == 1
         assert "transient llm failure" in (job.last_error or "")
+        # 抽取未成功：没有 memory_sync 被入队，也没有任何记忆
+        memsync = (
+            await session.execute(
+                select(Job).where(Job.kind == "memory_sync", Job.note_id == note_id)
+            )
+        ).scalars().all()
+    assert memsync == []
     assert [m for m in await get_memory_store().list(user["user_id"])] == []
 
     # LLM 恢复后重试成功
@@ -180,107 +188,167 @@ async def test_first_llm_failure_leaves_no_side_effects(client, user, monkeypatc
     assert note.status == "organized"
 
 
-async def test_memory_failure_retries_backfill_only(client, user, monkeypatch):
-    """P2：记忆写入移到写事务提交之后，失败靠 job 重试幂等补写。
+async def test_extract_skips_when_rev_moved_marks_done(client, user, monkeypatch):
+    """INV-2.2：入队时的 rev 与执行时不一致：任务跳过 = done，无副作用。
 
-    第一次：LLM 成功、note 已 organized（rev+1、提醒已建），store.add
-    在写入之后失败 → DB 副作用保留，job 回 pending 重试。
-    重试：organize 发现 note 已 organized 且 memory_synced=False，跳过
-    LLM 只补写记忆（delete_by_note 后 add），即使上次 add 已部分写入
-    也不会重复。
+    PATCH 已重新入队新 rev 的 extract，旧任务执行时一次 LLM 都不调用。
     """
     from app.db import get_sessionmaker
-    from app.memory.inmemory import InMemoryStore
     from app.pipeline.runner import run_pending_jobs
-
-    class WriteThenFailStore(InMemoryStore):
-        """第一次 add：先写入再抛错（模拟“写入成功但结果确认前失败”）。"""
-
-        def __init__(self):
-            super().__init__()
-            self.add_calls = 0
-
-        async def add(self, user_id, text, note_id=None):
-            self.add_calls += 1
-            item = await super().add(user_id, text, note_id=note_id)
-            if self.add_calls == 1:
-                raise RuntimeError("memory backend down after write")
-            return item
-
-    store = WriteThenFailStore()
-    monkeypatch.setattr("app.pipeline.organize.get_memory_store", lambda: store)
-
-    r = await client.post(
-        "/v1/notes",
-        json={"client_note_id": str(uuid.uuid4()), "text": "周末和朋友聚餐"},
-        headers=auth_headers(user),
-    )
-    note_id = r.json()["note_id"]
-
-    # 第一次执行：整理落库，记忆失败，job 待重试
-    processed = await run_pending_jobs(limit=1, retry_delay_seconds=0)
-    assert processed == 1
-    async with get_sessionmaker()() as session:
-        note = await session.get(Note, note_id)
-        job = (
-            await session.execute(
-                select(Job).where(Job.kind == "organize_note", Job.payload_json.contains(note_id))
-            )
-        ).scalars().one()
-    assert note.status == "organized"  # DB 副作用已提交，不再随记忆失败回滚
-    assert note.memory_synced is False
-    assert note.rev == 2 and note.llm_calls == 1
-    assert job.status == "pending"
-    assert job.attempts == 1
-    assert "memory backend down" in (job.last_error or "")
-    assert store.add_calls == 1
-    assert len([m for m in await store.list(user["user_id"]) if m.note_id == note_id]) == 1
-
-    # 重试：只补写记忆，不再调 LLM / 重新整理
-    await run_pending_jobs(retry_delay_seconds=0)
-    async with get_sessionmaker()() as session:
-        note = await session.get(Note, note_id)
-        job = (
-            await session.execute(
-                select(Job).where(Job.kind == "organize_note", Job.payload_json.contains(note_id))
-            )
-        ).scalars().one()
-    assert job.status == "done"
-    assert job.attempts == 2
-    assert note.status == "organized"
-    assert note.memory_synced is True
-    assert note.rev == 2  # 没有再整理
-    assert note.llm_calls == 1  # 没有再调 LLM
-    assert store.add_calls == 2
-    items = [m for m in await store.list(user["user_id"]) if m.note_id == note_id]
-    assert len(items) == 1  # delete_by_note 后再 add：最终写入且不重复
-
-
-async def test_stale_organize_job_skipped_after_patch(client, user, run_jobs):
-    """入队时的 rev 与执行时不一致：任务跳过，由 PATCH 重新入队的任务整理。"""
-    from app.db import get_sessionmaker
 
     r = await client.post(
         "/v1/notes",
         json={"client_note_id": str(uuid.uuid4()), "text": "第一版内容"},
-        headers={"authorization": f"Bearer {user['access_token']}"},
+        headers=auth_headers(user),
     )
-    note_id = r.json()["note_id"]  # rev=1，job 记录 rev=1
+    note_id = r.json()["note_id"]  # rev=1，job 记录 note_rev=1
 
-    # 整理跑之前先 PATCH（rev 1→2，重新入队 rev=2 的 job）
+    # 抽取跑之前先 PATCH（rev 1→2，重新入队 rev=2 的 job）
     patch = await client.patch(
         f"/v1/notes/{note_id}",
         json={"text": "明天上午十点交周报", "rev": 1},
-        headers={"authorization": f"Bearer {user['access_token']}"},
+        headers=auth_headers(user),
     )
     assert patch.status_code == 200
-    await run_jobs()
+
+    llm_calls = {"n": 0}
+
+    class CountingLLM:
+        async def chat(self, messages, response_format=None):
+            llm_calls["n"] += 1
+            return json.dumps(
+                {"title": "t", "tags": [], "todos": [], "suggested_reminders": []},
+                ensure_ascii=False,
+            )
+
+    async def fake_get_llm():
+        return CountingLLM()
+
+    monkeypatch.setattr("app.pipeline.extract.get_llm_client", fake_get_llm)
+
+    # 只跑一个：最旧的是 rev=1 的任务，它必须跳过 = done（零副作用）
+    processed = await run_pending_jobs(limit=1, retry_delay_seconds=0)
+    assert processed == 1
+    async with get_sessionmaker()() as session:
+        jobs = (
+            await session.execute(select(Job).where(Job.kind == "extract", Job.note_id == note_id))
+        ).scalars().all()
+        note = await session.get(Note, note_id)
+    old = next(j for j in jobs if j.note_rev == 1)
+    assert old.status == "done"
+    assert llm_calls["n"] == 0
+    assert note.status == "uploaded"  # 旧任务没有写任何整理产物
+
+    # 新 rev 的任务随后正常抽取
+    await run_pending_jobs(retry_delay_seconds=0)
+    async with get_sessionmaker()() as session:
+        note = await session.get(Note, note_id)
+    assert note.status == "organized"
+    assert note.text == "明天上午十点交周报"
+    assert note.llm_calls == 1
+
+
+async def test_extract_attempts_exhausted_marks_note_failed_by_rev(client, user, monkeypatch):
+    """INV-2.5：extract 连续失败耗尽 → note.status=failed（按入队 rev 条件）。"""
+    from app.db import get_sessionmaker
+    from app.pipeline.runner import run_pending_jobs
+
+    r = await client.post(
+        "/v1/notes",
+        json={"client_note_id": str(uuid.uuid4()), "text": "会失败的笔记"},
+        headers=auth_headers(user),
+    )
+    note_id = r.json()["note_id"]
+
+    class BoomLLM:
+        async def chat(self, messages, response_format=None):
+            raise RuntimeError("llm down")
+
+    async def fake_get_llm():
+        return BoomLLM()
+
+    monkeypatch.setattr("app.pipeline.extract.get_llm_client", fake_get_llm)
+    await run_pending_jobs(retry_delay_seconds=0)
 
     async with get_sessionmaker()() as session:
         note = await session.get(Note, note_id)
-    assert note.llm_calls == 1  # 旧 job 被跳过，只有新 job 调了一次 LLM
-    assert note.status == "organized"
-    assert note.text == "明天上午十点交周报"
+        job = (
+            await session.execute(select(Job).where(Job.kind == "extract", Job.note_id == note_id))
+        ).scalar_one()
+    assert job.status == "failed"
+    assert note.status == "failed"
+    assert note.memory_status == "pending"  # extract 失败不触碰 memory_status
+
+
+async def test_extract_finalize_skips_note_patched_after_enqueue(client, user, monkeypatch):
+    """INV-2/6：最后一次失败收尾前用户 PATCH 了笔记 → 不把新 rev 的笔记标 failed。
+
+    失败收尾按入队 rev 条件更新，rowcount=0 时不动 note；新 rev 的抽取
+    任务正常完成。
+    """
+    from app.db import get_sessionmaker
+    from app.pipeline import runner
+    from app.pipeline.runner import run_pending_jobs
+
+    headers = auth_headers(user)
+    r = await client.post(
+        "/v1/notes",
+        json={"client_note_id": str(uuid.uuid4()), "text": "会失败且会被中途改掉的笔记"},
+        headers=headers,
+    )
+    note_id = r.json()["note_id"]
+
+    class BoomLLM:
+        async def chat(self, messages, response_format=None):
+            raise RuntimeError("llm down")
+
+    async def fake_get_llm():
+        return BoomLLM()
+
+    monkeypatch.setattr("app.pipeline.extract.get_llm_client", fake_get_llm)
+
+    finalize_calls = {"n": 0}
+    real_finalize = runner._finalize
+
+    async def finalize_with_mid_race_patch(maker, claimed, error, retry_delay_seconds, worker_id):
+        finalize_calls["n"] += 1
+        if finalize_calls["n"] == 3:
+            # 第 3 次（最后一次）失败收尾前，用户 PATCH：rev+1 并入队新任务，
+            # LLM 恢复（模拟“旧任务失败与用户修改并发，新任务随后成功”）
+            monkeypatch.undo()
+            rev = (await client.get(f"/v1/notes/{note_id}", headers=headers)).json()["rev"]
+            patched = await client.patch(
+                f"/v1/notes/{note_id}",
+                json={"text": "用户改过的最新内容", "rev": rev},
+                headers=headers,
+            )
+            assert patched.status_code == 200, patched.text
+        await real_finalize(maker, claimed, error, retry_delay_seconds, worker_id)
+
+    monkeypatch.setattr(runner, "_finalize", finalize_with_mid_race_patch)
+
+    # 只跑 3 个：旧任务 3 次尝试全部失败（判 failed），新 rev 的任务留在队列里
+    processed = await run_pending_jobs(limit=3, retry_delay_seconds=0)
+    assert processed == 3
+
+    async with get_sessionmaker()() as session:
+        note = await session.get(Note, note_id)
+    assert note.status != "failed"  # 新 rev 未被过期任务的失败收尾覆盖
+    assert note.status == "uploaded"  # PATCH 后等待重新抽取
+
+    # 新 rev 的任务随后正常完成，记忆也收敛
+    await run_pending_jobs(retry_delay_seconds=0)
+    async with get_sessionmaker()() as session:
+        note = await session.get(Note, note_id)
+        jobs = (
+            await session.execute(select(Job).where(Job.note_id == note_id))
+        ).scalars().all()
+    assert {j.status for j in jobs} == {"failed", "done"}
+    assert note.status == "organized"  # 不是 failed：收尾条件更新未命中新 rev
+    assert note.rev == 3  # PATCH +1，新任务抽取再 +1
+    assert note.text == "用户改过的最新内容"
+    assert note.llm_calls == 1  # 只有新任务真正调用了 LLM
+    assert note.memory_status == "synced"
 
 
 async def test_relative_time_uses_recorded_at_and_keeps_original_text(
@@ -339,7 +407,7 @@ async def test_past_or_broken_fire_at_discarded(client, user, monkeypatch, run_j
     async def fake_get_llm():
         return PastLLM()
 
-    monkeypatch.setattr("app.pipeline.organize.get_llm_client", fake_get_llm)
+    monkeypatch.setattr("app.pipeline.extract.get_llm_client", fake_get_llm)
     r = await client.post(
         "/v1/notes",
         json={
@@ -361,9 +429,9 @@ async def test_past_or_broken_fire_at_discarded(client, user, monkeypatch, run_j
 
 
 async def test_fire_at_before_server_now_discarded(client, user, monkeypatch, run_jobs):
-    """P2：按 recorded_at 推算的提醒可能落在服务器当前时间之前（旧录音
-    补整理时“明天”是录音那天 的明天）。早于 now 的 fire_at 不生成
-    建议提醒；正常的未来时间仍生成。
+    """按 recorded_at 推算的提醒可能落在服务器当前时间之前（旧录音补抽取时
+    “明天”是录音那天的明天）。早于 now 的 fire_at 不生成建议提醒；
+    正常的未来时间仍生成。
     """
     from app.db import get_sessionmaker
 
@@ -396,7 +464,7 @@ async def test_fire_at_before_server_now_discarded(client, user, monkeypatch, ru
     async with get_sessionmaker()() as session:
         for note_id in (old_id, new_id):
             note = await session.get(Note, note_id)
-            assert note.status == "organized"  # 提醒被丢弃不影响整理本身
+            assert note.status == "organized"  # 提醒被丢弃不影响抽取本身
         old_reminders = (
             await session.execute(select(Reminder).where(Reminder.note_id == old_id))
         ).scalars().all()
@@ -412,7 +480,6 @@ async def test_fire_at_before_server_now_discarded(client, user, monkeypatch, ru
 async def test_enqueue_uses_configured_max_attempts(client, user, monkeypatch):
     """入队的 job 继承 settings.job_max_attempts，而不是写死默认值。"""
     from app.config import get_settings
-    from app.db import get_sessionmaker
 
     monkeypatch.setattr(get_settings(), "job_max_attempts", 5)
     r = await client.post(
@@ -421,261 +488,5 @@ async def test_enqueue_uses_configured_max_attempts(client, user, monkeypatch):
         headers={"authorization": f"Bearer {user['access_token']}"},
     )
     note_id = r.json()["note_id"]
-    async with get_sessionmaker()() as session:
-        job = (
-            await session.execute(
-                select(Job).where(Job.kind == "organize_note", Job.payload_json.contains(note_id))
-            )
-        ).scalars().one()
+    job = await _extract_job(note_id)
     assert job.max_attempts == 5
-
-
-async def test_failure_marks_note_failed(client, user, monkeypatch):
-    """LLM 连续失败 3 次后 note.status=failed。"""
-    import uuid
-
-    from app.db import get_sessionmaker
-    from app.pipeline.runner import run_pending_jobs
-
-    r = await client.post(
-        "/v1/notes",
-        json={"client_note_id": str(uuid.uuid4()), "text": "会失败的笔记"},
-        headers={"authorization": f"Bearer {user['access_token']}"},
-    )
-    note_id = r.json()["note_id"]
-
-    class BoomLLM:
-        async def chat(self, messages, response_format=None):
-            raise RuntimeError("llm down")
-
-    async def fake_get_llm():
-        return BoomLLM()
-
-    monkeypatch.setattr("app.pipeline.organize.get_llm_client", fake_get_llm)
-    await run_pending_jobs(retry_delay_seconds=0)
-
-    async with get_sessionmaker()() as session:
-        note = await session.get(Note, note_id)
-    assert note.status == "failed"
-
-
-async def test_failed_finalize_skips_note_patched_after_enqueue(client, user, monkeypatch):
-    """P1-C：最后一次失败收尾前用户 PATCH 了笔记 → 不把新 rev 的笔记标 failed。
-
-    旧收尾对 note 无条件置 failed：拿着旧 rev 的任务失败收尾时会把用户
-    刚 PATCH 出来的新版本也标成 failed。现在按入队 rev 条件更新，
-    rowcount=0 时不动 note；新 rev 的整理任务正常完成。
-    """
-    import uuid
-
-    from app.db import get_sessionmaker
-    from app.pipeline import runner
-    from app.pipeline.runner import run_pending_jobs
-    from tests.conftest import auth_headers
-
-    headers = auth_headers(user)
-    r = await client.post(
-        "/v1/notes",
-        json={"client_note_id": str(uuid.uuid4()), "text": "会失败且会被中途改掉的笔记"},
-        headers=headers,
-    )
-    note_id = r.json()["note_id"]
-
-    class BoomLLM:
-        async def chat(self, messages, response_format=None):
-            raise RuntimeError("llm down")
-
-    async def fake_get_llm():
-        return BoomLLM()
-
-    monkeypatch.setattr("app.pipeline.organize.get_llm_client", fake_get_llm)
-
-    finalize_calls = {"n": 0}
-    real_finalize = runner._finalize
-
-    async def finalize_with_mid_race_patch(maker, claimed, error, retry_delay_seconds, worker_id):
-        finalize_calls["n"] += 1
-        if finalize_calls["n"] == 3:
-            # 第 3 次（最后一次）失败收尾前，用户 PATCH：rev+1 并入队新任务，
-            # LLM 恢复（模拟“旧任务失败与用户修改并发，新任务随后成功”）
-            monkeypatch.undo()
-            rev = (await client.get(f"/v1/notes/{note_id}", headers=headers)).json()["rev"]
-            patched = await client.patch(
-                f"/v1/notes/{note_id}",
-                json={"text": "用户改过的最新内容", "rev": rev},
-                headers=headers,
-            )
-            assert patched.status_code == 200, patched.text
-        await real_finalize(maker, claimed, error, retry_delay_seconds, worker_id)
-
-    monkeypatch.setattr(runner, "_finalize", finalize_with_mid_race_patch)
-
-    # 只跑 3 个：旧任务 3 次尝试全部失败（判 failed），新 rev 的任务留在队列里。
-    # 此时检查收尾有没有污染用户的新版本（下一次运行才会执行新任务）
-    processed = await run_pending_jobs(limit=3, retry_delay_seconds=0)
-    assert processed == 3
-
-    async with get_sessionmaker()() as session:
-        note = await session.get(Note, note_id)
-    assert note.status != "failed"  # 新 rev 未被过期任务的失败收尾覆盖
-    assert note.status == "uploaded"  # PATCH 后等待重新整理
-
-    # 新 rev 的任务随后正常完成
-    await run_pending_jobs(retry_delay_seconds=0)
-    async with get_sessionmaker()() as session:
-        note = await session.get(Note, note_id)
-        jobs = (
-            await session.execute(
-                select(Job).where(Job.payload_json.contains(note_id))
-            )
-        ).scalars().all()
-    assert {j.status for j in jobs} == {"failed", "done"}
-    assert note.status == "organized"  # 不是 failed：收尾条件更新未命中新 rev
-    assert note.rev == 3  # PATCH +1，新任务整理再 +1
-    assert note.text == "用户改过的最新内容"
-    assert note.llm_calls == 1  # 只有新任务真正调用了 LLM
-
-
-# ---------------------------------------------------------------------------
-# P1：删除后记忆不复活——_sync_memory 的 add 后复查 + 幂等 cleanup_memory job
-# ---------------------------------------------------------------------------
-
-
-async def test_delete_during_memory_sync_does_not_resurrect(client, user, monkeypatch, run_jobs):
-    """P1：删除落在 _sync_memory 的 delete_by_note 与 add 之间：add 后的
-    复查发现 deleted_at 非空，把刚写入的记忆再删掉，最终 search 搜不到。
-
-    旧实现 add 完就直接置 memory_synced：删除请求的清理先跑、add 后落
-    的话，已删笔记的记忆就“复活”了。两个库都跑：交错用 store 钩子模拟
-    （worker 在 add 内让 DELETE 请求先完成），不依赖真实并发时序。
-    """
-    from sqlalchemy import select
-
-    from app.db import get_sessionmaker
-    from app.jobs.queue import enqueue
-    from app.memory.inmemory import InMemoryStore
-    from app.models import Job, Note
-    from tests.conftest import auth_headers
-
-    # SQLite 测试库文件跨测试复用：先排空残留 job
-    await run_jobs()
-
-    headers = auth_headers(user)
-    note_text = "这条笔记会在记忆写入途中被删除"
-    r = await client.post(
-        "/v1/notes",
-        json={"client_note_id": str(uuid.uuid4()), "text": note_text},
-        headers=headers,
-    )
-    note_id = r.json()["note_id"]
-
-    class DeleteRacingStore(InMemoryStore):
-        """add 真正写入前，先让 DELETE /v1/notes 完成（含它提交后的
-        delete_by_note）：删除恰好落在 _sync_memory 的 delete 与 add 之间。"""
-
-        def __init__(self):
-            super().__init__()
-            self.hooked = False
-
-        async def add(self, user_id, text, note_id=None):
-            if note_id == target_note_id and not self.hooked:
-                self.hooked = True
-                resp = await client.delete(f"/v1/notes/{note_id}", headers=headers)
-                assert resp.status_code == 204, resp.text
-            return await super().add(user_id, text, note_id=note_id)
-
-    store = DeleteRacingStore()
-    target_note_id = note_id
-    monkeypatch.setattr("app.pipeline.organize.get_memory_store", lambda: store)
-    monkeypatch.setattr("app.api.notes.get_memory_store", lambda: store)
-
-    # 只跑一个 job（organize，先入队）：删除发生在它执行中，此刻删除
-    # 入队的 cleanup_memory 还是 pending——先单独验证 add 后复查本身
-    # 把记忆清掉了，不靠 cleanup job 兜底掩盖复查失效
-    from app.pipeline.runner import run_pending_jobs
-
-    processed = await run_pending_jobs(limit=1)
-    assert processed == 1
-
-    async with get_sessionmaker()() as session:
-        note = await session.get(Note, note_id)
-        cleanups = (
-            await session.execute(
-                select(Job).where(
-                    Job.kind == "cleanup_memory", Job.payload_json.contains(note_id)
-                )
-            )
-        ).scalars().all()
-    assert note.deleted_at is not None  # 删除生效
-    assert note.memory_synced is False  # 复查发现已删，不再置位
-    assert len(cleanups) == 1 and cleanups[0].status == "pending"  # 还没轮到兜底
-    # organize 已完成而 cleanup 未跑的中间态：已删笔记的记忆不存在、搜不到
-    assert [m for m in await store.list(user["user_id"]) if m.note_id == note_id] == []
-    assert [m for m in await store.search(user["user_id"], note_text) if m.note_id == note_id] == []
-
-    # 兜底任务随后正常完成
-    await run_jobs()
-    async with get_sessionmaker()() as session:
-        organize = (
-            await session.execute(
-                select(Job).where(Job.kind == "organize_note", Job.payload_json.contains(note_id))
-            )
-        ).scalar_one()
-        cleanups = (
-            await session.execute(
-                select(Job).where(
-                    Job.kind == "cleanup_memory", Job.payload_json.contains(note_id)
-                )
-            )
-        ).scalars().all()
-    assert organize.status == "done"  # 整理任务未被删除交错打断
-    assert {j.status for j in cleanups} == {"done"}
-
-    # cleanup_memory 幂等：再手动入队一次并执行，仍正常完成、无副作用
-    async with get_sessionmaker()() as session:
-        await enqueue(session, "cleanup_memory", {"note_id": note_id, "user_id": user["user_id"]})
-        await session.commit()
-    await run_jobs()
-    async with get_sessionmaker()() as session:
-        again = (
-            await session.execute(
-                select(Job).where(Job.kind == "cleanup_memory", Job.payload_json.contains(note_id))
-            )
-        ).scalars().all()
-    assert {j.status for j in again} == {"done"}
-    assert [m for m in await store.list(user["user_id"]) if m.note_id == note_id] == []
-
-
-async def test_cleanup_memory_job_skips_live_note(client, user, run_jobs):
-    """cleanup_memory 只清已删笔记：笔记未删除时跳过，不误删在用记忆。"""
-    from sqlalchemy import select
-
-    from app.db import get_sessionmaker
-    from app.jobs.queue import enqueue
-    from app.memory.base import get_memory_store
-    from app.models import Job
-
-    r = await client.post(
-        "/v1/notes",
-        json={"client_note_id": str(uuid.uuid4()), "text": "还活着的笔记不该被清记忆"},
-        headers=auth_headers(user),
-    )
-    note_id = r.json()["note_id"]
-    await run_jobs()  # 正常整理：记忆已写入
-    store = get_memory_store()
-    assert [m for m in await store.list(user["user_id"]) if m.note_id == note_id]
-
-    async with get_sessionmaker()() as session:
-        await enqueue(session, "cleanup_memory", {"note_id": note_id, "user_id": user["user_id"]})
-        await session.commit()
-    await run_jobs()
-
-    # 笔记未删除：job 完成但记忆原样保留
-    assert [m for m in await store.list(user["user_id"]) if m.note_id == note_id]
-    async with get_sessionmaker()() as session:
-        job = (
-            await session.execute(
-                select(Job).where(Job.kind == "cleanup_memory", Job.payload_json.contains(note_id))
-            )
-        ).scalar_one()
-    assert job.status == "done"

@@ -61,7 +61,10 @@ async def test_patch_optimistic_lock_409(client, user):
     assert got.json()["status"] == "uploaded"  # 修改后回到 uploaded 等待重新整理
 
 
-async def test_delete_note_soft_and_cascade(client, user):
+async def test_delete_note_soft_and_cascade(client, user, run_jobs):
+    """软删除 + 记忆级联。INV-4：DELETE 请求本身**不碰** memory store
+    （只置 deleted_at 并入队 memory_sync job）；级联清理由随后的
+    memory_sync job 完成（delete_by_note）。"""
     from app.memory.base import get_memory_store
 
     r = await client.post("/v1/notes", json=_note_body(), headers=auth_headers(user))
@@ -75,9 +78,15 @@ async def test_delete_note_soft_and_cascade(client, user):
     # 读取 → 404（软删除）
     got = await client.get(f"/v1/notes/{note_id}", headers=auth_headers(user))
     assert got.status_code == 404
-    # 关联记忆被删除
+    # 请求路径不直接删记忆：DELETE 返回后记忆仍在
     remaining = [m for m in await store.list(user["user_id"]) if m.note_id == note_id]
-    assert remaining == []
+    assert remaining, "DELETE 不应同步触碰 memory store（INV-4）"
+
+    # 排空 job：extract 发现已删除 → done；memory_sync 对已删除笔记
+    # 执行 delete_by_note 且不再 add
+    await run_jobs()
+    remaining = [m for m in await store.list(user["user_id"]) if m.note_id == note_id]
+    assert remaining == [], "memory_sync 应清掉该笔记的全部记忆"
     # 再次删除 → 404
     again = await client.delete(f"/v1/notes/{note_id}", headers=auth_headers(user))
     assert again.status_code == 404

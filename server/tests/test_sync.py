@@ -109,7 +109,7 @@ async def test_sync_multi_reminders_one_note_limit1_no_loss(client, user, run_jo
     import json
     from datetime import UTC, datetime, timedelta
 
-    from app.pipeline import organize
+    from app.pipeline import extract
 
     class _FakeLLM:
         async def chat(self, messages, response_format=None):
@@ -126,7 +126,7 @@ async def test_sync_multi_reminders_one_note_limit1_no_loss(client, user, run_jo
     async def _fake_client():
         return _FakeLLM()
 
-    monkeypatch.setattr(organize, "get_llm_client", _fake_client)
+    monkeypatch.setattr(extract, "get_llm_client", _fake_client)
 
     headers = auth_headers(user)
     await _create(client, user, "一条产生多条建议提醒的笔记")

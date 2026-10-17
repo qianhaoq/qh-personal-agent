@@ -55,12 +55,14 @@ requires_postgres = pytest.mark.skipif(
 
 @pytest.fixture(autouse=True)
 async def _fresh_env():
-    """每个测试：建表 + 干净的记忆存储 + 结束后释放引擎。"""
-    if _TEST_DB_URL:
-        # PG：每个测试先 drop 再建，保证隔离（SQLite 靠 import 时删库文件 + 随机 ID）
-        engine = get_engine()
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.drop_all)
+    """每个测试：先 drop 再建表 + 干净的记忆存储 + 结束后释放引擎。
+
+    SQLite 同样 drop：import 时删库文件只清一次，同一进程内残留的
+    job/note 行会跨测试泄漏（并发测试尤其依赖空队列起步）。
+    """
+    engine = get_engine()
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
     await create_all()
     set_memory_store(InMemoryStore())
     yield

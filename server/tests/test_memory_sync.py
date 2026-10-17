@@ -1,0 +1,529 @@
+"""memory_sync 执行语义（INV-3/4/5，docs/server-invariants.md）。
+
+覆盖：记忆归属 metadata（note_id+source_rev）、API 不直删记忆、四步
+协议（写/删/复查/再入队）、C4（PATCH 后 extract 永久失败旧记忆清掉）、
+C9（复查不一致只删本次 add 的 id）、删除后不复活、worker 中断回收收敛、
+耗尽标 failed 的条件。交错窗口用 DelayedAddStore 类钩子注入（真实
+HTTP 请求落在钩子窗口里），不依赖数据库层并发语义，两后端都跑。
+"""
+import asyncio
+import uuid
+
+from sqlalchemy import select
+
+from app.memory.base import set_memory_store
+from app.memory.inmemory import InMemoryStore
+from app.models import Job, Note
+from tests.conftest import auth_headers
+
+
+async def _create_note(client, user, text: str = "我对花生过敏") -> str:
+    r = await client.post(
+        "/v1/notes",
+        json={"client_note_id": str(uuid.uuid4()), "text": text},
+        headers=auth_headers(user),
+    )
+    assert r.status_code == 202, r.text
+    return r.json()["note_id"]
+
+
+async def _note(note_id: str) -> Note:
+    from app.db import get_sessionmaker
+
+    async with get_sessionmaker()() as session:
+        return await session.get(Note, note_id)
+
+
+async def _memsync_jobs(note_id: str) -> list[Job]:
+    from app.db import get_sessionmaker
+
+    async with get_sessionmaker()() as session:
+        return (
+            await session.execute(
+                select(Job).where(Job.kind == "memory_sync", Job.note_id == note_id)
+            )
+        ).scalars().all()
+
+
+def get_store():
+    from app.memory.base import get_memory_store
+
+    return get_memory_store()
+
+
+async def _items(store, user_id: str, note_id: str) -> list:
+    return [m for m in await store.list(user_id) if m.note_id == note_id]
+
+
+# ---------------------------------------------------------------------------
+# INV-3 记忆归属
+# ---------------------------------------------------------------------------
+
+
+async def test_memory_metadata_contains_note_id_and_source_rev(client, user, run_jobs):
+    note_id = await _create_note(client, user, "我妈生日是三月五号，记得准备礼物")
+    await run_jobs()
+    note = await _note(note_id)
+    assert note.status == "organized"
+    items = await _items(get_store(), user["user_id"], note_id)
+    assert items, "organized 的笔记应有记忆"
+    for m in items:
+        assert m.note_id == note_id
+        assert m.source_rev == note.rev  # 记忆只属于当前 rev
+
+
+async def test_no_stale_rev_memory_after_repatch(client, user, run_jobs):
+    """INV-3 / C9 端到端：PATCH 重整理后旧 rev 的记忆不再留在检索里。"""
+    note_id = await _create_note(client, user, "我对花生过敏，吃饭要注意")
+    await run_jobs()
+    headers = auth_headers(user)
+    rev = (await client.get(f"/v1/notes/{note_id}", headers=headers)).json()["rev"]
+    patched = await client.patch(
+        f"/v1/notes/{note_id}",
+        json={"text": "我喜欢游泳，每周去两次", "rev": rev},
+        headers=headers,
+    )
+    assert patched.status_code == 200, patched.text
+    await run_jobs()
+
+    store = get_store()
+    items = await _items(store, user["user_id"], note_id)
+    assert items, "新 rev 应有记忆"
+    note = await _note(note_id)
+    assert all(m.source_rev == note.rev for m in items)
+    assert all("花生" not in m.text for m in items), "旧 rev 的记忆文本不该残留"
+
+    # /v1/search 搜旧内容：不该命中这条笔记的记忆
+    search = await client.get("/v1/search", params={"q": "花生过敏"}, headers=headers)
+    assert search.status_code == 200
+    assert [m for m in search.json()["items"] if m["note_id"] == note_id] == []
+    # 搜新内容：命中
+    search2 = await client.get("/v1/search", params={"q": "游泳"}, headers=headers)
+    assert [m for m in search2.json()["items"] if m["note_id"] == note_id], "新记忆应可检索"
+
+
+# ---------------------------------------------------------------------------
+# INV-4 API 路径不直接写删记忆
+# ---------------------------------------------------------------------------
+
+
+class RecordingStore(InMemoryStore):
+    """记录所有写方法调用的假 store。"""
+
+    def __init__(self):
+        super().__init__()
+        self.calls: list[str] = []
+
+    async def add(self, user_id, text, *, note_id=None, source_rev=None):
+        self.calls.append("add")
+        return await super().add(user_id, text, note_id=note_id, source_rev=source_rev)
+
+    async def delete(self, user_id, memory_ids):
+        self.calls.append(f"delete:{list(memory_ids)}")
+        return await super().delete(user_id, memory_ids)
+
+    async def delete_by_note(self, user_id, note_id):
+        self.calls.append("delete_by_note")
+        return await super().delete_by_note(user_id, note_id)
+
+    async def delete_all(self, user_id):
+        self.calls.append("delete_all")
+        return await super().delete_all(user_id)
+
+
+async def test_patch_and_delete_never_touch_memory_store_directly(client, user, run_jobs):
+    """INV-4：HTTP PATCH/DELETE 请求期间记忆 store 零调用；排空 job 后的
+    调用全部来自 memory_sync job。"""
+    store = RecordingStore()
+    set_memory_store(store)
+
+    note_id = await _create_note(client, user, "先整理出一条记忆")
+    await run_jobs()
+    assert "add" in store.calls  # 前置：memory_sync 确实写了记忆
+    store.calls.clear()
+
+    headers = auth_headers(user)
+    rev = (await client.get(f"/v1/notes/{note_id}", headers=headers)).json()["rev"]
+    patched = await client.patch(
+        f"/v1/notes/{note_id}", json={"text": "改过的内容", "rev": rev}, headers=headers
+    )
+    assert patched.status_code == 200, patched.text
+    assert store.calls == [], f"PATCH 期间不得触碰记忆 store：{store.calls}"
+
+    deleted = await client.delete(f"/v1/notes/{note_id}", headers=headers)
+    assert deleted.status_code == 204, deleted.text
+    assert store.calls == [], f"DELETE 期间不得触碰记忆 store：{store.calls}"
+
+    # 排空队列后：清/写只发生在 memory_sync job 里
+    await run_jobs()
+    assert store.calls, "排空 job 后 memory_sync 应已收敛记忆"
+    jobs = await _memsync_jobs(note_id)
+    assert jobs and all(j.status == "done" for j in jobs)
+    assert await _items(store, user["user_id"], note_id) == []  # 终态：已删笔记无记忆
+
+
+# ---------------------------------------------------------------------------
+# INV-5 四步执行语义
+# ---------------------------------------------------------------------------
+
+
+async def test_memory_sync_writes_memory_with_source_rev_and_marks_synced(client, user, run_jobs):
+    note_id = await _create_note(client, user, "周末和朋友聚餐")
+    await run_jobs()
+    note = await _note(note_id)
+    assert note.memory_status == "synced"
+    items = await _items(get_store(), user["user_id"], note_id)
+    assert items and all(m.source_rev == note.rev for m in items)
+    jobs = await _memsync_jobs(note_id)
+    assert {j.status for j in jobs} == {"done"}
+
+
+async def test_memory_sync_on_deleted_note_removes_memory(client, user, run_jobs):
+    note_id = await _create_note(client, user, "这条笔记会被删除")
+    await run_jobs()
+    store = get_store()
+    assert await _items(store, user["user_id"], note_id)
+
+    resp = await client.delete(f"/v1/notes/{note_id}", headers=auth_headers(user))
+    assert resp.status_code == 204
+    await run_jobs()
+
+    assert await _items(store, user["user_id"], note_id) == []
+    search = await client.get(
+        "/v1/search", params={"q": "这条笔记会被删除"}, headers=auth_headers(user)
+    )
+    assert [m for m in search.json()["items"] if m["note_id"] == note_id] == []
+
+
+async def test_memory_sync_on_unorganized_note_clears_stale_memory_without_add(
+    client, user, run_jobs, monkeypatch
+):
+    """INV-5.2 / C4：PATCH 后 extract 永久失败——旧 rev 的记忆被清掉、无新增。"""
+    store = RecordingStore()
+    set_memory_store(store)
+
+    note_id = await _create_note(client, user, "旧内容：我对花生过敏")
+    await run_jobs()  # organized + 记忆已写
+    assert await _items(store, user["user_id"], note_id)
+    added_before = store.calls.count("add")
+
+    class BoomLLM:
+        async def chat(self, messages, response_format=None):
+            raise RuntimeError("llm down")
+
+    async def fake_get_llm():
+        return BoomLLM()
+
+    monkeypatch.setattr("app.pipeline.extract.get_llm_client", fake_get_llm)
+
+    headers = auth_headers(user)
+    rev = (await client.get(f"/v1/notes/{note_id}", headers=headers)).json()["rev"]
+    patched = await client.patch(
+        f"/v1/notes/{note_id}", json={"text": "新内容：我喜欢游泳", "rev": rev}, headers=headers
+    )
+    assert patched.status_code == 200
+    # retry_delay=0 让 extract 立即重试至耗尽；memory_sync 在中途把旧记忆清掉
+    from app.pipeline.runner import run_pending_jobs
+
+    for _ in range(10):
+        if await run_pending_jobs(retry_delay_seconds=0) == 0:
+            break
+
+    note = await _note(note_id)
+    assert note.status == "failed"  # extract 耗尽
+    # memory_sync 在 extract 耗尽前就已把旧记忆清空并置位（内容已收敛）；
+    # 其取值为 synced（先于失败标记运行）或 failed（晚于失败标记运行），
+    # 两种交错都满足「记忆 == f(note 终态) = 空」
+    assert note.memory_status in ("synced", "failed")
+    assert store.calls.count("add") == added_before, "未 organized 不得新增记忆"
+    assert "delete_by_note" in store.calls
+    assert await _items(store, user["user_id"], note_id) == [], "旧记忆必须被清掉（C4）"
+    search = await client.get("/v1/search", params={"q": "花生过敏"}, headers=headers)
+    assert [m for m in search.json()["items"] if m["note_id"] == note_id] == []
+
+
+class DelayedAddStore(InMemoryStore):
+    """目标笔记的 add 先挂起等待放行：外部事件（PATCH/DELETE/别的写入）
+    落在 add 窗口里，复现真实交错。"""
+
+    def __init__(self):
+        super().__init__()
+        self.target_note_id: str | None = None
+        self.target_source_rev: int | None = None
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.in_window: list[str] = []
+        self.added_in_window: list = []
+        self.deleted_ids: list[str] = []
+
+    def _is_target(self, note_id, source_rev) -> bool:
+        return note_id == self.target_note_id and (
+            self.target_source_rev is None or source_rev == self.target_source_rev
+        )
+
+    async def add(self, user_id, text, *, note_id=None, source_rev=None):
+        if self._is_target(note_id, source_rev) and not self.entered.is_set():
+            self.entered.set()
+            await self.release.wait()
+            self.in_window.append("add")
+            items = await super().add(user_id, text, note_id=note_id, source_rev=source_rev)
+            self.added_in_window.extend(items)
+            return items
+        return await super().add(user_id, text, note_id=note_id, source_rev=source_rev)
+
+    async def delete(self, user_id, memory_ids):
+        self.deleted_ids.append(list(memory_ids))
+        return await super().delete(user_id, memory_ids)
+
+
+async def test_memory_sync_requeues_and_deletes_only_own_ids_on_rev_change(
+    client, user, run_jobs
+):
+    """INV-5.3 / C9：add 窗口内笔记被 PATCH（rev 变化）——复查发现后只删
+    本次 add 产生的 id，绝不 delete_by_note 误删并发新 rev 刚写的记忆；
+    并再入队（与 PATCH 已入队的 pending 去重合并）。"""
+    note_id = await _create_note(client, user, "版本二：我对花生过敏")
+    await run_jobs()  # organized rev=2，记忆 source_rev=2
+
+    store = DelayedAddStore()
+    store.target_note_id = note_id
+    store.target_source_rev = 2  # 只有旧 rev 的 add 挂起
+    set_memory_store(store)
+
+    from app.db import get_sessionmaker
+    from app.jobs.queue import enqueue
+    from app.pipeline.runner import run_pending_jobs
+
+    # 手动再入队一个 memory_sync（模拟去重竞争中留下的冗余任务）
+    async with get_sessionmaker()() as session, session.begin():
+        await enqueue(session, "memory_sync", {"note_id": note_id}, note_id=note_id)
+
+    worker = asyncio.create_task(run_pending_jobs(limit=1))
+    await asyncio.wait_for(store.entered.wait(), timeout=5)  # 旧任务 add 挂起中
+
+    headers = auth_headers(user)
+    # 窗口内：并发的“新 rev 任务”刚写了一条记忆（模拟另一 worker 的写入）
+    foreign = await store.add(
+        user["user_id"], "并发新任务刚写入的记忆", note_id=note_id, source_rev=99
+    )
+    # 窗口内：用户 PATCH（rev 2→3，enqueue extract(rev=3) + memory_sync pending）
+    patched = await client.patch(
+        f"/v1/notes/{note_id}", json={"text": "版本三：我喜欢游泳", "rev": 2}, headers=headers
+    )
+    assert patched.status_code == 200, patched.text
+
+    store.release.set()
+    await asyncio.wait_for(worker, timeout=10)
+
+    # 旧任务收尾：只删自己 add 的 id（C9），别的写入原样保留
+    own_ids = [m.id for m in store.added_in_window]
+    assert own_ids, "前置失败：旧任务应在窗口内 add 过记忆"
+    assert store.deleted_ids == [own_ids], (
+        f"复查不一致时必须只删本次 add 的 id：{store.deleted_ids}"
+    )
+    assert [m for m in await store.list(user["user_id"]) if m.id == foreign[0].id], (
+        "并发新写入的记忆不得被旧任务误删"
+    )
+    # 再入队发生（与 PATCH 的 pending 去重合并后仍有一个 pending 在队列里）
+    note = await _note(note_id)
+    assert note.rev == 3
+
+    # 排空：按新状态收敛（extract rev=3 → organized rev=4 → 记忆=新文本）
+    await run_jobs()
+    note = await _note(note_id)
+    assert note.status == "organized"
+    assert note.memory_status == "synced"
+    items = await _items(store, user["user_id"], note_id)
+    assert items and all("游泳" in m.text for m in items)
+    assert all(m.source_rev == note.rev for m in items)
+    assert [m for m in items if m.id == foreign[0].id] == [], "旧杂散记忆最终被收敛清掉"
+
+
+async def test_memory_sync_converges_after_delete_during_add(client, user, run_jobs):
+    """INV-5：删除落在 add 窗口内——复查发现 deleted，删掉本次新增并再入队，
+    最终该笔记的记忆彻底消失（不复活）。"""
+    note_id = await _create_note(client, user, "这条笔记的记忆会在写入途中被删除")
+    await run_jobs()
+
+    store = DelayedAddStore()
+    store.target_note_id = note_id
+    set_memory_store(store)
+
+    # 手动再入队一个 memory_sync，让它在 add 里挂起
+    from app.db import get_sessionmaker
+    from app.jobs.queue import enqueue
+    from app.pipeline.runner import run_pending_jobs
+
+    async with get_sessionmaker()() as session, session.begin():
+        await enqueue(session, "memory_sync", {"note_id": note_id}, note_id=note_id)
+
+    worker = asyncio.create_task(run_pending_jobs(limit=1))
+    await asyncio.wait_for(store.entered.wait(), timeout=5)
+
+    # 窗口内：真实 DELETE 请求（enqueue memory_sync、软删、提交）
+    deleted = await asyncio.wait_for(
+        client.delete(f"/v1/notes/{note_id}", headers=auth_headers(user)), timeout=3
+    )
+    assert deleted.status_code == 204, deleted.text
+
+    store.release.set()
+    await asyncio.wait_for(worker, timeout=10)
+
+    # 旧任务只删自己 add 的 id；DELETE 入队的任务随后把一切清干净
+    own_ids = [m.id for m in store.added_in_window]
+    assert own_ids and store.deleted_ids == [own_ids]
+    await run_jobs()
+    assert await _items(store, user["user_id"], note_id) == []
+    search = await client.get(
+        "/v1/search", params={"q": "写入途中被删除"}, headers=auth_headers(user)
+    )
+    assert [m for m in search.json()["items"] if m["note_id"] == note_id] == []
+    ask = await client.post(
+        "/v1/ask", json={"text": "被删除的笔记说了什么"}, headers=auth_headers(user)
+    )
+    assert ask.status_code == 200
+    assert "写入途中被删除" not in ask.json()["answer"]
+
+
+async def test_memory_sync_worker_killed_mid_run_reclaimed_converges(client, user, run_jobs):
+    """INV-5：worker 在外部写中途被杀（job 卡 running）→ 租约过期回收重跑，
+    按 note 当前状态收敛。"""
+    note_id = await _create_note(client, user, "回收前的内容")
+    await run_jobs()
+
+    headers = auth_headers(user)
+    rev = (await client.get(f"/v1/notes/{note_id}", headers=headers)).json()["rev"]
+    patched = await client.patch(
+        f"/v1/notes/{note_id}", json={"text": "回收后的新内容", "rev": rev}, headers=headers
+    )
+    assert patched.status_code == 200
+
+    # 先让 extract（PATCH 入队、排在 memory_sync 前面）正常完成
+    from datetime import timedelta
+
+    from app.config import get_settings
+    from app.db import get_sessionmaker
+    from app.jobs.queue import claim_next
+    from app.pipeline.runner import run_pending_jobs
+    from app.timeutil import utcnow
+
+    maker = get_sessionmaker()
+    assert await run_pending_jobs(limit=1) == 1
+
+    # 模拟 worker 认领 memory_sync 后立刻崩溃（job 留在 running）
+    from sqlalchemy import update
+
+    memsync_id = None
+    async with maker() as session, session.begin(), claim_next(session, worker_id="wkr_dead") as job:
+        assert job is not None
+        assert job.kind == "memory_sync"
+        memsync_id = job.id
+    async with maker() as session, session.begin():
+        await session.execute(
+            update(Job)
+            .where(Job.id == memsync_id)
+            .values(
+                locked_at=utcnow()
+                - timedelta(seconds=get_settings().job_lock_timeout_seconds + 60)
+            )
+        )
+
+    processed = await run_pending_jobs()  # 回收 + 重跑 + 排空其余 job
+    assert processed >= 1
+
+    note = await _note(note_id)
+    assert note.status == "organized"
+    assert note.memory_status == "synced"
+    items = await _items(get_store(), user["user_id"], note_id)
+    assert items and all("回收后的新内容" == m.text for m in items)
+    async with maker() as session:
+        job = await session.get(Job, memsync_id)
+    assert job.status == "done"
+    assert job.attempts == 2  # 认领 +1、回收 +1
+
+
+async def test_memory_sync_attempts_exhausted_marks_failed_only_without_newer_job(
+    client, user, run_jobs, monkeypatch
+):
+    """INV-2.5/INV-5：memory_sync 耗尽 → memory_status='failed'，但**仅当**
+    没有更新的 pending/running memory_sync（失败只是中间态时不落 failed）。"""
+    note_id = await _create_note(client, user, "同步会失败的内容")
+    await run_jobs()
+
+    headers = auth_headers(user)
+    rev = (await client.get(f"/v1/notes/{note_id}", headers=headers)).json()["rev"]
+
+    calls = {"add": 0}
+
+    class FlakyStore(InMemoryStore):
+        """add 可开关地抛错：模拟记忆后端故障与恢复。"""
+
+        def __init__(self):
+            super().__init__()
+            self.broken = True
+
+        async def add(self, user_id, text, *, note_id=None, source_rev=None):
+            calls["add"] += 1
+            if self.broken:
+                raise RuntimeError("memory backend down")
+            return await super().add(user_id, text, note_id=note_id, source_rev=source_rev)
+
+    flaky = FlakyStore()
+    set_memory_store(flaky)
+    # PATCH 触发一次 memory_sync（extract 正常，store.add 全挂）
+    patched = await client.patch(
+        f"/v1/notes/{note_id}", json={"text": "改过但同步失败", "rev": rev}, headers=headers
+    )
+    assert patched.status_code == 200
+
+    from app.pipeline import runner
+    from app.pipeline.runner import run_pending_jobs
+
+    finalize_calls = {"n": 0}
+    real_finalize = runner._finalize
+
+    async def finalize_with_mid_race_patch(maker, claimed, error, retry_delay_seconds, worker_id):
+        finalize_calls["n"] += 1
+        if finalize_calls["n"] == 3 and claimed.kind == "memory_sync":
+            # 旧 memory_sync 第 2 次失败收尾前，用户再 PATCH：留下新的
+            # pending memory_sync（失败只是中间态，不落 failed；旧任务回
+            # pending 会撞唯一索引，让位标 done）
+            cur = (await client.get(f"/v1/notes/{note_id}", headers=headers)).json()["rev"]
+            again = await client.patch(
+                f"/v1/notes/{note_id}", json={"text": "又一次修改", "rev": cur}, headers=headers
+            )
+            assert again.status_code == 200, again.text
+            flaky.broken = False  # 后续同步恢复
+        await real_finalize(maker, claimed, error, retry_delay_seconds, worker_id)
+
+    monkeypatch.setattr(runner, "_finalize", finalize_with_mid_race_patch)
+    for _ in range(10):
+        if await run_pending_jobs(retry_delay_seconds=0) == 0:
+            break
+
+    note = await _note(note_id)
+    assert note.memory_status != "failed", "还有更新的任务在途时不得落 failed"
+
+    # 排空：最终按最新状态收敛为 synced
+    for _ in range(10):
+        if await run_pending_jobs(retry_delay_seconds=0) == 0:
+            break
+    note = await _note(note_id)
+    assert note.memory_status == "synced"
+    assert note.status == "organized"
+
+    # 反向场景：没有更新的任务时，耗尽就落 failed（且不动 note.status）
+    flaky2 = FlakyStore()
+    set_memory_store(flaky2)
+    cur = (await client.get(f"/v1/notes/{note_id}", headers=headers)).json()["rev"]
+    patched2 = await client.patch(
+        f"/v1/notes/{note_id}", json={"text": "彻底同步失败", "rev": cur}, headers=headers
+    )
+    assert patched2.status_code == 200
+    monkeypatch.undo()
+    for _ in range(10):
+        if await run_pending_jobs(retry_delay_seconds=0) == 0:
+            break
+    note = await _note(note_id)
+    assert note.memory_status == "failed"
+    assert note.status == "organized"  # memory 失败不污染 note.status（修 C5）

@@ -201,7 +201,10 @@ def test_llm_provider_only_accepts_known_values():
     # 显式 sqlite URL：隔离 PG 运行时环境变量对生产校验的影响
     sqlite = "sqlite+aiosqlite:///./app.sqlite3"
     assert Settings(database_url=sqlite, llm_provider="mock").llm_provider == "mock"
-    assert Settings(database_url=sqlite, llm_provider="openai").llm_provider == "openai"
+    # openai 属合法取值（三元组齐备校验由 INV-10 用例单独覆盖，这里配齐）
+    assert (
+        Settings(database_url=sqlite, **_OPENAI_COMPLETE).llm_provider == "openai"
+    )
     with pytest.raises(ValidationError, match="llm_provider"):
         Settings(database_url=sqlite, llm_provider="openia")  # 拼错：直接校验失败
 
@@ -218,12 +221,79 @@ def test_production_mock_llm_allowed_with_test_flag():
 
 def test_production_openai_without_api_key_rejected():
     with pytest.raises(ValidationError, match="LLM_API_KEY"):
-        _pg_settings(llm_provider="openai", llm_api_key="")
+        _pg_settings(
+            llm_provider="openai",
+            llm_api_key="",
+            llm_base_url="https://llm.example.com/v1",
+            llm_model="test-model",
+        )
 
 
-def test_production_openai_with_api_key_ok():
-    settings = _pg_settings(llm_provider="openai", llm_api_key="sk-test-only")
+# ---------------------------------------------------------------------------
+# INV-10（修 C3/C7）：LLM 三元组齐备校验与 DEFAULT_TIMEZONE 的 IANA 校验，
+# 两者都在**任何环境**生效（不只是生产）。
+# ---------------------------------------------------------------------------
+
+_OPENAI_COMPLETE = {
+    "llm_provider": "openai",
+    "llm_api_key": "sk-test-only",
+    "llm_base_url": "https://llm.example.com/v1",
+    "llm_model": "test-model",
+}
+
+
+def test_openai_missing_api_key_rejected():
+    kwargs = dict(_OPENAI_COMPLETE, llm_api_key="")
+    with pytest.raises(ValidationError, match="LLM_API_KEY"):
+        Settings(database_url="sqlite+aiosqlite:///./app.sqlite3", **kwargs)
+    # 生产形态同样拒绝
+    with pytest.raises(ValidationError, match="LLM_API_KEY"):
+        _pg_settings(**kwargs)
+
+
+def test_openai_missing_base_url_rejected():
+    """修 C3：缺 LLM_BASE_URL 时相对 /chat/completions 的拼 URL 错必须在
+    启动期暴露，而不是等到第一次 extract/ask 才失败。"""
+    kwargs = dict(_OPENAI_COMPLETE, llm_base_url="")
+    with pytest.raises(ValidationError, match="LLM_BASE_URL"):
+        Settings(database_url="sqlite+aiosqlite:///./app.sqlite3", **kwargs)
+    with pytest.raises(ValidationError, match="LLM_BASE_URL"):
+        _pg_settings(**kwargs)
+
+
+def test_openai_missing_model_rejected():
+    kwargs = dict(_OPENAI_COMPLETE, llm_model="")
+    with pytest.raises(ValidationError, match="LLM_MODEL"):
+        Settings(database_url="sqlite+aiosqlite:///./app.sqlite3", **kwargs)
+    with pytest.raises(ValidationError, match="LLM_MODEL"):
+        _pg_settings(**kwargs)
+
+
+def test_openai_missing_two_fields_lists_both():
+    kwargs = dict(_OPENAI_COMPLETE, llm_base_url="", llm_model="")
+    with pytest.raises(ValidationError, match="LLM_BASE_URL、LLM_MODEL"):
+        Settings(database_url="sqlite+aiosqlite:///./app.sqlite3", **kwargs)
+
+
+def test_openai_all_three_configured_ok():
+    settings = _pg_settings(**_OPENAI_COMPLETE)
     assert settings.llm_provider == "openai"
+    assert settings.llm_base_url == "https://llm.example.com/v1"
+    assert settings.llm_model == "test-model"
+
+
+def test_default_timezone_invalid_rejected():
+    """修 C7：DEFAULT_TIMEZONE 拼错会让 naive recorded_at 静默按错误时区
+    解释、提醒解析回退——启动即拒。任何环境生效。"""
+    for tz in ("Asia/Bejing", "UTC+8", ""):
+        with pytest.raises(ValidationError, match="DEFAULT_TIMEZONE"):
+            Settings(database_url="sqlite+aiosqlite:///./app.sqlite3", default_timezone=tz)
+
+
+def test_default_timezone_valid_ok():
+    for tz in ("Asia/Shanghai", "UTC", "America/New_York"):
+        settings = Settings(database_url="sqlite+aiosqlite:///./app.sqlite3", default_timezone=tz)
+        assert settings.default_timezone == tz
 
 
 def test_sqlite_mock_llm_ok():
