@@ -40,6 +40,7 @@ class SeqLast(unittest.TestCase):
         self.assertEqual(rules("""
         async def f(session):
             payload.values(text=t, change_seq=await allocate_seq(session))
+            cfg.update(x).values(text=t, change_seq=await allocate_seq(session))
         """), [])
 
     def test_enqueue_after_allocate_flagged(self):

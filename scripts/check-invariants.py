@@ -129,7 +129,8 @@ def _only_seq_update(call: ast.Call) -> bool:
 
 def _is_dml(call: ast.Call) -> bool:
     """execute(update/insert/delete(...)) — SELECTs and other reads are not writes."""
-    return any(isinstance(n, ast.Call) and _name(n.func) in {"update", "insert", "delete"} for n in ast.walk(call))
+    return any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in {"update", "insert", "delete"}
+               for n in ast.walk(call))
 
 
 def _exclusive(a, b, parents) -> bool:
@@ -194,7 +195,8 @@ def check_seq_last(tree, path, parents) -> list[Finding]:
                 if p is fn:
                     break
                 if isinstance(p, ast.Call) and _name(p.func) == "values" and isinstance(p.func, ast.Attribute) \
-                        and any(isinstance(n, ast.Call) and _name(n.func) == "update" for n in ast.walk(p.func.value)):
+                        and any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "update"
+                                for n in ast.walk(p.func.value)):  # bare sqlalchemy update(Model), not obj.update()
                     extra = sorted({k.arg for k in p.keywords if k.arg} - SEQ_COLUMNS)
                     if extra:
                         out.append(Finding(path, seq.lineno, "INV-SEQ-LAST",
