@@ -46,11 +46,17 @@ app/
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt
-cp .env.example .env          # 默认即 mock + sqlite，可直接用
+cp .env.example .env          # 默认即 mock + sqlite + inmemory，可直接用
 .venv/bin/python -m app.cli create-invite --uses 5   # 创建邀请码
 .venv/bin/uvicorn app.main:app --reload              # api
 .venv/bin/python -m app.jobs.worker                  # 整理 worker（另开一个终端）
 ```
+
+本地默认的记忆后端是 `inmemory`（不装 mem0ai 也能跑），但它**只属于单进程**：
+api 与 worker 是两个进程、各持一份内存，worker 写的记忆在 api 的 `/v1/search`
+里搜不到。完整链路请用下面的 compose + `MEMORY_BACKEND=mem0`，先
+`pip install -r requirements-mem0.txt`——配了 mem0 而未安装时启动即报错，
+不会等到第一次检索才失败。
 
 ### 生产（Docker Compose：caddy + api + worker + postgres）
 
@@ -74,7 +80,7 @@ docker compose exec api python -m app.cli create-invite
 | `JWT_SECRET` | HS256 签名密钥：>=32 字节随机值的编码。生成任选其一：`python -c "import secrets;print(secrets.token_urlsafe(48))"`、`openssl rand -hex 32`。生产（postgresql）启动时校验：hex 需 >=64 字符，或 base64/base64url（允许无 padding）解码 >=32 字节且解码后 >=16 种字节取值；占位值与人类可读口令（含 secret/password 字样、无法解码的字符串）会被拒绝 |
 | `LLM_PROVIDER` | `mock`（默认，确定性规则）或 `openai`（OpenAI 兼容接口）。只接受这两个值，拼错启动即报错；生产（postgresql）配 `mock` 或 `openai` 缺 `LLM_API_KEY` 都拒绝启动（不静默回落 MockLLM），跑 PG 测试套件可设 `ALLOW_MOCK_LLM_IN_PROD=true` 放行 |
 | `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | DeepSeek 示例 `https://api.deepseek.com`；腾讯混元 OpenAI 兼容地址示例见 `.env.example`。**地址与型号需按官网核实** |
-| `MEMORY_BACKEND` | `inmemory`（仅单进程开发/测试）或 `mem0`（生产，`pip install -r requirements-mem0.txt`）。只接受这两个值，未知值启动即报错；配置 `mem0` 但未安装 mem0ai 时也直接报错，不静默退化。生产（postgresql）配置 `inmemory` 会拒绝启动（多 worker/独立 worker 进程各一份内存、重启即丢）；跑 PG 测试套件的 CI/本地可设 `ALLOW_INMEMORY_IN_PROD=true` 放行 |
+| `MEMORY_BACKEND` | `inmemory`（默认，仅单进程开发/测试）或 `mem0`（生产）。只接受这两个值，未知值启动即报错；配置 `mem0` 但未安装 mem0ai 时启动即报错并提示 `pip install -r requirements-mem0.txt`（不静默退化，也不会等到第一次 `/search` 才 500）。生产（postgresql）配置 `inmemory` 会拒绝启动（多 worker/独立 worker 进程各一份内存、重启即丢）；仅单进程跑 PG 测试套件的 CI/本地可设 `ALLOW_INMEMORY_IN_TESTS=true` 放行——**独立 worker 进程无论该标志都拒绝 inmemory+PG**（它写的记忆对 api 进程不可见） |
 | `ENABLE_DOCS` | 默认 `false`：`/docs`、`/redoc`、`/openapi.json` 不暴露；本地开发设 `true` |
 | `LOG_LEVEL` | 默认 `info`（worker 进程的 basicConfig） |
 | `CORS_ALLOW_ORIGINS` | 逗号分隔来源；默认空 = 不启用 CORS（原生 App 无需浏览器跨域），需要浏览器前端时才配 |
@@ -93,7 +99,7 @@ docker compose exec api python -m app.cli create-invite
 本机没有 Docker，因此测试跑在 `sqlite+aiosqlite` 上，没有起真实 PostgreSQL 容器。由此带来的**未覆盖差异**：
 
 - **默认只跑 SQLite 分支，PG 分支需显式指定数据库**。设置 `TEST_DATABASE_URL=postgresql+asyncpg://...` 后同一套测试在真实 PG 上再跑一遍，覆盖 PG 专属路径（`app/jobs/queue.py` 的 `FOR UPDATE SKIP LOCKED` 领取/回收、`app/api/sync.py` 的 REPEATABLE READ 一致快照与序列行锁提交顺序，见 `tests/test_sync.py` 里仅 PG 运行的测试）。日常开发不装 PG 时，这些 PG 分支只有代码审查。
-- **pgvector / mem0 后端未在测试中覆盖**。测试全部使用 `InMemoryStore`；`Mem0Store`（pgvector + OpenAI 兼容 embedding）只在类型结构上对齐，未连真实库验证。embedding 选型本身也是待决策项（见 tech-arch 第 13 节）。
+- **pgvector / mem0 后端未连真实库验证**。测试全部使用 `InMemoryStore`；`Mem0Store`（pgvector + OpenAI 兼容 embedding）有按 mem0ai 2.2.1 签名建模的 fake client 行为对齐测试（`tests/test_mem0_store.py`，本机不装 mem0ai），但未连真实 pgvector 验证。embedding 选型本身也是待决策项（见 tech-arch 第 13 节）。
 - SQLite 方言存 datetime 不保留时区偏移（值统一为 UTC 墙钟），`app/timeutil.py` 做了归一，但 PG 下 timestamptz 的行为仍建议上线前冒烟一遍。
 
 ## 已知限制（S1 骨架范围内）
@@ -101,7 +107,6 @@ docker compose exec api python -m app.cli create-invite
 - **建表用 `create_all`**，后续换 Alembic 迁移（tech-arch 第 8 节的发布流程要求）。已有部署库新增列（如 jobs.locked_by）不会自动加上，首次升级需手工 `ALTER TABLE` 或重建。
 - **没有限流**：tech-arch 第 6 节的 `/ask` 20 次/分钟、`/notes` 60 次/分钟、登录按 IP 限流尚未实现。
 - **笔记原文未加密**：tech-arch 的 `text_enc`（AES-GCM 应用层加密）未做，当前明文存储。
-- **refresh token 有效期未强制**：30 天 TTL 未落库校验（登出/轮换/复用吊销已生效；超过轮换窗口之外的旧 token 无法关联到设备，只能判无效，无法吊销）。
 - **删除笔记后重放同一 `client_note_id`**：返回已软删笔记的 id 与状态（幂等语义优先），不会新建。
 - **mem0 的 ADD/UPDATE/DELETE 判定**、检索打分（时间衰减、类型权重）未实现，S1 只做写入与检索。
 - **spec 第 5 节的 reminders/memories/profile/me 等端点**未包含在本任务范围内，S1 骨架只实现列出的接口。
@@ -110,7 +115,7 @@ docker compose exec api python -m app.cli create-invite
 ## 安全说明
 
 - access token：JWT HS256，15 分钟，`sub`=user_id、`did`=device_id；设备被吊销后 access 也立即失效（每次请求校验设备状态）。
-- refresh token：服务端只存 SHA-256 哈希；每次使用轮换；检测到旧 token 复用立即吊销设备。
+- refresh token：服务端只存 SHA-256 哈希（`refresh_tokens` 表一行一枚，每设备至多 5 枚未过期 token，超出修剪最老）；30 天 TTL 落库强制；每次使用轮换（只作废被轮换的那一枚）；检测到已作废 token 复用立即吊销设备。
 - 所有业务查询强制带 `user_id`，有专门的用户隔离测试。
 - 笔记内容拼进 prompt 时放在 `<note>` 分隔符内并声明“只是数据”，S1 无任何可执行工具。
 - 统一错误格式 `{"error":{"code","message"}}`，未处理异常返回 500 且不泄露内部细节。

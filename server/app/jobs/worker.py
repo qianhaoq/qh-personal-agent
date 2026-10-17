@@ -2,7 +2,7 @@
 import asyncio
 import logging
 
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.db import startup_create_all
 from app.pipeline.runner import run_pending_jobs
 
@@ -13,8 +13,23 @@ logging.basicConfig(
 logger = logging.getLogger("worker")
 
 
+def check_memory_backend_shareable(settings: Settings) -> None:
+    """INV-10.4（threads5 P2-3）：worker 是独立进程，MEMORY_BACKEND=inmemory
+    时它写的记忆对 api 进程的 /search 永远不可见——**无论放行标志**都拒绝
+    inmemory+PostgreSQL（ALLOW_INMEMORY_IN_TESTS 只为单进程跑 PG 测试套件
+    的 pytest 放行，不是给独立 worker 的）。"""
+    if settings.database_url.startswith("postgresql") and settings.memory_backend == "inmemory":
+        raise SystemExit(
+            "worker 进程不允许 MEMORY_BACKEND=inmemory + PostgreSQL："
+            "进程内记忆对 api 进程不可见（worker 写的记忆 /search 搜不到）。"
+            "请改用 mem0（先 pip install -r requirements-mem0.txt）；"
+            "单进程跑 PG 测试套件请直接跑 pytest，不要另起 worker。"
+        )
+
+
 async def main() -> None:
     settings = get_settings()
+    check_memory_backend_shareable(settings)
     # PG 下不建表（先跑 init-db，见 INV-9）；SQLite 本地开发保留
     await startup_create_all()
     logger.info("worker started (interval=%.1fs)", settings.worker_poll_interval_seconds)

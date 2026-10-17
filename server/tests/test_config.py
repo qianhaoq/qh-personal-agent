@@ -14,11 +14,18 @@ PG_URL = "postgresql+asyncpg://u:p@localhost/db"
 GOOD_HEX = bytes(range(32)).hex()
 
 
+@pytest.fixture(autouse=True)
+def _assume_mem0ai_installed(monkeypatch):
+    """本机测试环境不装 mem0ai：INV-10.3 的安装探测统一按已安装放行，
+    「未安装」路径由专门用例单独改写探测结果模拟。"""
+    monkeypatch.setattr("app.config._mem0ai_installed", lambda: True)
+
+
 def _pg_settings(**kwargs) -> Settings:
     """生产形态（postgresql）的合法基线：强 secret + mem0 记忆后端 + 合法 LLM。
 
     不带 memory_backend 的话会先撞上“生产拒绝 inmemory”的校验（PG 跑
-    测试时 conftest 还设置了 ALLOW_INMEMORY_IN_PROD，行为随运行方式
+    测试时 conftest 还设置了 ALLOW_INMEMORY_IN_TESTS，行为随运行方式
     漂移），LLM 同理（ALLOW_MOCK_LLM_IN_PROD），显式固定住。
     """
     kwargs.setdefault("jwt_secret", GOOD_HEX)
@@ -136,16 +143,17 @@ def test_memory_backend_only_accepts_known_values():
 def test_production_inmemory_memory_backend_rejected():
     """P1：生产（postgresql）+ inmemory 静默丢记忆，启动即拒绝。
 
-    显式传 allow_inmemory_in_prod=False：PG 跑测试时 conftest 会把该
+    显式传 allow_inmemory_in_tests=False：PG 跑测试时 conftest 会把该
     环境变量设为 true，不压住的话这条用例在不同运行方式下行为漂移。
     """
     with pytest.raises(ValidationError, match="MEMORY_BACKEND"):
-        _pg_settings(memory_backend="inmemory", allow_inmemory_in_prod=False)
+        _pg_settings(memory_backend="inmemory", allow_inmemory_in_tests=False)
 
 
 def test_production_inmemory_with_explicit_test_flag_allowed():
-    """ALLOW_INMEMORY_IN_PROD=true 只为跑 PG 测试套件放行（生产不要设）。"""
-    settings = _pg_settings(memory_backend="inmemory", allow_inmemory_in_prod=True)
+    """ALLOW_INMEMORY_IN_TESTS=true 只为单进程跑 PG 测试套件放行（生产
+    不要设；独立 worker 进程无论该标志都拒绝）。"""
+    settings = _pg_settings(memory_backend="inmemory", allow_inmemory_in_tests=True)
     assert settings.memory_backend == "inmemory"
 
 
@@ -159,17 +167,57 @@ def test_sqlite_inmemory_memory_backend_ok():
     assert settings.memory_backend == "inmemory"
 
 
-def test_env_example_defaults_to_mem0_backend():
-    """P1：部署模板默认 mem0（pgvector + OpenAI 兼容 embedding/LLM），
-    inmemory 只留给单进程开发/测试。"""
+def test_env_example_local_default_inmemory_documents_mem0():
+    """threads5 P2-3：模板本地默认 inmemory（本地安装步骤不装 mem0ai，
+    默认 mem0 会让照抄模板的人启动即报错）；mem0 行以注释给出并写明
+    安装命令与单进程局限。"""
     env_example = (
         pathlib.Path(__file__).resolve().parent.parent / ".env.example"
     ).read_text(encoding="utf-8")
     lines = [ln.strip() for ln in env_example.splitlines()]
-    assert "MEMORY_BACKEND=mem0" in lines
+    assert "MEMORY_BACKEND=inmemory" in lines
+    assert "# MEMORY_BACKEND=mem0" in lines
+    # 安装命令与单进程局限必须写明（读者据此知道何时切换 mem0）
+    assert any("pip install -r requirements-mem0.txt" in ln for ln in lines)
+    assert any("单进程" in ln for ln in lines)
     # mem0 的 embedding/LLM OpenAI 兼容配置有占位说明
     assert any(ln.startswith("# MEM0_EMBEDDING_BASE_URL=") for ln in lines)
     assert any(ln.startswith("# MEM0_EMBEDDING_MODEL=") for ln in lines)
+
+
+def test_mem0_backend_missing_mem0ai_rejected_at_startup(monkeypatch):
+    """threads5 P2-3 / INV-10.3：MEMORY_BACKEND=mem0 而未装 mem0ai——启动
+    即报错且错误信息带安装命令（记忆 store 懒构造，不查的话要等第一次
+    /search 才 500）。任何环境生效。"""
+    monkeypatch.setattr("app.config._mem0ai_installed", lambda: False)
+    with pytest.raises(ValidationError, match="requirements-mem0.txt"):
+        _pg_settings(memory_backend="mem0")
+    # SQLite 本地开发同样生效（不是只挡生产）
+    with pytest.raises(ValidationError, match="requirements-mem0.txt"):
+        Settings(database_url="sqlite+aiosqlite:///./app.sqlite3", memory_backend="mem0")
+
+
+def test_worker_refuses_inmemory_with_postgres():
+    """threads5 P2-3 / INV-10.4：独立 worker 进程无论放行标志都拒绝
+    inmemory+PG——它写的记忆对 api 进程的 /search 不可见；SQLite 本地
+    开发不受限。"""
+    from app.jobs.worker import check_memory_backend_shareable
+
+    flagged = Settings(
+        database_url=PG_URL,
+        jwt_secret=GOOD_HEX,
+        memory_backend="inmemory",
+        allow_inmemory_in_tests=True,  # 即便放行标志开着
+        allow_mock_llm_in_prod=True,
+    )
+    with pytest.raises(SystemExit, match="inmemory"):
+        check_memory_backend_shareable(flagged)
+
+    sqlite = Settings(database_url="sqlite+aiosqlite:///./app.sqlite3", memory_backend="inmemory")
+    check_memory_backend_shareable(sqlite)  # SQLite 本地开发：不抛
+
+    mem0 = _pg_settings(memory_backend="mem0")
+    check_memory_backend_shareable(mem0)  # PG + mem0：正常
 
 
 def test_get_memory_store_unknown_backend_raises(monkeypatch):

@@ -20,8 +20,9 @@ if _TEST_DB_URL:
     os.environ["DATABASE_URL"] = _TEST_DB_URL
     # PG（生产形态）下 config 会拒绝 MEMORY_BACKEND=inmemory：测试套件
     # 显式放行（生产环境不允许，见 config._reject_inmemory_memory_backend_
-    # in_production），记忆后端仍统一用进程内假实现
-    os.environ["ALLOW_INMEMORY_IN_PROD"] = "true"
+    # in_production；仅限单进程 pytest，独立 worker 进程不放行），记忆后端
+    # 仍统一用进程内假实现
+    os.environ["ALLOW_INMEMORY_IN_TESTS"] = "true"
     # 同理：LLM_PROVIDER=mock 在生产形态下默认拒绝（见
     # config._reject_misconfigured_llm_in_production），测试套件显式放行
     os.environ["ALLOW_MOCK_LLM_IN_PROD"] = "true"
