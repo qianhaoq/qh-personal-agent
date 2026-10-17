@@ -1,0 +1,14 @@
+# FastAPI 官方写法就是把 Depends/Query/Body 等放在参数默认值上，
+# 这些调用结果是不可变的，告诉 bugbear 不要按 B008 报。
+[lint.flake8-bugbear]
+extend-immutable-calls = [
+    "fastapi.Depends",
+    "fastapi.Query",
+    "fastapi.Body",
+    "fastapi.Path",
+    "fastapi.Form",
+    "fastapi.File",
+    "fastapi.Header",
+    "fastapi.Cookie",
+    "fastapi.Security",
+]
