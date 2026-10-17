@@ -18,7 +18,7 @@ import re
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common import allocate_seq, new_id
@@ -144,7 +144,6 @@ async def organize_note(
     note.updated_at = utcnow()
 
     ref = _reference_time(note)
-    seq = await allocate_seq(session)
     for r in extraction["suggested_reminders"]:
         fire_at = _parse_fire_at(r.get("fire_at"), note.timezone or settings.default_timezone)
         if fire_at is None or fire_at <= ref:
@@ -158,7 +157,9 @@ async def organize_note(
                 title=r["title"],
                 fire_at=fire_at,
                 status="suggested",
-                change_seq=seq,
+                # 每条各自分配 seq：共用同一个值时，分页切在组中间会让
+                # 剩余提醒被 `> cursor` 永久跳过
+                change_seq=await allocate_seq(session),
             )
         )
     await session.flush()
@@ -187,8 +188,14 @@ def _parse_fire_at(value, tzname: str):
 
 async def _clear_prev_outputs(session: AsyncSession, note: Note) -> None:
     """重新整理前清掉旧的建议提醒（软删），mem0 的 ADD/UPDATE 判定交给 mem0。"""
-    await session.execute(
-        update(Reminder)
-        .where(Reminder.note_id == note.id, Reminder.status == "suggested")
-        .values(deleted_at=utcnow(), change_seq=await allocate_seq(session))
-    )
+    reminders = (
+        await session.execute(
+            select(Reminder).where(Reminder.note_id == note.id, Reminder.status == "suggested")
+        )
+    ).scalars().all()
+    now = utcnow()
+    for r in reminders:
+        r.deleted_at = now
+        # 逐行更新而不是一条 bulk UPDATE：共用同一个 seq 时，分页切在组中间
+        # 会让剩余墓碑被 `> cursor` 永久跳过
+        r.change_seq = await allocate_seq(session)

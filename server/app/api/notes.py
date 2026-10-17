@@ -182,10 +182,11 @@ async def delete_note(
     reminders = (
         await session.execute(select(Reminder).where(Reminder.note_id == note.id))
     ).scalars().all()
-    seq = await allocate_seq(session)
     for r in reminders:
         r.deleted_at = now
-        r.change_seq = seq
+        # 每条各自分配 seq：共用同一个值时，分页切在组中间会让剩余墓碑被
+        # `> cursor` 永久跳过
+        r.change_seq = await allocate_seq(session)
     store = get_memory_store()
     await store.delete_by_note(user_id, note.id)
     await session.commit()
@@ -203,9 +204,10 @@ async def _invalidate_outputs(session: AsyncSession, note: Note) -> None:
         )
     ).scalars().all()
     if reminders:
-        seq = await allocate_seq(session)
+        now = utcnow()
         for r in reminders:
-            r.deleted_at = utcnow()
-            r.change_seq = seq
+            r.deleted_at = now
+            # 同 delete_note：每条各自分配 seq，避免分页切断同 seq 组
+            r.change_seq = await allocate_seq(session)
     store = get_memory_store()
     await store.delete_by_note(note.user_id, note.id)

@@ -100,6 +100,43 @@ async def test_sync_pagination_merged_stream_no_loss(client, user, run_jobs):
         assert all(r["note_id"] == reminder_note_id for r in suggested)
 
 
+async def test_sync_multi_reminders_one_note_limit1_no_loss(client, user, run_jobs, monkeypatch):
+    """回归：同一笔记的多条建议提醒各自分配 change_seq。
+
+    旧实现一批提醒共用同一个 seq，limit=1 分页恰好切在组中间时，cursor
+    取本页最后一条的 seq，同组剩余提醒被 `> cursor` 永久跳过。
+    """
+    import json
+    from datetime import UTC, datetime, timedelta
+
+    from app.pipeline import organize
+
+    class _FakeLLM:
+        async def chat(self, messages, response_format=None):
+            base = datetime.now(UTC)
+            reminders = [
+                {"title": f"提醒事项{i}", "fire_at": (base + timedelta(hours=1 + i)).isoformat()}
+                for i in range(4)
+            ]
+            return json.dumps(
+                {"title": "多条提醒", "tags": [], "todos": [], "suggested_reminders": reminders},
+                ensure_ascii=False,
+            )
+
+    async def _fake_client():
+        return _FakeLLM()
+
+    monkeypatch.setattr(organize, "get_llm_client", _fake_client)
+
+    headers = auth_headers(user)
+    await _create(client, user, "一条产生多条建议提醒的笔记")
+    await run_jobs()
+
+    _notes, reminders = await _walk(client, headers, limit=1)
+    suggested = [r for r in reminders if r.get("status") == "suggested"]
+    assert {r["title"] for r in suggested} == {f"提醒事项{i}" for i in range(4)}
+
+
 async def test_sync_isolated_per_user(client, user):
     from app.db import get_sessionmaker
     from tests.conftest import make_invite
