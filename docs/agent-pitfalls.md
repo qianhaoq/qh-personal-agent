@@ -67,7 +67,7 @@ async def get_note(note_id: NoNulStr): ...
 async def get_note(note_id: Annotated[str, Path(pattern=r"^nte_[0-9a-f]{16}$")]): ...
 ```
 
-机检 `INV-NUL`：FastAPI 路由里类型为 `str`、`str | None`、`Optional[str]`，或者没有 NUL 安全约束的 `Annotated[str, …]` 的 path 参数。接受 `NoNulStr`、`reject_nul`/`AfterValidator`、`Path/Query(pattern=…)`，以及 `{id:int}` 这类非字符串转换器。只读取装饰器里的路径，不解析 router 的 prefix。
+机检 `INV-NUL`：FastAPI 路由里类型为 `str`、`str | None`、`Optional[str]`，或者没有 NUL 安全约束的 `Annotated[str, …]` 的 path 参数。接受 `NoNulStr`、`reject_nul`、`Annotated` 里任何 `*Validator(...)`（Before/After/Plain/WrapValidator，含 `pydantic.X` 写法）、`Path/Query(pattern=…)`，以及 `{id:int}` 这类非字符串转换器；默认值或 `Annotated` 里带 `Depends(...)`/`Security(...)` 的参数（依赖注入，由依赖负责校验）直接跳过。只读取装饰器里的路径，不解析 router 的 prefix。
 
 ## 4. 提交后副作用要能收敛（INV-3、INV-4、INV-5） <a id="side-effects"></a>
 
@@ -103,7 +103,7 @@ raise ValueError(s.provider)
 await s.execute(update(Note).values(text=t, change_seq=await allocate_seq(s)))
 # 对
 await s.execute(update(Note).where(...).values(text=t, rev=Note.rev + 1))
-await enqueue(s, "organize_note", {...})
+await enqueue(s, "extract", {...})
 await s.flush()
 seq = await allocate_seq(s)
 await s.execute(update(Note).where(Note.id == nid).values(change_seq=seq))

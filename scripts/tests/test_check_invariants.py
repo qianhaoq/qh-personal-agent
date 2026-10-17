@@ -34,7 +34,7 @@ class SeqLast(unittest.TestCase):
         src = """
         async def create(session):
             note.change_seq = await allocate_seq(session)
-            await enqueue(session, "organize_note", {})
+            await enqueue(session, "extract", {})
         """
         self.assertEqual(rules(src), [("INV-SEQ-LAST", 4)])
         self.assertEqual(errors(src), [])
@@ -61,7 +61,7 @@ class SeqLast(unittest.TestCase):
             session.add(note)
             await session.flush()
             note.change_seq = await allocate_seq(session)
-            await enqueue(session, "organize_note", {})
+            await enqueue(session, "extract", {})
         """), [("INV-SEQ-LAST", 6)])
 
     def test_nested_in_business_update_flagged(self):
@@ -78,7 +78,7 @@ class SeqLast(unittest.TestCase):
         self.assertEqual(rules("""
         async def patch(session):
             await session.execute(update(Note).values(text=t))
-            await enqueue(session, "organize_note", {})
+            await enqueue(session, "extract", {})
             await session.flush()
             seq = await allocate_seq(session)
             await session.execute(update(Note).where(Note.id == i).values(change_seq=seq))
@@ -180,6 +180,48 @@ class Nul(unittest.TestCase):
         async def i(g: Annotated[str, StringConstraints(pattern=r"^x$")]): ...
         """), [])
 
+    def test_any_validator_in_annotated_ok(self):
+        # QA bbef39d P1: all of these return 422 for %00 at runtime
+        self.assertEqual(rules("""
+        @router.get("/{a}/{b}/{c}/{d}/{e}/{f}")
+        async def g(
+            a: Annotated[str, Path(), BeforeValidator(no_nul)],
+            b: Annotated[str, Path(), PlainValidator(no_nul)],
+            c: Annotated[str, WrapValidator(no_nul_wrap)],
+            d: Annotated[str, Path(), AfterValidator(no_nul)],
+            e: Annotated[str, pydantic.BeforeValidator(no_nul)],
+            f: "Annotated[str, functional_validators.WrapValidator(w)]",
+        ): ...
+        """), [])
+
+    def test_depends_and_security_skipped(self):
+        self.assertEqual(rules("""
+        @router.get("/{a}/{b}/{c}/{d}/{e}/{f}/{g}")
+        async def h(
+            a: Annotated[str, Depends(valid_note_id)],
+            b: Annotated[str, Path(), fastapi.Depends(valid_note_id)],
+            c: Annotated[str, Security(scoped_id, scopes=["n"])],
+            d: str = Depends(valid_note_id),
+            e: str = fastapi.Depends(valid_note_id),
+            f: str = Security(scoped_id),
+            *,
+            g: "Annotated[str, Depends(valid_note_id)]",
+        ): ...
+        @router.get("/{note_id}")
+        async def i(note_id: str = fastapi.params.Security(scoped_id)): ...
+        """), [])
+
+    def test_non_validator_metadata_still_flagged(self):
+        self.assertEqual(rules("""
+        @router.get("/{a}/{b}/{c}/{d}")
+        async def g(
+            a: Annotated[str, Path()],
+            b: Annotated[str, Path(min_length=1), Doc("BeforeValidator")],
+            c: Annotated[str, DependsOn(x)],
+            d: str = Path(..., min_length=1),
+        ): ...
+        """), [("INV-NUL", 4), ("INV-NUL", 5), ("INV-NUL", 6), ("INV-NUL", 7)])
+
     def test_router_prefix_not_resolved(self):
         self.assertEqual(rules("""
         router = APIRouter(prefix="/u/{user_id}")
@@ -273,6 +315,21 @@ class Robustness(unittest.TestCase):
             self.assertEqual(rc, 0, out)
             self.assertIn("bad.py: warning: skipped", out)
             self.assertIn("dangling.py: warning: skipped", out)
+            self.assertNotIn("Traceback", out)
+
+    def test_too_deeply_nested_warns_and_skips(self):
+        # MemoryError (parser stack overflow) and RecursionError (deep AST in a check) are skipped, not tracebacks
+        with tempfile.TemporaryDirectory() as d:
+            app = Path(d, "server/app")
+            app.mkdir(parents=True)
+            (app / "deep_unary.py").write_text("x = " + "-" * 100000 + "1\n")
+            (app / "deep_binop.py").write_text(
+                '@router.get("/{a}")\nasync def g(a: Annotated[str, ' + "1+" * 30000 + '1]): ...\n')
+            (app / "llm.py").write_text("def f(s):\n    if not s.k:\n        return MockLLM()\n")
+            rc, out = self._run(d)
+            self.assertEqual(rc, 1, out)  # remaining files are still checked
+            self.assertIn("deep_unary.py: warning: skipped (MemoryError", out)
+            self.assertIn("deep_binop.py: warning: skipped (RecursionError", out)
             self.assertNotIn("Traceback", out)
 
     def test_rule_error_exits_one_tests_skipped(self):

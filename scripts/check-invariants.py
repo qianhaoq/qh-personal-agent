@@ -23,9 +23,11 @@ Rules (checker id -> docs/server-invariants.md id):
   INV-NUL          [INV-7 外部输入硬化] FastAPI path params typed as bare str (str, str | None,
                    Optional[str], Annotated[str, ...] without a NUL-safe constraint). Only the
                    decorator path is read (router prefixes are not resolved).
-                   Accepted: NoNulStr; Annotated metadata with reject_nul/AfterValidator,
-                   or any constraint call with pattern=/regex= (Path, Query, StringConstraints,
-                   Field, constr); non-str converters ({id:int}).
+                   Accepted: NoNulStr; Annotated metadata with reject_nul or any *Validator(...)
+                   call (Before/After/Plain/WrapValidator, attribute forms too), or any
+                   constraint call with pattern=/regex= (Path, Query, StringConstraints,
+                   Field, constr); non-str converters ({id:int}). Params whose default or
+                   annotation contains Depends(...)/Security(...) are skipped (injected).
   INV-NO-FALLBACK  [INV-10 配置完备性] A known fake (MockLLM, FakeLLM, InMemoryStore) constructed as an
                    implicit fallback: inside an `except` handler, a bare `else:`
                    branch, or an `if` whose test is a negation / `is None` /
@@ -246,14 +248,41 @@ def check_seq_last(tree, path, parents) -> list[Finding]:
 
 
 # ------------------------------------------------------------------ INV-NUL
+INJECTORS = {"Depends", "Security"}
+
+
+def _call_named(n, pred) -> bool:
+    return isinstance(n, ast.Call) and (_name(n.func) or "") != "" and pred(_name(n.func))
+
+
 def _nul_safe_meta(meta: list[ast.AST]) -> bool:
     for m in meta:
-        src = ast.unparse(m)
-        if "reject_nul" in src or "AfterValidator" in src:
+        if "reject_nul" in ast.unparse(m):
+            return True
+        # Before/After/Plain/WrapValidator(...) (or pydantic.functional_validators.X): the validator owns the
+        # value, so assume it rejects NUL (precision over recall).
+        if any(_call_named(n, lambda x: x.endswith("Validator")) for n in ast.walk(m)):
             return True
         if isinstance(m, ast.Call) and any(k.arg in {"pattern", "regex"} for k in m.keywords):  # Path/Query/StringConstraints/constr/Field
             return True
     return False
+
+
+def _parsed(ann):
+    """String (forward-reference) annotations parsed to an expression; None if unparsable."""
+    if isinstance(ann, ast.Constant) and isinstance(ann.value, str):
+        try:
+            return ast.parse(ann.value, mode="eval").body
+        except SyntaxError:
+            return None
+    return ann
+
+
+def _injected(ann, default) -> bool:
+    """Depends(...)/Security(...) (incl. fastapi.Depends) in the default or anywhere in the annotation:
+    the value comes from a dependency, which owns validation (it is not the raw path string)."""
+    nodes = [x for x in (_parsed(ann), default) if x is not None]
+    return any(_call_named(n, lambda x: x in INJECTORS) for root in nodes for n in ast.walk(root))
 
 
 def _bare_str(ann) -> bool:
@@ -295,6 +324,8 @@ def check_nul(tree, path, parents) -> list[Finding]:
         defaults = dict(zip([a.arg for a in pos[len(pos) - len(fn.args.defaults):]], fn.args.defaults))
         defaults.update({a.arg: d for a, d in zip(fn.args.kwonlyargs, fn.args.kw_defaults) if d is not None})
         for a in fn.args.args + fn.args.kwonlyargs:
+            if _injected(a.annotation, defaults.get(a.arg)):
+                continue  # note_id: str = Depends(dep) / Annotated[str, Depends(dep)]
             if a.arg in defaults and _nul_safe_meta([defaults[a.arg]]):
                 continue  # note_id: str = Path(pattern=...)
             if a.arg in params and _bare_str(a.annotation):
@@ -390,7 +421,8 @@ def main(argv: list[str]) -> int:
             with tokenize.open(f) as fh:  # honours BOM and PEP 263 declarations
                 src = fh.read()
             findings += check_source(src, str(rel))
-        except (OSError, SyntaxError, UnicodeDecodeError, ValueError, RecursionError) as e:
+        except (OSError, SyntaxError, UnicodeDecodeError, ValueError, RecursionError, MemoryError) as e:
+            # MemoryError/RecursionError: pathologically nested source CPython itself cannot compile
             warnings += 1
             print(f"{rel}: warning: skipped ({type(e).__name__}: {e})")
     for x in findings:
