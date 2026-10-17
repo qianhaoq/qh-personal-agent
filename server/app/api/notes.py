@@ -143,6 +143,19 @@ async def get_note(
     return note_to_dict(note)
 
 
+async def _raise_conflict_or_not_found(
+    session: AsyncSession, user_id: str, note_id: str
+) -> None:
+    """条件更新匹配 0 行后的归因（INV-11/INV-12）：回滚后重读当前状态，
+    区分 404（不存在/已删除/他人笔记）与 409（rev 已被并发修改）。"""
+    current = (
+        await session.execute(select(Note).where(Note.id == note_id, Note.user_id == user_id))
+    ).scalar_one_or_none()
+    if current is None or current.deleted_at is not None:
+        raise ApiError(404, "not_found", "笔记不存在")
+    raise ApiError(409, "conflict", "版本冲突，请拉取最新版本后重试")
+
+
 @router.patch("/{note_id}")
 async def patch_note(
     note_id: Annotated[NoNulStr, Path()],
@@ -154,7 +167,31 @@ async def patch_note(
     # 避免“读到 rev → 修改 → 写回”两步之间被并发请求插队
     note = await _get_owned_note(session, user_id, note_id)
     if body.text is None or body.text == note.text:
-        return {"note": note_to_dict(note), "rev": note.rev}
+        # 内容不变的快路径也必须先原子校验 rev（INV-11，threads6 P1-2）：
+        # 拿过期 rev 的无操作 PATCH 是 409 而不是 200——否则客户端会误以为
+        # 自己的过期视图就是当前态。自赋值 UPDATE 只取行锁、不改任何列
+        # （显式赋值抑制列级 onupdate，不产生可观察时间戳），rowcount=1
+        # 即「锁内 rev 仍匹配」的原子判定；0 行回滚重读归因（INV-12）
+        checked = await session.execute(
+            update(Note)
+            .where(
+                Note.id == note_id,
+                Note.user_id == user_id,
+                Note.rev == body.rev,
+                Note.deleted_at.is_(None),
+            )
+            .values(updated_at=Note.updated_at)
+            .execution_options(synchronize_session=False)
+        )
+        if checked.rowcount == 0:
+            await session.rollback()
+            await _raise_conflict_or_not_found(session, user_id, note_id)
+        # 持锁后的权威读：期间若有变更恰好落到同一 rev 且 text 已不同，
+        # 不能谎报内容一致——落回完整 PATCH 路径（其条件更新会再次校验）
+        await session.refresh(note)
+        if body.text is None or body.text == note.text:
+            await session.commit()
+            return {"note": note_to_dict(note), "rev": note.rev}
 
     # 加锁顺序（全局规则见 app.common.allocate_seq）：先条件更新业务行
     # note（本条 UPDATE 拿行锁），再作废 reminders，再 INSERT job 行
@@ -182,12 +219,7 @@ async def patch_note(
     if result.rowcount == 0:
         await session.rollback()
         # 复查区分 404（被并发删除/不存在）与 409（rev 已被并发修改）
-        current = (
-            await session.execute(select(Note).where(Note.id == note_id, Note.user_id == user_id))
-        ).scalar_one_or_none()
-        if current is None or current.deleted_at is not None:
-            raise ApiError(404, "not_found", "笔记不存在")
-        raise ApiError(409, "conflict", "版本冲突，请拉取最新版本后重试")
+        await _raise_conflict_or_not_found(session, user_id, note_id)
 
     # 旧的整理产物作废，重新入队 extract（带新 rev，执行侧据此丢弃过期
     # 任务）；同时入队 memory_sync 清旧记忆——即使 extract 永久失败，

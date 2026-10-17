@@ -61,6 +61,72 @@ async def test_patch_optimistic_lock_409(client, user):
     assert got.json()["status"] == "uploaded"  # 修改后回到 uploaded 等待重新整理
 
 
+async def test_patch_unchanged_text_with_stale_rev_409(client, user):
+    """threads6 P1-2 / INV-11：内容不变（或缺 text）的快路径也必须先原子
+    校验 rev——拿过期 rev 的无操作 PATCH 是 409，不是 200 + 过期视图；
+    当前 rev 的无操作 PATCH 走 200 且不产生任何可观察变更。"""
+    from sqlalchemy import func, select
+
+    from app.db import get_sessionmaker
+    from app.models import Job
+
+    headers = auth_headers(user)
+    created = await client.post(
+        "/v1/notes", json=_note_body("原始内容A"), headers=headers
+    )
+    note_id = created.json()["note_id"]
+
+    patched = await client.patch(
+        f"/v1/notes/{note_id}", json={"text": "新内容B", "rev": 1}, headers=headers
+    )
+    assert patched.status_code == 200, patched.text
+    current = patched.json()["rev"]
+    assert current == 2
+
+    # 过期 rev + 内容恰与当前一致（threads6 的精确场景）：409，不是 200
+    stale_same = await client.patch(
+        f"/v1/notes/{note_id}", json={"text": "新内容B", "rev": 1}, headers=headers
+    )
+    assert stale_same.status_code == 409, stale_same.text
+    assert stale_same.json()["error"]["code"] == "conflict"
+    assert stale_same.json()["error"]["message"] == "版本冲突，请拉取最新版本后重试"
+
+    # 过期 rev + 旧内容 / 缺 text：同样 409
+    stale_old = await client.patch(
+        f"/v1/notes/{note_id}", json={"text": "原始内容A", "rev": 1}, headers=headers
+    )
+    assert stale_old.status_code == 409
+    stale_no_text = await client.patch(f"/v1/notes/{note_id}", json={"rev": 1}, headers=headers)
+    assert stale_no_text.status_code == 409
+
+    # 当前 rev + 内容不变：200 快路径，rev/updated_at/队列全部不动
+    before = await client.get(f"/v1/notes/{note_id}", headers=headers)
+    maker = get_sessionmaker()
+    async with maker() as session:
+        jobs_before = (
+            await session.execute(select(func.count()).select_from(Job).where(Job.note_id == note_id))
+        ).scalar_one()
+
+    noop = await client.patch(
+        f"/v1/notes/{note_id}", json={"text": "新内容B", "rev": current}, headers=headers
+    )
+    assert noop.status_code == 200, noop.text
+    assert noop.json()["rev"] == current
+    assert noop.json()["note"]["rev"] == current
+    assert noop.json()["note"]["text"] == "新内容B"
+
+    after = await client.get(f"/v1/notes/{note_id}", headers=headers)
+    assert after.json()["rev"] == current
+    assert after.json()["updated_at"] == before.json()["updated_at"], (
+        "快路径不得推进 updated_at（自赋值 UPDATE 不产生可观察时间戳）"
+    )
+    async with maker() as session:
+        jobs_after = (
+            await session.execute(select(func.count()).select_from(Job).where(Job.note_id == note_id))
+        ).scalar_one()
+    assert jobs_after == jobs_before, "快路径不得入队新 job"
+
+
 async def test_delete_note_soft_and_cascade(client, user, run_jobs):
     """软删除 + 记忆级联。INV-4：DELETE 请求本身**不碰** memory store
     （只置 deleted_at 并入队 memory_sync job）；级联清理由随后的
