@@ -37,6 +37,13 @@ jobs:
   # Detection runs first in a service-less job so that, while server/ has no
   # tests, PostgreSQL is never pulled or started (services start before any
   # step of the job that declares them). Discovery mirrors scripts/ci-test.sh.
+  # The image is pgvector/pgvector:pg16 (PostgreSQL 16 + the `vector`
+  # extension) so the real mem0ai + pgvector integration tests
+  # (server/tests/test_mem0_integration.py, local fake embedder, no external
+  # API calls) run here instead of skipping. Detection is content-based, not
+  # a path filter: whenever server/ has tests the job runs on every PR, so
+  # changes to server/requirements-mem0.txt or app/memory/mem0_store.py are
+  # always exercised.
   pg-detect:
     name: PG Tests (detect)
     runs-on: ubuntu-latest
@@ -71,7 +78,8 @@ jobs:
       contents: read
     services:
       postgres:
-        image: postgres:16
+        # Official postgres:16 + the pgvector extension (same entrypoint/env).
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_USER: personal
           POSTGRES_PASSWORD: ci-only-postgres-pw
@@ -105,7 +113,25 @@ jobs:
           python -m pip install -q pytest
           if [ -f server/requirements.txt ]; then python -m pip install -q -r server/requirements.txt; fi
           if [ -f server/pyproject.toml ]; then python -m pip install -q -e server; fi
+          # Optional mem0 backend (mem0ai + psycopg) for the real pgvector
+          # integration tests; absent on main until PR #2 lands.
+          if [ -f server/requirements-mem0.txt ]; then python -m pip install -q -r server/requirements-mem0.txt; fi
 
-      - name: pytest on PostgreSQL 16
+      # test_mem0_integration.py skips (not fails) when the `vector`
+      # extension is missing, and the tests only check for it. POSTGRES_USER is
+      # the superuser in this image, so enable it here and fail loudly if the
+      # image ever stops shipping it.
+      - name: Enable pgvector extension
+        env:
+          PG_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          docker exec "$PG_CONTAINER" psql -v ON_ERROR_STOP=1 -U personal -d personal_agent_test \
+            -c 'CREATE EXTENSION IF NOT EXISTS vector' \
+            -c "SELECT extname, extversion FROM pg_extension WHERE extname = 'vector'"
+
+      - name: pytest on PostgreSQL 16 + pgvector
         working-directory: server
-        run: python -m pytest -q
+        env:
+          # Belt and braces: the mem0 fixture already sets this per test.
+          MEM0_TELEMETRY: 'False'
+        run: python -m pytest -q -rs
