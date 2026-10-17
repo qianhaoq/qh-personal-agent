@@ -154,8 +154,10 @@ memory_sync(note_id)     不带 rev。短读事务取 note 当前状态 →（�
 **验证测试**：
 - `test_memory_sync_writes_memory_with_source_rev_and_marks_synced`
 - `test_memory_sync_on_deleted_note_removes_memory`（替代原 cleanup_memory 系列语义）
+- `test_memory_sync_deleted_path_always_calls_delete_by_note`（4c1c9be P2-1：已删除路径无条件 delete_by_note，哪怕 store 里本无记忆）
+- `test_two_worker_delete_vs_add_converges_no_orphan`（4c1c9be P2-1 两 worker 交错：旧 cleanup 先跑完、慢 add 落地、worker 复查前崩溃 → 租约回收重跑清掉孤儿，最终搜不到）
 - `test_memory_sync_on_unorganized_note_clears_stale_memory_without_add`（C4 回归：PATCH 后 extract 永久失败，旧记忆被清、无新增）
-- `test_memory_sync_requeues_and_deletes_only_own_ids_on_rev_change`（C9 回归：用 DelayedAddStore 模拟慢 add，PATCH 插入后旧任务只删自己写的 id，新 rev 记忆保留；双后端语义验证）
+- `test_memory_sync_requeues_and_deletes_only_own_ids_on_rev_change`（C9 回归 / 4c1c9be P2-2：用 DelayedAddStore 模拟慢 add，PATCH 插入后旧任务只删自己写的 id，并发新写入立刻且最终都可检索；双后端语义验证）
 - `test_memory_sync_converges_after_delete_during_add`（删除后不复活）
 - `test_memory_sync_worker_killed_mid_run_reclaimed_converges`（模拟租约过期回收后重跑收敛）
 - `test_memory_sync_attempts_exhausted_marks_failed_only_without_newer_job`（有更新的 pending/running 时不标 failed）

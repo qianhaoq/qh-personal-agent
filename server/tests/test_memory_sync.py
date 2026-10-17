@@ -3,13 +3,16 @@
 覆盖：记忆归属 metadata（note_id+source_rev）、API 不直删记忆、四步
 协议（写/删/复查/再入队）、C4（PATCH 后 extract 永久失败旧记忆清掉）、
 C9（复查不一致只删本次 add 的 id）、删除后不复活、worker 中断回收收敛、
-耗尽标 failed 的条件。交错窗口用 DelayedAddStore 类钩子注入（真实
-HTTP 请求落在钩子窗口里），不依赖数据库层并发语义，两后端都跑。
+耗尽标 failed 的条件；4c1c9be P2-1/P2-2 的两 worker 交错（已删除路径
+无条件 delete_by_note、DELETE vs 慢 add + 崩溃后不留孤儿记忆）。交错
+窗口用 DelayedAddStore 类钩子注入（真实 HTTP 请求落在钩子窗口里），
+不依赖数据库层并发语义，两后端都跑。
 """
 import asyncio
 import uuid
 
-from sqlalchemy import select
+import pytest
+from sqlalchemy import select, update
 
 from app.memory.base import set_memory_store
 from app.memory.inmemory import InMemoryStore
@@ -195,6 +198,27 @@ async def test_memory_sync_on_deleted_note_removes_memory(client, user, run_jobs
     assert [m for m in search.json()["items"] if m["note_id"] == note_id] == []
 
 
+async def test_memory_sync_deleted_path_always_calls_delete_by_note(client, user, run_jobs):
+    """INV-5.2 / 4c1c9be P2-1：已删除路径必须**无条件**调 delete_by_note——
+    哪怕 store 里本来就没有该 note 的记忆。两 worker 交错（旧任务的
+    cleanup 先跑、慢写随后落地）叠加崩溃后，正是这条保证把残留记忆
+    最终清掉；「见无记忆可删就跳过」会让孤儿记忆永久可搜。"""
+    store = RecordingStore()
+    set_memory_store(store)
+
+    # 建一条笔记后立刻删除：从没跑过 job，store 里从未写过任何记忆
+    note_id = await _create_note(client, user, "从未同步过就被删除的笔记")
+    deleted = await client.delete(f"/v1/notes/{note_id}", headers=auth_headers(user))
+    assert deleted.status_code == 204, deleted.text
+    assert await _items(store, user["user_id"], note_id) == []
+
+    await run_jobs()
+    assert "delete_by_note" in store.calls, "已删除路径必须调用 delete_by_note（即使无记忆可删）"
+    assert "add" not in store.calls, "已删除的笔记不得再写记忆"
+    jobs = await _memsync_jobs(note_id)
+    assert jobs and all(j.status == "done" for j in jobs)
+
+
 async def test_memory_sync_on_unorganized_note_clears_stale_memory_without_add(
     client, user, run_jobs, monkeypatch
 ):
@@ -244,7 +268,11 @@ async def test_memory_sync_on_unorganized_note_clears_stale_memory_without_add(
 
 class DelayedAddStore(InMemoryStore):
     """目标笔记的 add 先挂起等待放行：外部事件（PATCH/DELETE/别的写入）
-    落在 add 窗口里，复现真实交错。"""
+    落在 add 窗口里，复现真实交错。
+
+    pause_after_add=True 时再挂一次：写完记忆、复查之前停住——模拟
+    「add 已落地、worker 随即崩溃」的交错（4c1c9be P2-1/P2-2 的时序）。
+    """
 
     def __init__(self):
         super().__init__()
@@ -252,6 +280,9 @@ class DelayedAddStore(InMemoryStore):
         self.target_source_rev: int | None = None
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
+        self.pause_after_add = False
+        self.wrote = asyncio.Event()
+        self.resume_after_add = asyncio.Event()
         self.in_window: list[str] = []
         self.added_in_window: list = []
         self.deleted_ids: list[str] = []
@@ -268,12 +299,28 @@ class DelayedAddStore(InMemoryStore):
             self.in_window.append("add")
             items = await super().add(user_id, text, note_id=note_id, source_rev=source_rev)
             self.added_in_window.extend(items)
+            if self.pause_after_add:
+                self.wrote.set()
+                await self.resume_after_add.wait()
             return items
         return await super().add(user_id, text, note_id=note_id, source_rev=source_rev)
 
     async def delete(self, user_id, memory_ids):
         self.deleted_ids.append(list(memory_ids))
         return await super().delete(user_id, memory_ids)
+
+    async def delete_by_note(self, user_id, note_id):
+        # InMemoryStore.delete_by_note 直改内部 dict、不经过 delete()：
+        # 这里记下它实际删掉的 id，供「清掉的方式是 delete_by_note」断言
+        ids = [
+            m.id
+            for m in self._items.values()
+            if m.user_id == user_id and m.note_id == note_id
+        ]
+        removed = await super().delete_by_note(user_id, note_id)
+        if ids:
+            self.deleted_ids.append(ids)
+        return removed
 
 
 async def test_memory_sync_requeues_and_deletes_only_own_ids_on_rev_change(
@@ -324,6 +371,12 @@ async def test_memory_sync_requeues_and_deletes_only_own_ids_on_rev_change(
     assert [m for m in await store.list(user["user_id"]) if m.id == foreign[0].id], (
         "并发新写入的记忆不得被旧任务误删"
     )
+    # 慢 add 收尾后新写入立刻可检索（4c1c9be P2-2：复查清理绝不清掉它）
+    mid = await client.get("/v1/search", params={"q": "并发新任务"}, headers=headers)
+    assert mid.status_code == 200
+    assert [m for m in mid.json()["items"] if m["memory_id"] == foreign[0].id], (
+        "并发新写入的记忆在旧任务收尾后必须仍可检索"
+    )
     # 再入队发生（与 PATCH 的 pending 去重合并后仍有一个 pending 在队列里）
     note = await _note(note_id)
     assert note.rev == 3
@@ -337,6 +390,10 @@ async def test_memory_sync_requeues_and_deletes_only_own_ids_on_rev_change(
     assert items and all("游泳" in m.text for m in items)
     assert all(m.source_rev == note.rev for m in items)
     assert [m for m in items if m.id == foreign[0].id] == [], "旧杂散记忆最终被收敛清掉"
+    final = await client.get("/v1/search", params={"q": "游泳"}, headers=headers)
+    assert [m for m in final.json()["items"] if m["note_id"] == note_id], (
+        "新 rev 的记忆最终必须可检索"
+    )
 
 
 async def test_memory_sync_converges_after_delete_during_add(client, user, run_jobs):
@@ -383,6 +440,88 @@ async def test_memory_sync_converges_after_delete_during_add(client, user, run_j
     )
     assert ask.status_code == 200
     assert "写入途中被删除" not in ask.json()["answer"]
+
+
+async def test_two_worker_delete_vs_add_converges_no_orphan(client, user, run_jobs):
+    """INV-5 / 4c1c9be P2-1 的两 worker 交错：旧任务的 cleanup
+    （delete_by_note）先跑完 → 慢 add 随后落地（记忆重新出现）→ 旧 worker
+    在复查前崩溃（job 卡 running）。旧模型里 organize_note 重跑见已删除
+    就 return 不删记忆 → 永久可搜；新模型里回收重跑的 memory_sync 走
+    「已删除」路径无条件 delete_by_note → 孤儿被清、最终搜不到。"""
+    note_id = await _create_note(client, user, "两个 worker 交错时会被写出的记忆")
+    await run_jobs()
+
+    store = DelayedAddStore()
+    store.target_note_id = note_id
+    store.pause_after_add = True  # 写完记忆、复查前停住（崩溃窗口）
+    set_memory_store(store)
+
+    from datetime import timedelta
+
+    from app.config import get_settings
+    from app.db import get_sessionmaker
+    from app.jobs.queue import enqueue
+    from app.pipeline.runner import run_pending_jobs
+    from app.timeutil import utcnow
+
+    # 冗余的旧 memory_sync（模拟 ≥2 worker 时留下的重复任务）
+    async with get_sessionmaker()() as session, session.begin():
+        await enqueue(session, "memory_sync", {"note_id": note_id}, note_id=note_id)
+
+    worker1 = asyncio.create_task(run_pending_jobs(limit=1, worker_id="wkr_old"))
+    await asyncio.wait_for(store.entered.wait(), timeout=5)  # add 挂起中
+
+    # 放行 add：cleanup（delete_by_note）已跑完，新记忆落地后停在写后钩子
+    store.release.set()
+    await asyncio.wait_for(store.wrote.wait(), timeout=5)
+
+    # 紧随其后的 DELETE（另一请求路径）：软删 + enqueue memory_sync
+    deleted = await asyncio.wait_for(
+        client.delete(f"/v1/notes/{note_id}", headers=auth_headers(user)), timeout=3
+    )
+    assert deleted.status_code == 204, deleted.text
+
+    # 旧 worker 复查前崩溃：job 卡 running，刚写出的记忆成为潜在孤儿
+    worker1.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(worker1, timeout=5)
+    orphan_ids = [m.id for m in store.added_in_window]
+    assert orphan_ids, "前置失败：崩溃前 add 的记忆应已落地"
+    assert [m for m in await store.list(user["user_id"]) if m.id in orphan_ids]
+
+    # 租约过期 → 另一 worker 回收重跑：deleted 路径 delete_by_note 清掉孤儿
+    maker = get_sessionmaker()
+    async with maker() as session, session.begin():
+        await session.execute(
+            update(Job)
+            .where(
+                Job.kind == "memory_sync",
+                Job.note_id == note_id,
+                Job.status == "running",
+            )
+            .values(
+                locked_at=utcnow()
+                - timedelta(seconds=get_settings().job_lock_timeout_seconds + 60)
+            )
+        )
+
+    await run_jobs()
+
+    assert await _items(store, user["user_id"], note_id) == [], "孤儿记忆必须被回收重跑清掉"
+    flat_deleted = [mid for ids in store.deleted_ids for mid in ids]
+    assert set(orphan_ids) <= set(flat_deleted), "清掉的方式是 delete_by_note（按 id）"
+    jobs = await _memsync_jobs(note_id)
+    assert jobs and all(j.status == "done" for j in jobs)
+    search = await client.get(
+        "/v1/search", params={"q": "两个 worker 交错"}, headers=auth_headers(user)
+    )
+    assert search.status_code == 200
+    assert [m for m in search.json()["items"] if m["note_id"] == note_id] == []
+    ask = await client.post(
+        "/v1/ask", json={"text": "被删除的笔记写了什么"}, headers=auth_headers(user)
+    )
+    assert ask.status_code == 200
+    assert "两个 worker 交错" not in ask.json()["answer"]
 
 
 async def test_memory_sync_worker_killed_mid_run_reclaimed_converges(client, user, run_jobs):
