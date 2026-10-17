@@ -127,9 +127,12 @@ def _only_seq_update(call: ast.Call) -> bool:
     return False
 
 
+_SA: set[str] = set()
+
+
 def _is_dml(call: ast.Call) -> bool:
     """execute(update/insert/delete(...)) — SELECTs and other reads are not writes."""
-    return any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in {"update", "insert", "delete"}
+    return any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in _SA
                for n in ast.walk(call))
 
 
@@ -174,7 +177,18 @@ def _after_terminal_arm(c, seq, fn, parents) -> bool:
     return False
 
 
+def _sqlalchemy_names(tree) -> set[str]:
+    """Local names bound by `from sqlalchemy[...] import update/insert/delete` (aliases included)."""
+    out = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ImportFrom) and (n.module or "").split(".")[0] == "sqlalchemy":
+            out |= {a.asname or a.name for a in n.names if a.name in {"update", "insert", "delete"}}
+    return out
+
+
 def check_seq_last(tree, path, parents) -> list[Finding]:
+    global _SA
+    _SA = _sqlalchemy_names(tree)
     out = []
     for fn in ast.walk(tree):
         if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) or fn.name == SEQ_FUNC:
@@ -195,8 +209,8 @@ def check_seq_last(tree, path, parents) -> list[Finding]:
                 if p is fn:
                     break
                 if isinstance(p, ast.Call) and _name(p.func) == "values" and isinstance(p.func, ast.Attribute) \
-                        and any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "update"
-                                for n in ast.walk(p.func.value)):  # bare sqlalchemy update(Model), not obj.update()
+                        and any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in _SA
+                                for n in ast.walk(p.func.value)):  # update() imported from sqlalchemy
                     extra = sorted({k.arg for k in p.keywords if k.arg} - SEQ_COLUMNS)
                     if extra:
                         out.append(Finding(path, seq.lineno, "INV-SEQ-LAST",

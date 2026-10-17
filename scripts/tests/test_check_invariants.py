@@ -18,12 +18,15 @@ sys.modules["check_invariants"] = ci
 _SPEC.loader.exec_module(ci)
 
 
+SA = "from sqlalchemy import update, insert, delete, select\n"
+
+
 def rules(src):
-    return [(f.rule, f.line) for f in ci.check_source(textwrap.dedent(src), "server/app/x.py")]
+    return [(f.rule, f.line - 1) for f in ci.check_source(SA + textwrap.dedent(src), "server/app/x.py")]
 
 
 def errors(src):
-    return [(f.rule, f.line) for f in ci.check_source(textwrap.dedent(src), "server/app/x.py") if not f.warning]
+    return [(f.rule, f.line - 1) for f in ci.check_source(SA + textwrap.dedent(src), "server/app/x.py") if not f.warning]
 
 
 class SeqLast(unittest.TestCase):
@@ -41,7 +44,12 @@ class SeqLast(unittest.TestCase):
         async def f(session):
             payload.values(text=t, change_seq=await allocate_seq(session))
             cfg.update(x).values(text=t, change_seq=await allocate_seq(session))
+
         """), [])
+
+    def test_bare_update_not_from_sqlalchemy_ok(self):
+        src = "from builders import update\nasync def g(session):\n    update(x).values(text=t, change_seq=await allocate_seq(session))\n"
+        self.assertEqual(ci.check_source(src, "server/app/x.py"), [])
 
     def test_enqueue_after_allocate_flagged(self):
         self.assertEqual(rules("""
