@@ -88,6 +88,11 @@ class SeqLast(unittest.TestCase):
                 seq = await allocate_seq(session)
             except ValueError:
                 session.add(row)
+        async def t(session, flag):
+            if flag:
+                seq = await allocate_seq(session)
+                return seq
+            session.add(row)
         async def g(session, items):
             gen = (await allocate_seq(session) for _ in items)
             session.add(row)

@@ -153,6 +153,21 @@ def _exclusive(a, b, parents) -> bool:
     return False
 
 
+def _after_terminal_arm(c, seq, fn, parents) -> bool:
+    """seq sits in an if/else arm that ends in return/raise/continue/break, and c is outside that if."""
+    child = seq
+    for p in _ancestors(seq, parents):
+        if p is fn:
+            return False
+        if isinstance(p, ast.If):
+            arm = p.body if child in p.body else p.orelse if child in p.orelse else None
+            if arm and isinstance(arm[-1], (ast.Return, ast.Raise, ast.Continue, ast.Break)) \
+                    and p not in _ancestors(c, parents):
+                return True
+        child = p
+    return False
+
+
 def check_seq_last(tree, path, parents) -> list[Finding]:
     out = []
     for fn in ast.walk(tree):
@@ -191,7 +206,7 @@ def check_seq_last(tree, path, parents) -> list[Finding]:
                 if recv == sess and f.attr in TXN_END:
                     break
                 bad = None
-                if _exclusive(c, seq, parents):
+                if _exclusive(c, seq, parents) or _after_terminal_arm(c, seq, fn, parents):
                     continue
                 if recv == sess and f.attr in SESSION_WRITES:
                     if f.attr != "execute" or (_is_dml(c) and not _only_seq_update(c)):
