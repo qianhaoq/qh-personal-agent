@@ -22,6 +22,9 @@ if _TEST_DB_URL:
     # 显式放行（生产环境不允许，见 config._reject_inmemory_memory_backend_
     # in_production），记忆后端仍统一用进程内假实现
     os.environ["ALLOW_INMEMORY_IN_PROD"] = "true"
+    # 同理：LLM_PROVIDER=mock 在生产形态下默认拒绝（见
+    # config._reject_misconfigured_llm_in_production），测试套件显式放行
+    os.environ["ALLOW_MOCK_LLM_IN_PROD"] = "true"
 else:
     os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{_DB_FILE}"
 # 随机生成的合法密钥形态（64 位 hex = 32 字节）：PG 测试运行（生产形态

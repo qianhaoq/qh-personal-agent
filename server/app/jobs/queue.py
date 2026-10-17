@@ -7,16 +7,22 @@
 领取规则（P1-B）：
 - status=pending 且 run_after<=now：正常到期执行；
 - status=running 且 locked_at < now - JOB_LOCK_TIMEOUT_SECONDS：worker
-  崩溃/重启遗留的任务，锁过期后回收重跑（attempts 照常 +1）；若
-  attempts+1 已达 max_attempts，不再执行，直接标 failed，并按入队 rev
-  条件把 note.status 置 failed（见 mark_note_failed_if_rev）。
+  崩溃/重启遗留的任务，锁过期后回收重跑（attempts 照常 +1）；仅当
+  attempts 已达 max_attempts（最后一次允许的尝试也已用过）才不再执行，
+  直接标 failed，并按入队 rev 条件把 note.status 置 failed
+  （见 mark_note_failed_if_rev）。
+
+租约（P2）：领取时写入 locked_by（worker 实例 id）与 locked_at，收尾
+（finalize_claim）按两者 + status='running' 条件校验——任务被回收给
+别的 worker 后，旧 worker 的收尾一律放弃，不再改动 job/note。
 
 用法：
     await enqueue(session, "organize_note", {"note_id": "..."})
-    async with claim_next(session) as job:
+    async with claim_next(session, worker_id="wkr_x") as job:
         if job is None: ...  # 队列空
 """
 import json
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
@@ -26,6 +32,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.common import allocate_seq, new_id
 from app.models import Job, Note
 from app.timeutil import as_utc, utcnow
+
+
+def new_worker_id() -> str:
+    """worker 实例标识：写入 jobs.locked_by，收尾校验租约用。"""
+    return f"wkr_{uuid.uuid4().hex}"
 
 
 def is_postgres() -> bool:
@@ -57,17 +68,24 @@ async def enqueue(session: AsyncSession, kind: str, payload: dict) -> str:
 
 
 @asynccontextmanager
-async def claim_next(session: AsyncSession):
+async def claim_next(session: AsyncSession, worker_id: str | None = None):
     """领取一个到期/可回收的 job（None 表示没有可执行的）。
 
-    调用方负责在同一个事务里处理并调用 mark_done / mark_failed。
+    worker_id 写入 jobs.locked_by 作为租约持有者；缺省时每次生成一次性
+    id（等价于“领取后即失联”的 worker，回收语义不受影响）。调用方负责
+    在同一个事务里完成领取，并用 finalize_claim 做带租约校验的收尾。
     """
     now = utcnow()
-    job = await _claim_postgres(session, now) if is_postgres() else await _claim_sqlite(session, now)
+    wid = worker_id or new_worker_id()
+    job = (
+        await _claim_postgres(session, now, wid)
+        if is_postgres()
+        else await _claim_sqlite(session, now, wid)
+    )
     yield job
 
 
-async def _claim_postgres(session: AsyncSession, now: datetime) -> Job | None:
+async def _claim_postgres(session: AsyncSession, now: datetime, worker_id: str) -> Job | None:
     cutoff = _lock_cutoff(now)
     while True:
         row = (
@@ -85,19 +103,19 @@ async def _claim_postgres(session: AsyncSession, now: datetime) -> Job | None:
             return None
         job_id, status, attempts, max_attempts, payload_json = row
         if status == "pending":
-            job = await _mark_running(session, job_id, now)
-        elif attempts + 1 >= max_attempts:
-            # running 锁过期且重试次数用尽：不再执行，直接判死
+            job = await _mark_running(session, job_id, now, worker_id)
+        elif attempts >= max_attempts:
+            # running 锁过期且次数已用尽（含最后一次允许的尝试）：不再执行，直接判死
             await _fail_expired(session, job_id, payload_json)
             job = None
         else:
-            job = await _reclaim_running(session, job_id, now, cutoff)
+            job = await _reclaim_running(session, job_id, now, cutoff, worker_id)
         if job is not None:
             return job
         # 判死/抢占未成功：继续找下一个候选
 
 
-async def _claim_sqlite(session: AsyncSession, now: datetime) -> Job | None:
+async def _claim_sqlite(session: AsyncSession, now: datetime, worker_id: str) -> Job | None:
     # 时间过滤放在 Python 里做：SQLite 读回的 naive UTC 和 aware now 不能直接比
     cutoff = _lock_cutoff(now)
     rows = (
@@ -118,27 +136,29 @@ async def _claim_sqlite(session: AsyncSession, now: datetime) -> Job | None:
     for job_id, status, run_after, locked_at, attempts, max_attempts, payload_json in rows:
         if status == "pending":
             if as_utc(run_after) <= now:
-                job = await _mark_running(session, job_id, now)
+                job = await _mark_running(session, job_id, now, worker_id)
                 if job is not None:
                     return job
             continue
         # running：锁过期才能回收；locked_at 为 NULL 属于异常数据，保守跳过
         if locked_at is None or as_utc(locked_at) >= cutoff:
             continue
-        if attempts + 1 >= max_attempts:
+        if attempts >= max_attempts:
             await _fail_expired(session, job_id, payload_json)
             continue
-        job = await _reclaim_running(session, job_id, now, cutoff)
+        job = await _reclaim_running(session, job_id, now, cutoff, worker_id)
         if job is not None:
             return job
     return None
 
 
-async def _mark_running(session: AsyncSession, job_id: str, now: datetime) -> Job | None:
+async def _mark_running(
+    session: AsyncSession, job_id: str, now: datetime, worker_id: str
+) -> Job | None:
     result = await session.execute(
         update(Job)
         .where(Job.id == job_id, Job.status == "pending")
-        .values(status="running", attempts=Job.attempts + 1, locked_at=now)
+        .values(status="running", attempts=Job.attempts + 1, locked_at=now, locked_by=worker_id)
     )
     if result.rowcount == 0:  # 已被别人抢走
         return None
@@ -146,12 +166,14 @@ async def _mark_running(session: AsyncSession, job_id: str, now: datetime) -> Jo
     return await session.get(Job, job_id)
 
 
-async def _reclaim_running(session: AsyncSession, job_id: str, now: datetime, cutoff: datetime) -> Job | None:
-    """回收锁过期的 running 任务（attempts +1、续锁）。条件更新防并发抢占。"""
+async def _reclaim_running(
+    session: AsyncSession, job_id: str, now: datetime, cutoff: datetime, worker_id: str
+) -> Job | None:
+    """回收锁过期的 running 任务（attempts +1、换租约）。条件更新防并发抢占。"""
     result = await session.execute(
         update(Job)
         .where(Job.id == job_id, Job.status == "running", Job.locked_at < cutoff)
-        .values(attempts=Job.attempts + 1, locked_at=now)
+        .values(attempts=Job.attempts + 1, locked_at=now, locked_by=worker_id)
         .execution_options(synchronize_session=False)
     )
     if result.rowcount == 0:  # 已被别人回收
@@ -201,19 +223,45 @@ async def mark_note_failed_if_rev(session: AsyncSession, payload: dict) -> bool:
     return True
 
 
-async def mark_done(session: AsyncSession, job: Job) -> None:
-    job.status = "done"
-    await session.flush()
+async def finalize_claim(
+    session: AsyncSession,
+    job_id: str,
+    *,
+    worker_id: str,
+    locked_at: datetime,
+    error: str | None,
+    retry_delay_seconds: int = 30,
+) -> str | None:
+    """收尾一个已执行的 job：成功标 done，失败退避重试或达上限标 failed。
 
+    租约校验（P2）：只对仍处于 running 且 locked_by/locked_at 与领取时
+    一致的 job 收尾。任务在执行期间被回收给别的 worker（锁过期）时，
+    本 worker 的收尾一律放弃（返回 None）——job 的状态由新持有者决定，
+    领取方也不再基于过期结果修改 note。
 
-async def mark_failed(
-    session: AsyncSession, job: Job, error: str, retry: bool, retry_delay_seconds: int = 30
-) -> None:
-    """失败处理：可重试且未超次数则回到 pending（run_after 推迟），否则 failed。"""
-    job.last_error = error[:2000]
-    if retry and job.attempts < job.max_attempts:
-        job.status = "pending"
-        job.run_after = utcnow() + timedelta(seconds=retry_delay_seconds)
+    PG 下先 FOR UPDATE 拿行锁再检查：检查与写入之间不会被回收路径
+    （条件 UPDATE running 行）插队；SQLite 单写者模型天然串行。
+    """
+    stmt = select(Job).where(Job.id == job_id)
+    if is_postgres():
+        stmt = stmt.with_for_update()
+    job = (await session.execute(stmt)).scalar_one_or_none()
+    if job is None:
+        return None
+    if (
+        job.status != "running"
+        or job.locked_by != worker_id
+        or as_utc(job.locked_at) != as_utc(locked_at)
+    ):
+        return None  # 租约已失效（被回收/换主）：放弃收尾
+    if error is None:
+        job.status = "done"
     else:
-        job.status = "failed"
+        job.last_error = error[:2000]
+        if job.attempts < job.max_attempts:
+            job.status = "pending"
+            job.run_after = utcnow() + timedelta(seconds=retry_delay_seconds)
+        else:
+            job.status = "failed"
     await session.flush()
+    return job.status

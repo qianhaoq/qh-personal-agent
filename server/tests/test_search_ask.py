@@ -1,4 +1,5 @@
 """搜索与问答（MockLLM + InMemoryStore）。"""
+import asyncio
 import uuid
 
 from tests.conftest import auth_headers
@@ -153,3 +154,63 @@ async def test_ask_naive_client_time_localized_by_timezone(client, user, run_job
     )
     assert resp2.status_code == 200
     assert "2026-10-17T01:00:00+00:00" in captured["messages"][0]["content"]
+
+
+async def test_nul_rejected_in_ask_and_search_422(client, user):
+    """QA（PR #2 复测）：ask 的 text / search 的 q 含 NUL 一律 422。"""
+    headers = auth_headers(user)
+    resp = await client.post(
+        "/v1/ask", json={"text": "有问题\x00的提问", "timezone": "Asia/Shanghai\x00"}, headers=headers
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "validation_error"
+
+    search = await client.get("/v1/search", params={"q": "妈妈\x00生日"}, headers=headers)
+    assert search.status_code == 422
+    assert search.json()["error"]["code"] == "validation_error"
+
+
+# ---------------------------------------------------------------------------
+# P2（Codex）：鉴权依赖不得把数据库会话/事务带进 LLM 与记忆检索。
+#
+# 旧实现 get_auth 挂着请求级会话（鉴权查询开启事务后一直不关），ask 的
+# 秒级 LLM 调用期间白白占住连接池的一个连接。现在鉴权在独立短会话完成
+# 并立即归还（app.deps.get_auth），ask/search 不再依赖请求级会话。
+# ---------------------------------------------------------------------------
+
+
+def _slow_ask_llm(monkeypatch, entered: asyncio.Event, release: asyncio.Event):
+    class SlowLLM:
+        async def chat(self, messages, response_format=None):
+            entered.set()
+            await release.wait()
+            return "根据你的记录：慢慢答"
+
+    async def fake_get_llm():
+        return SlowLLM()
+
+    monkeypatch.setattr("app.api.ask.get_llm_client", fake_get_llm)
+
+
+async def test_ask_slow_llm_does_not_block_other_requests(client, user, run_jobs, monkeypatch):
+    """ask 在慢 LLM 中等待时，另一个要访问数据库的已鉴权请求仍能完成。"""
+    await _add_note(client, user, "我对花生过敏，吃饭要注意")  # 让 ask 有记忆可查
+    await run_jobs()
+
+    entered, release = asyncio.Event(), asyncio.Event()
+    _slow_ask_llm(monkeypatch, entered, release)
+
+    ask_task = asyncio.create_task(
+        client.post("/v1/ask", json={"text": "我吃东西要注意什么"}, headers=auth_headers(user))
+    )
+    await asyncio.wait_for(entered.wait(), timeout=5)
+
+    other = await asyncio.wait_for(
+        client.get("/v1/notes", headers=auth_headers(user)), timeout=3
+    )
+    assert other.status_code == 200, other.text
+
+    release.set()
+    resp = await asyncio.wait_for(ask_task, timeout=5)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["answer"]

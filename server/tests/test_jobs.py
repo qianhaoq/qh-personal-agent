@@ -107,3 +107,94 @@ async def test_expired_running_job_at_max_attempts_fails_note(client, user):
     assert job.status == "failed"
     assert "过期" in (job.last_error or "")
     assert note.status == "failed"
+
+
+async def test_expired_running_job_last_allowed_attempt_still_executes(client, user):
+    """P2（差一回归）：max_attempts=3、attempts=2 的过期 running 任务，
+    回收后的第 3 次尝试是最后一次**允许**的尝试，必须照常执行。
+
+    旧判定 attempts+1 >= max_attempts 把它直接判死，最后一次允许的
+    尝试被吞掉：任务没执行就 failed、note 也被置 failed。
+    """
+    note_id, job_id = await _create_note_with_job(client, user)
+    await _claim_once(job_id)  # 第 1 次尝试，worker 崩溃（attempts=1）
+    async with get_sessionmaker()() as session, session.begin():
+        # 第 2 次尝试同样崩溃（attempts=2），仍 < max_attempts=3
+        await session.execute(update(Job).where(Job.id == job_id).values(attempts=2))
+    await _expire_lock(job_id)
+
+    processed = await run_pending_jobs()
+    assert processed == 1  # 第 3 次（最后一次允许的）尝试被执行
+
+    async with get_sessionmaker()() as session:
+        job = await session.get(Job, job_id)
+        note = await session.get(Note, note_id)
+    assert job.status == "done"
+    assert job.attempts == 3
+    assert note.status == "organized"
+
+
+async def test_stale_worker_finalize_ignored_after_lease_reclaimed(client, user, monkeypatch):
+    """P2（租约）：任务被回收换主后，旧 worker 的失败收尾不生效。
+
+    旧 worker 认领后在 LLM 里挂起 → 锁过期 → 新 worker 回收并完成
+    （job=done、note=organized）→ 旧 worker 的 LLM 才报错返回。收尾按
+    (status, locked_by, locked_at) 条件校验：租约已是新 worker 的，
+    旧 worker 的收尾放弃——job 不被改回 pending/failed，note 也不被
+    置 failed、不写旧 worker 的 last_error。
+    """
+    import asyncio
+    import json
+
+    from app.pipeline.runner import run_pending_jobs
+
+    await run_pending_jobs()  # 排空无关 job（SQLite 库跨测试复用）
+    note_id, job_id = await _create_note_with_job(client, user)
+
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = {"llm": 0}
+
+    class OldWorkerDiesLLM:
+        """第 1 次调用（旧 worker）挂起后抛错；第 2 次（新 worker）正常。"""
+
+        async def chat(self, messages, response_format=None):
+            calls["llm"] += 1
+            if calls["llm"] == 1:
+                entered.set()
+                await release.wait()
+                raise RuntimeError("old worker llm died")
+            return json.dumps(
+                {"title": "整理结果", "tags": [], "todos": [], "suggested_reminders": []},
+                ensure_ascii=False,
+            )
+
+    async def fake_get_llm():
+        return OldWorkerDiesLLM()
+
+    monkeypatch.setattr("app.pipeline.organize.get_llm_client", fake_get_llm)
+
+    old_worker = asyncio.create_task(run_pending_jobs(limit=1, worker_id="wkr_old"))
+    await asyncio.wait_for(entered.wait(), timeout=5)  # 旧 worker 认领后在 LLM 挂起
+    await _expire_lock(job_id)  # 锁过期：任务可被回收
+
+    # 新 worker 回收（租约换主）并执行完成
+    processed = await run_pending_jobs(worker_id="wkr_new")
+    assert processed == 1
+
+    async with get_sessionmaker()() as session:
+        job = await session.get(Job, job_id)
+    assert job.status == "done"
+    assert job.attempts == 2  # 认领 +1、回收 +1
+    assert job.locked_by == "wkr_new"
+
+    # 放行旧 worker：它的 LLM 失败返回，收尾必须被租约校验挡下
+    release.set()
+    assert await asyncio.wait_for(old_worker, timeout=5) == 1
+
+    async with get_sessionmaker()() as session:
+        job = await session.get(Job, job_id)
+        note = await session.get(Note, note_id)
+    assert job.status == "done"  # 未被旧 worker 改回 pending/failed
+    assert job.last_error is None  # 旧 worker 的错误没有写入
+    assert note.status == "organized"  # note 未被旧 worker 置 failed
+    assert note.llm_calls == 1  # 只有新 worker 的那次整理落了库

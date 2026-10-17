@@ -41,10 +41,19 @@ class LLMClient(Protocol):
 
 
 async def get_llm_client() -> LLMClient:
+    """按配置构造 LLM 客户端。
+
+    不再静默回落 MockLLM（P2）：LLM_PROVIDER=openai 而缺 LLM_API_KEY、
+    或生产（postgresql）配了 mock，都直接抛错——配置错误必须暴露出来，
+    假实现混进生产会掩盖问题到用户侧。启动侧的同名校验见
+    app.config._reject_misconfigured_llm_in_production，这里是运行时兜底。
+    """
     from app.config import get_settings
 
     settings = get_settings()
-    if settings.llm_provider == "openai" and settings.llm_api_key:
+    if settings.llm_provider == "openai":
+        if not settings.llm_api_key:
+            raise RuntimeError("LLM_PROVIDER=openai 但未设置 LLM_API_KEY（不会静默回落 MockLLM）")
         from app.llm.openai_compat import OpenAICompatClient
 
         return OpenAICompatClient(
@@ -52,6 +61,11 @@ async def get_llm_client() -> LLMClient:
             api_key=settings.llm_api_key,
             model=settings.llm_model,
             timeout=settings.llm_timeout_seconds,
+        )
+    # mock：生产下 config 已在启动时拒绝；这里再挡一层绕过启动校验的场景
+    if settings.database_url.startswith("postgresql") and not settings.allow_mock_llm_in_prod:
+        raise RuntimeError(
+            "生产环境不允许 LLM_PROVIDER=mock（仅测试可设 ALLOW_MOCK_LLM_IN_PROD=true）"
         )
     from app.llm.mock import MockLLM
 

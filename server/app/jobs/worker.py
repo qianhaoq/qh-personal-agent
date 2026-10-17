@@ -6,7 +6,10 @@ from app.config import get_settings
 from app.db import create_all
 from app.pipeline.runner import run_pending_jobs
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+logging.basicConfig(
+    level=get_settings().log_level.upper(),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
 logger = logging.getLogger("worker")
 
 

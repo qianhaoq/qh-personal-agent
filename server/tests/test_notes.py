@@ -190,3 +190,43 @@ async def test_note_text_too_long_422(client, user):
         headers=auth_headers(user),
     )
     assert patched.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# QA（PR #2 复测）：正文含 NUL（\x00）在 schemas 校验层拒绝（422）。
+# 不拦的话 PostgreSQL 文本列会直接编码报错（asyncpg → 500），NUL 流入
+# LLM prompt / JSON 序列化也会出各种怪错。两库行为一致（校验在进库前）。
+# ---------------------------------------------------------------------------
+
+
+async def test_nul_rejected_in_note_strings_422(client, user):
+    headers = auth_headers(user)
+    nul = "含\x00的正文"
+    cases = [
+        ("text", nul),
+        ("client_note_id", "cn\x00"),
+        ("source", "app\x00"),
+        ("timezone", "Asia/Shanghai\x00"),
+        # asr 容器内任何层级的字符串（键与值）都要拦
+        ("asr", {"transcript": nul}),
+        ("asr", {"segments": [{"text": nul}]}),
+        ("asr", {"ke\x00y": "value"}),
+    ]
+    for field, value in cases:
+        body = {"client_note_id": str(uuid.uuid4()), "text": "正常正文", field: value}
+        created = await client.post("/v1/notes", json=body, headers=headers)
+        assert created.status_code == 422, (field, value, created.text)
+        assert created.json()["error"]["code"] == "validation_error"
+
+    # PATCH 的 text 同样拦截
+    ok = await client.post(
+        "/v1/notes",
+        json={"client_note_id": str(uuid.uuid4()), "text": "正常长度"},
+        headers=headers,
+    )
+    note_id, rev = ok.json()["note_id"], ok.json()["rev"]
+    patched = await client.patch(
+        f"/v1/notes/{note_id}", json={"text": nul, "rev": rev}, headers=headers
+    )
+    assert patched.status_code == 422
+    assert patched.json()["error"]["code"] == "validation_error"

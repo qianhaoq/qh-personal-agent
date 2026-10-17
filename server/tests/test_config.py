@@ -15,14 +15,15 @@ GOOD_HEX = bytes(range(32)).hex()
 
 
 def _pg_settings(**kwargs) -> Settings:
-    """生产形态（postgresql）的合法基线：强 secret + mem0 记忆后端。
+    """生产形态（postgresql）的合法基线：强 secret + mem0 记忆后端 + 合法 LLM。
 
     不带 memory_backend 的话会先撞上“生产拒绝 inmemory”的校验（PG 跑
     测试时 conftest 还设置了 ALLOW_INMEMORY_IN_PROD，行为随运行方式
-    漂移），显式固定住。
+    漂移），LLM 同理（ALLOW_MOCK_LLM_IN_PROD），显式固定住。
     """
     kwargs.setdefault("jwt_secret", GOOD_HEX)
     kwargs.setdefault("memory_backend", "mem0")
+    kwargs.setdefault("allow_mock_llm_in_prod", True)
     return Settings(database_url=PG_URL, **kwargs)
 
 
@@ -186,3 +187,100 @@ def test_job_lock_timeout_seconds_default_300():
     """P1-B：锁超时默认 300s（回收 running 任务的判定窗口）。"""
     settings = Settings(database_url="sqlite+aiosqlite:///./app.sqlite3")
     assert settings.job_lock_timeout_seconds == 300
+
+
+# ---------------------------------------------------------------------------
+# P2（Codex）：LLM 配置错误不得静默回落 MockLLM。
+# - provider 只接受 mock|openai（拼错启动即报错）；
+# - 生产（postgresql）：mock 拒绝（除非 ALLOW_MOCK_LLM_IN_PROD=true，
+#   PG 测试套件用）、openai 缺 LLM_API_KEY 拒绝。
+# ---------------------------------------------------------------------------
+
+
+def test_llm_provider_only_accepts_known_values():
+    # 显式 sqlite URL：隔离 PG 运行时环境变量对生产校验的影响
+    sqlite = "sqlite+aiosqlite:///./app.sqlite3"
+    assert Settings(database_url=sqlite, llm_provider="mock").llm_provider == "mock"
+    assert Settings(database_url=sqlite, llm_provider="openai").llm_provider == "openai"
+    with pytest.raises(ValidationError, match="llm_provider"):
+        Settings(database_url=sqlite, llm_provider="openia")  # 拼错：直接校验失败
+
+
+def test_production_mock_llm_rejected():
+    with pytest.raises(ValidationError, match="LLM_PROVIDER"):
+        _pg_settings(llm_provider="mock", allow_mock_llm_in_prod=False)
+
+
+def test_production_mock_llm_allowed_with_test_flag():
+    settings = _pg_settings(llm_provider="mock", allow_mock_llm_in_prod=True)
+    assert settings.llm_provider == "mock"
+
+
+def test_production_openai_without_api_key_rejected():
+    with pytest.raises(ValidationError, match="LLM_API_KEY"):
+        _pg_settings(llm_provider="openai", llm_api_key="")
+
+
+def test_production_openai_with_api_key_ok():
+    settings = _pg_settings(llm_provider="openai", llm_api_key="sk-test-only")
+    assert settings.llm_provider == "openai"
+
+
+def test_sqlite_mock_llm_ok():
+    # SQLite 开发/测试环境不受生产校验影响
+    settings = Settings(database_url="sqlite+aiosqlite:///./app.sqlite3", llm_provider="mock")
+    assert settings.llm_provider == "mock"
+
+
+async def test_get_llm_client_never_silently_falls_back(monkeypatch):
+    """get_llm_client 运行时兜底：openai 缺 key、生产 mock 都抛错，不回落。"""
+    from app.config import get_settings
+    from app.llm.base import get_llm_client
+    from app.llm.mock import MockLLM
+    from app.llm.openai_compat import OpenAICompatClient
+
+    settings = get_settings()
+
+    # 默认（测试环境：mock，PG 套件 conftest 已置 ALLOW_MOCK_LLM_IN_PROD）
+    assert isinstance(await get_llm_client(), MockLLM)
+
+    # openai 配了 key：正常返回兼容客户端
+    monkeypatch.setattr(settings, "llm_provider", "openai")
+    monkeypatch.setattr(settings, "llm_api_key", "sk-test-only")
+    assert isinstance(await get_llm_client(), OpenAICompatClient)
+
+    # openai 缺 key：抛错（任何环境），不再静默回落 MockLLM
+    monkeypatch.setattr(settings, "llm_api_key", "")
+    with pytest.raises(RuntimeError, match="LLM_API_KEY"):
+        await get_llm_client()
+
+    # 生产形态 + mock 且未放行：抛错
+    monkeypatch.setattr(settings, "llm_provider", "mock")
+    monkeypatch.setattr(settings, "database_url", PG_URL)
+    monkeypatch.setattr(settings, "allow_mock_llm_in_prod", False)
+    with pytest.raises(RuntimeError, match="ALLOW_MOCK_LLM_IN_PROD"):
+        await get_llm_client()
+
+
+# ---------------------------------------------------------------------------
+# P2（审查）：生产默认值——/docs 默认关闭、CORS 默认不启用、日志级别可配。
+# ---------------------------------------------------------------------------
+
+
+def test_enable_docs_defaults_to_false():
+    assert Settings(database_url="sqlite+aiosqlite:///./app.sqlite3").enable_docs is False
+
+
+def test_cors_allow_origins_defaults_to_empty():
+    assert Settings(database_url="sqlite+aiosqlite:///./app.sqlite3").cors_allow_origins == ""
+
+
+def test_env_example_documents_new_runtime_flags():
+    """部署模板要包含本轮新增的运行时配置项（占位不含真值）。"""
+    env_example = (
+        pathlib.Path(__file__).resolve().parent.parent / ".env.example"
+    ).read_text(encoding="utf-8")
+    lines = [ln.strip() for ln in env_example.splitlines()]
+    assert "ENABLE_DOCS=false" in lines
+    assert "LOG_LEVEL=info" in lines
+    assert any(ln.startswith("# CORS_ALLOW_ORIGINS=") for ln in lines)

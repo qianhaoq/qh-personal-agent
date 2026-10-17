@@ -53,6 +53,12 @@ class Settings(BaseSettings):
     # 基础
     app_name: str = "personal-agent"
     debug: bool = False
+    # 生产默认关闭交互文档（/docs、/redoc、/openapi.json）：本地开发设 true
+    enable_docs: bool = False
+    # 逗号分隔的 CORS 允许来源；空 = 不启用 CORS（原生 App 无需浏览器跨域）
+    cors_allow_origins: str = ""
+    # 日志级别（worker 的 basicConfig 与 uvicorn --log-level 用）
+    log_level: str = "info"
 
     # 数据库：生产 postgresql+asyncpg，测试 sqlite+aiosqlite
     database_url: str = "sqlite+aiosqlite:///./app.sqlite3"
@@ -62,12 +68,15 @@ class Settings(BaseSettings):
     access_token_ttl_seconds: int = 15 * 60
     refresh_token_ttl_days: int = 30
 
-    # LLM
-    llm_provider: str = "mock"  # mock | openai
+    # LLM：只接受这两个值，拼错启动即报错（而不是静默当 mock 用）
+    llm_provider: Literal["mock", "openai"] = "mock"
     llm_base_url: str = ""
     llm_api_key: str = ""
     llm_model: str = ""
     llm_timeout_seconds: float = 15.0
+    # 仅测试用：生产（postgresql）+ mock 默认拒绝启动（假整理/假问答），
+    # 跑 PG 测试套件的 CI/本地环境显式置 true 放行（生产环境不要设置）
+    allow_mock_llm_in_prod: bool = False
 
     # 记忆层：只接受这两个值，未知值启动即报错（而不是静默退化丢记忆）
     memory_backend: Literal["inmemory", "mem0"] = "inmemory"
@@ -143,6 +152,33 @@ class Settings(BaseSettings):
                 "MEMORY_BACKEND=inmemory（多进程/重启即丢记忆）：请改为 "
                 "mem0（pgvector 与业务库同一个 PostgreSQL 实例）。"
                 "仅在跑 PG 测试套件的 CI/本地环境可设 ALLOW_INMEMORY_IN_PROD=true 放行"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _reject_misconfigured_llm_in_production(self) -> "Settings":
+        """P2：生产（postgresql）下 LLM 配置错误必须启动报错，而不是静默
+        回落 MockLLM（整理/问答全变假实现，问题被掩盖到用户侧）。
+
+        - LLM_PROVIDER=openai 但缺 LLM_API_KEY：拒绝（get_llm_client 也
+          不会再静默回落）；
+        - LLM_PROVIDER=mock：拒绝（假实现），仅跑 PG 测试套件的 CI/本地
+          环境可设 ALLOW_MOCK_LLM_IN_PROD=true 放行。
+        provider 拼错由 Literal 校验直接报错（任何环境）。
+        """
+        if not self.database_url.startswith("postgresql"):
+            return self
+        if self.llm_provider == "openai":
+            if not self.llm_api_key:
+                raise ValueError(
+                    "生产环境（DATABASE_URL 以 postgresql 开头）"
+                    "LLM_PROVIDER=openai 必须设置 LLM_API_KEY：缺 key 不会静默回落 MockLLM"
+                )
+        elif self.llm_provider == "mock" and not self.allow_mock_llm_in_prod:
+            raise ValueError(
+                "生产环境（DATABASE_URL 以 postgresql 开头）不允许 LLM_PROVIDER=mock"
+                "（整理/问答会是确定性假实现）：请配置 openai。"
+                "仅在跑 PG 测试套件的 CI/本地环境可设 ALLOW_MOCK_LLM_IN_PROD=true 放行"
             )
         return self
 

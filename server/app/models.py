@@ -130,6 +130,9 @@ class Job(Base):
     max_attempts: Mapped[int] = mapped_column(Integer, default=3)
     run_after: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 持有租约的 worker 实例 id：收尾按 (status, locked_by, locked_at) 校验，
+    # 任务被回收换主后旧 worker 的收尾不再生效（见 jobs.queue.finalize_claim）
+    locked_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)

@@ -388,3 +388,180 @@ async def test_concurrent_first_login_same_invite_single_user(client, invite_cod
     assert len(users) == 1
     assert invite.used == 1  # 只计一次注册
     assert invite.owner_user_id == user_ids.pop()
+
+
+# ---------------------------------------------------------------------------
+# QA（PR #2 复测）：同一 note 上 PATCH、DELETE、organize 写回三方重叠。
+#
+# 加锁顺序（全局规则见 app.common.allocate_seq）：三条路径都是先锁
+# 业务行（note 的条件 UPDATE / FOR UPDATE）→ reminders → jobs INSERT
+# → 最后 allocate_seq。用 Event 让 organize 写回停在“已持有 note 行锁、
+# 即将请求 sequences 锁”的位置，同时发出 PATCH 与 DELETE（各自独立
+# 会话/连接，真实并发地阻塞在 note 行锁上），重复 20 轮：PG 上任何
+# 顺序违反（如先 allocate_seq 再锁 note）都会以 DeadlockDetected→500
+# 或锁等待超时暴露。仅 PG：SQLite 无行锁、单写者串行，构造不出重叠窗口。
+# ---------------------------------------------------------------------------
+
+
+@requires_postgres
+async def test_patch_delete_organize_three_way_overlap_no_deadlock(client, user, monkeypatch):
+    from sqlalchemy import select
+
+    from app.db import get_sessionmaker
+    from app.memory.base import get_memory_store
+    from app.models import Job, Note, Reminder
+    from app.pipeline import organize as organize_mod
+    from app.pipeline.runner import run_pending_jobs
+
+    headers = auth_headers(user)
+    rounds = 20
+    gate: dict[str, asyncio.Event] = {"entered": asyncio.Event(), "release": asyncio.Event()}
+    real_allocate_seq = organize_mod.allocate_seq
+
+    async def allocate_seq_paused(session, name="global", count=1):
+        # 到这里说明 organize 已 flush 完业务行（持有 note 行锁），正要请求
+        # sequences 锁：把三方重叠钉在这个时刻
+        gate["entered"].set()
+        await gate["release"].wait()
+        return await real_allocate_seq(session, name=name, count=count)
+
+    monkeypatch.setattr(organize_mod, "allocate_seq", allocate_seq_paused)
+
+    await run_pending_jobs()  # 排空残留 job，保证每轮先被领走的是本轮任务
+    note_ids: list[str] = []
+    for i in range(rounds):
+        gate["entered"] = asyncio.Event()
+        gate["release"] = asyncio.Event()
+        created = await client.post(
+            "/v1/notes",
+            json={"client_note_id": str(uuid.uuid4()), "text": f"第 {i} 轮三方重叠"},
+            headers=headers,
+        )
+        assert created.status_code == 202, created.text
+        note_id = created.json()["note_id"]
+        note_ids.append(note_id)
+
+        worker = asyncio.create_task(run_pending_jobs(limit=1))
+        await asyncio.wait_for(gate["entered"].wait(), timeout=5)
+
+        # 三者同时进入：PATCH 与 DELETE（独立请求/会话）都阻塞在 organize
+        # 持有的 note 行锁上
+        patch_task = asyncio.create_task(
+            client.patch(
+                f"/v1/notes/{note_id}",
+                json={"text": "并发 PATCH 的新内容", "rev": 1},
+                headers=headers,
+            )
+        )
+        delete_task = asyncio.create_task(client.delete(f"/v1/notes/{note_id}", headers=headers))
+        await asyncio.sleep(0.15)
+        assert not patch_task.done() and not delete_task.done(), "两请求应在 note 行锁上等待"
+
+        gate["release"].set()
+        patched, deleted = await asyncio.gather(patch_task, delete_task)
+        await asyncio.wait_for(worker, timeout=10)
+
+        # 无 DeadlockDetected 引发的 500；结果必为合法的串行化结果之一：
+        # organize 先提交（rev+1）→ PATCH 409、DELETE 204；或 DELETE 先
+        # 落定 → PATCH 404、DELETE 204
+        assert patched.status_code in (409, 404), (i, patched.status_code, patched.text)
+        assert deleted.status_code == 204, (i, deleted.status_code, deleted.text)
+        # 每轮收尾：清掉本轮 DELETE 入队的 cleanup job，避免下一轮的
+        # run_pending_jobs(limit=1) 领到它而不是新 organize job
+        await run_pending_jobs()
+
+    # 最终状态一致：全部已删除 → 无存活提醒、无记忆、job 全部收尾
+    async with get_sessionmaker()() as session:
+        notes = (
+            await session.execute(select(Note).where(Note.id.in_(note_ids)))
+        ).scalars().all()
+        live_reminders = (
+            await session.execute(
+                select(Reminder).where(
+                    Reminder.note_id.in_(note_ids), Reminder.deleted_at.is_(None)
+                )
+            )
+        ).scalars().all()
+        relevant_jobs = [
+            j
+            for j in (
+                await session.execute(select(Job).where(Job.kind.in_(("organize_note", "cleanup_memory"))))
+            ).scalars().all()
+            if any(nid in (j.payload_json or "") for nid in note_ids)
+        ]
+    assert all(n.deleted_at is not None for n in notes)
+    assert live_reminders == []
+    assert relevant_jobs and {j.status for j in relevant_jobs} <= {"done", "failed"}
+    assert [m for m in await get_memory_store().list(user["user_id"]) if m.note_id in note_ids] == []
+
+
+@requires_postgres
+async def test_ask_slow_llm_single_connection_pool_still_serves(client, user, run_jobs, monkeypatch):
+    """P2：ask 的 LLM 调用不占数据库连接——把引擎池压到 pool_size=1、
+    max_overflow=0，慢 LLM 等待期间另一个需要数据库的请求仍能完成。
+
+    旧实现里鉴权依赖挂着的请求级会话在鉴权查询后就一直开着（事务未
+    提交、连接未还），ask 的 LLM 秒级调用期间这唯一连接被占死，其他
+    请求（含鉴权）全部排队。现在鉴权在独立短会话完成即还连接，ask
+    处理中根本没有打开的会话。
+    """
+    import uuid as uuid_mod
+
+    from sqlalchemy.ext.asyncio import (
+        AsyncSession,
+        async_sessionmaker,
+        create_async_engine,
+    )
+
+    import app.db as db_module
+    from app.config import get_settings
+
+    url = get_settings().database_url
+    assert url.startswith("postgresql")
+    # 直接替换全局引擎（URL query 参数会被 asyncpg 当连接参数，不能走 URL）
+    engine = create_async_engine(
+        url, pool_pre_ping=True, future=True, pool_size=1, max_overflow=0
+    )
+    monkeypatch.setattr(db_module, "_engine", engine)
+    monkeypatch.setattr(
+        db_module,
+        "_sessionmaker",
+        async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False),
+    )
+    try:
+        headers = auth_headers(user)
+        created = await client.post(
+            "/v1/notes",
+            json={"client_note_id": str(uuid_mod.uuid4()), "text": "我对花生过敏"},
+            headers=headers,
+        )
+        assert created.status_code == 202, created.text
+        await run_jobs()
+
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        class SlowLLM:
+            async def chat(self, messages, response_format=None):
+                entered.set()
+                await release.wait()
+                return "根据你的记录：花生过敏"
+
+        async def fake_get_llm():
+            return SlowLLM()
+
+        monkeypatch.setattr("app.api.ask.get_llm_client", fake_get_llm)
+
+        ask_task = asyncio.create_task(
+            client.post("/v1/ask", json={"text": "我吃东西要注意什么"}, headers=headers)
+        )
+        await asyncio.wait_for(entered.wait(), timeout=5)
+
+        # 池里唯一的连接没被 ask 占住：鉴权+查询走数据库的请求照常完成
+        other = await asyncio.wait_for(client.get("/v1/notes", headers=headers), timeout=3)
+        assert other.status_code == 200, other.text
+
+        release.set()
+        resp = await asyncio.wait_for(ask_task, timeout=5)
+        assert resp.status_code == 200, resp.text
+    finally:
+        await engine.dispose()

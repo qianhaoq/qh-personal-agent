@@ -1,14 +1,7 @@
-fastapi>=0.115
-uvicorn[standard]>=0.30
-pydantic>=2.8
-pydantic-settings>=2.4
-SQLAlchemy[asyncio]>=2.0.30
-aiosqlite>=0.20
-asyncpg>=0.29
-PyJWT>=2.9
-httpx>=0.27
-python-multipart>=0.0.9
+# 运行时依赖见 requirements-app.txt（Docker 镜像只装它，不带测试工具）。
+# CI 安装本文件以同时获得 pytest-asyncio（pytest 由 CI 显式安装）。
+-r requirements-app.txt
 
-# ---- 测试依赖（CI 只安装本文件：async fixture 需要 pytest-asyncio）----
+# ---- 测试依赖 ----
 pytest>=8.2
 pytest-asyncio>=0.23

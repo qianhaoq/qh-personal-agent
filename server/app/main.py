@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from app.config import get_settings
 from app.db import create_all, dispose_engine
 from app.errors import (
     ApiError,
@@ -22,12 +23,55 @@ async def lifespan(app: FastAPI):
     await dispose_engine()
 
 
-app = FastAPI(title="personal-agent", version="0.1.0", lifespan=lifespan)
+def create_app() -> FastAPI:
+    """按当前配置构建应用。
 
-app.add_exception_handler(ApiError, api_error_handler)
-app.add_exception_handler(StarletteHTTPException, http_exception_handler)
-app.add_exception_handler(RequestValidationError, validation_exception_handler)
-app.add_exception_handler(Exception, unhandled_exception_handler)
+    生产默认值（P2 审查）：
+    - ENABLE_DOCS=false：/docs、/redoc、/openapi.json 不暴露（避免把
+      全部接口面（含鉴权细节）公开给扫描器）；本地开发设 true 查看；
+    - CORS_ALLOW_ORIGINS 为空时不挂 CORS 中间件：原生 App 不走浏览器
+      跨域，默认多开一个来源就多一分配置出错的面。
+    """
+    settings = get_settings()
+    docs_enabled = settings.enable_docs
+    app = FastAPI(
+        title="personal-agent",
+        version="0.1.0",
+        lifespan=lifespan,
+        docs_url="/docs" if docs_enabled else None,
+        redoc_url="/redoc" if docs_enabled else None,
+        openapi_url="/openapi.json" if docs_enabled else None,
+    )
+
+    app.add_exception_handler(ApiError, api_error_handler)
+    app.add_exception_handler(StarletteHTTPException, http_exception_handler)
+    app.add_exception_handler(RequestValidationError, validation_exception_handler)
+    app.add_exception_handler(Exception, unhandled_exception_handler)
+
+    if settings.cors_allow_origins:
+        from fastapi.middleware.cors import CORSMiddleware
+
+        origins = [o.strip() for o in settings.cors_allow_origins.split(",") if o.strip()]
+        if origins:
+            app.add_middleware(
+                CORSMiddleware,
+                allow_origins=origins,
+                allow_credentials=True,
+                allow_methods=["*"],
+                allow_headers=["*"],
+            )
+
+    # 路由注册（放在 app 创建之后，避免路由 handlers 早于 app 定义）
+    from app.api import ask, auth, notes, sync
+
+    app.include_router(auth.router)
+    app.include_router(notes.router)
+    app.include_router(sync.router)
+    app.include_router(ask.router)
+    return app
+
+
+app = create_app()
 
 
 @app.get("/healthz", tags=["health"])
@@ -51,18 +95,8 @@ async def healthz():
 
 
 def _llm_status() -> str:
+    # config 已用 Literal 限制取值且生产下校验过（mock/openai 配错启动即拒），
+    # 如实回报即可；这里不再做“缺 key 就报 mock”的猜测
     from app.config import get_settings
 
-    settings = get_settings()
-    if settings.llm_provider == "openai" and settings.llm_api_key:
-        return "openai"
-    return "mock"
-
-
-# 路由注册（放在 app 创建之后，避免路由 handlers 早于 app 定义）
-from app.api import ask, auth, notes, sync
-
-app.include_router(auth.router)
-app.include_router(notes.router)
-app.include_router(sync.router)
-app.include_router(ask.router)
+    return get_settings().llm_provider

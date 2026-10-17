@@ -491,9 +491,9 @@ async def test_failed_finalize_skips_note_patched_after_enqueue(client, user, mo
     monkeypatch.setattr("app.pipeline.organize.get_llm_client", fake_get_llm)
 
     finalize_calls = {"n": 0}
-    real_finalize = runner._finalize_failure
+    real_finalize = runner._finalize
 
-    async def finalize_with_mid_race_patch(maker, claimed, error, retry_delay_seconds):
+    async def finalize_with_mid_race_patch(maker, claimed, error, retry_delay_seconds, worker_id):
         finalize_calls["n"] += 1
         if finalize_calls["n"] == 3:
             # 第 3 次（最后一次）失败收尾前，用户 PATCH：rev+1 并入队新任务，
@@ -506,9 +506,9 @@ async def test_failed_finalize_skips_note_patched_after_enqueue(client, user, mo
                 headers=headers,
             )
             assert patched.status_code == 200, patched.text
-        await real_finalize(maker, claimed, error, retry_delay_seconds)
+        await real_finalize(maker, claimed, error, retry_delay_seconds, worker_id)
 
-    monkeypatch.setattr(runner, "_finalize_failure", finalize_with_mid_race_patch)
+    monkeypatch.setattr(runner, "_finalize", finalize_with_mid_race_patch)
 
     # 只跑 3 个：旧任务 3 次尝试全部失败（判 failed），新 rev 的任务留在队列里。
     # 此时检查收尾有没有污染用户的新版本（下一次运行才会执行新任务）

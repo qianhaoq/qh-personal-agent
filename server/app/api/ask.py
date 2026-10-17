@@ -1,13 +1,18 @@
-"""搜索与问答：GET /v1/search、POST /v1/ask。"""
+"""搜索与问答：GET /v1/search、POST /v1/ask。
+
+不依赖请求级数据库会话（P2）：鉴权在独立短会话完成（见 app.deps），
+这里只有记忆检索（mem0 内部还有 LLM/embedding）与 LLM 调用——若挂着
+打开的会话/事务，秒级外部调用期间会占住连接池，把并发请求饿死。
+"""
+from typing import Annotated
+
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.db import get_db_session
 from app.deps import get_current_user_id
 from app.llm.base import get_llm_client
 from app.memory.base import get_memory_store
-from app.schemas import AskRequest
+from app.schemas import AskRequest, NoNulStr
 from app.timeutil import to_utc, utcnow
 
 router = APIRouter(prefix="/v1", tags=["ask"])
@@ -15,10 +20,9 @@ router = APIRouter(prefix="/v1", tags=["ask"])
 
 @router.get("/search")
 async def search(
-    q: str = Query(min_length=1, max_length=500),
+    q: Annotated[NoNulStr, Query(min_length=1, max_length=500)],
     top_k: int = Query(default=10, ge=1, le=50),
     user_id: str = Depends(get_current_user_id),
-    session: AsyncSession = Depends(get_db_session),
 ):
     store = get_memory_store()
     results = await store.search(user_id, q, top_k=top_k)
@@ -34,7 +38,6 @@ async def search(
 async def ask(
     body: AskRequest,
     user_id: str = Depends(get_current_user_id),
-    session: AsyncSession = Depends(get_db_session),
 ):
     settings = get_settings()
     store = get_memory_store()

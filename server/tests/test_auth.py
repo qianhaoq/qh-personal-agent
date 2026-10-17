@@ -102,3 +102,23 @@ async def test_expired_invite_rejected(client):
         await session.commit()
     resp = await client.post("/v1/auth/login", json={"invite_code": code, "device_id": "d_exp"})
     assert resp.status_code == 403
+
+
+async def test_nul_rejected_in_auth_strings_422(client, invite_code):
+    """QA（PR #2 复测）：鉴权相关字符串入参含 NUL 一律 422（schemas 层拦截）。"""
+    for field, value in (
+        ("invite_code", f"{invite_code}\x00"),
+        ("device_id", "dev\x00"),
+        ("device_name", "phone\x00"),
+        ("platform", "android\x00"),
+    ):
+        resp = await client.post(
+            "/v1/auth/login",
+            json={"invite_code": invite_code, "device_id": "dev_nul", field: value},
+        )
+        assert resp.status_code == 422, (field, resp.text)
+        assert resp.json()["error"]["code"] == "validation_error"
+
+    refresh = await client.post("/v1/auth/refresh", json={"refresh_token": "tok\x00en"})
+    assert refresh.status_code == 422
+    assert refresh.json()["error"]["code"] == "validation_error"
