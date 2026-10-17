@@ -249,7 +249,7 @@ memory_sync(note_id)     不带 rev。短读事务取 note 当前状态 →（�
   - 行不存在（被挤出/登出删除）→ 401 `unauthorized`，**不吊销设备**（挤出/登出的既定语义就是普通 401）；
   - `revoked_at` 非空 → 确系被轮换/吊销后的重放 → 按复用吊销整台设备（原语义）；
   - `revoked_at` 为空却没轮换成功 → 只可能是等待锁期间跨过过期时刻（UPDATE 里的 `now` 是请求起始时刻）→ 401 `unauthorized`（过期），不吊销设备。
-  - **重读必须绕过 identity map（threads7 P1，auth.py:280）**：轮换的条件 UPDATE 用 `synchronize_session=False`，不更新会话里已加载的 ORM 对象；随后的 `select(RefreshToken)` 会命中 identity map 里首读时装载的那份旧对象，把并发轮换刚提交的 `revoked_at` 读成 `None`——重放被误判成「过期 401」，设备与攻击者刚轮换到的新 token 都保持活跃。重读只查标量列（`select(RefreshToken.id, RefreshToken.expires_at, RefreshToken.revoked_at)`）或 `populate_existing=True`（细则与全仓清单见 INV-12）。
+  - **重读必须绕过 identity map（threads7 P1，auth.py:280）**：轮换的条件 UPDATE 用 `synchronize_session=False`，不更新会话里已加载的 ORM 对象；随后的 `select(RefreshToken)` 会命中 identity map 里首读时装载的那份旧对象，把并发轮换刚提交的 `revoked_at` 读成 `None`——重放被误判成「过期 401」，设备与攻击者刚轮换到的新 token 都保持活跃。重读只查标量列（`select(RefreshToken.id, RefreshToken.revoked_at)`）或 `populate_existing=True`（细则与全仓清单见 INV-12）。
 - **重放已作废（被轮换/吊销）的 token → 一律先 `_lock_device`，锁内重读 token 行后再判定（threads7 P1，auth.py:246）**。首读（无锁快照）看到 `revoked_at` 非空**不足以**直接吊销：等锁期间该行可能已被 logout 删除、或已跨过 `expires_at`（尚未被修剪）——INV-8 对这两类的定义都是普通 401、不吊销设备。锁内重读按固定顺序分类：
   - 行不存在（登出删除等）→ 401 `unauthorized`，**不吊销设备**；
   - 行已过期（`expires_at <= now`，无论是否作废）→ 401 `unauthorized`（过期），**不吊销设备**——先判过期再判作废；
@@ -361,6 +361,7 @@ memory_sync(note_id)     不带 rev。短读事务取 note 当前状态 →（�
 
 **验证测试**：
 - `test_refresh_race_row_deleted_while_waiting_device_lock_401_no_revoke`（0 行的成因是「行被删除」而非「重放」：错误归因会吊销整台设备）
+- `test_refresh_race_revoked_while_waiting_device_lock_detected_as_reuse`（threads7：0 行的成因是「并发轮换作废」，锁内重读必须绕过 identity map——旧行为命中首读旧对象，把重放误判成过期 401、设备保持活跃）
 - `test_concurrent_sixth_login_eviction_vs_refresh_no_device_revoke_pg`（同上，PG 真并发窗口）
 - 既有正面样例回归：`test_concurrent_patch_same_rev_exactly_one_success`（PATCH 0 行 → 重读归因 409/404）、`test_login_device_bound_to_other_user_403`（upsert 0 行 → 重读归因 403）
 

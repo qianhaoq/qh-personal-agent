@@ -474,6 +474,60 @@ async def test_refresh_race_row_deleted_while_waiting_device_lock_401_no_revoke(
     assert device.revoked_at is None
 
 
+async def test_refresh_race_revoked_while_waiting_device_lock_detected_as_reuse(
+    client, invite_code, monkeypatch
+):
+    """threads7 P1 / INV-12（auth.py:280）：同一枚 token 并发轮换，输家在
+    「首读活行 → 拿到 device 锁」的窗口里被赢家作废 → 轮换 0 行。锁内重读
+    必须绕过 identity map：轮换的条件 UPDATE 用 synchronize_session=False，
+    不更新会话已加载的 row 对象——旧行为的 select(RefreshToken) 命中首读
+    装载的旧对象，把并发轮换刚提交的 revoked_at 读成 None，重放被误判成
+    「过期 401」、设备与赢家刚轮换到的新 token 全部保持活跃；正确行为是
+    识别为重放 → 吊销整台设备。"""
+    from sqlalchemy import update as sa_update
+
+    from app.api import auth as auth_api
+    from app.auth.tokens import hash_refresh_token
+    from app.db import get_sessionmaker
+    from app.models import Device, RefreshToken
+    from app.timeutil import utcnow
+
+    device_id = "dev_race_revoked"
+    first = await client.post(
+        "/v1/auth/login", json={"invite_code": invite_code, "device_id": device_id}
+    )
+    assert first.status_code == 200, first.text
+    t1 = first.json()["refresh_token"]
+
+    real_lock_device = auth_api._lock_device
+
+    async def lock_device_after_concurrent_rotation(session, device_id):
+        # 注入「读行之后、拿锁之前」窗口里赢家的轮换提交（同一事务内可见，
+        # 与真实并发提交等价）。synchronize_session=False 是关键：真实并发
+        # 发生在别的连接上、摸不到本会话的 identity map；若让注入的 UPDATE
+        # 同步内存对象，会把要测的陈旧读 bug 掩盖掉
+        async with session.begin_nested():
+            await session.execute(
+                sa_update(RefreshToken)
+                .where(RefreshToken.token_hash == hash_refresh_token(t1))
+                .values(revoked_at=utcnow())
+                .execution_options(synchronize_session=False)
+            )
+        return await real_lock_device(session, device_id)
+
+    monkeypatch.setattr(auth_api, "_lock_device", lock_device_after_concurrent_rotation)
+
+    resp = await client.post("/v1/auth/refresh", json={"refresh_token": t1})
+    assert resp.status_code == 401, resp.text
+    assert resp.json()["error"]["code"] == "refresh_reused", (
+        "陈旧 identity map 读会把重放误判成「过期」普通 401"
+    )
+
+    async with get_sessionmaker()() as session:
+        device = await session.get(Device, device_id)
+    assert device.revoked_at is not None
+
+
 @requires_postgres
 async def test_concurrent_sixth_login_eviction_vs_refresh_no_device_revoke_pg(
     client, invite_code

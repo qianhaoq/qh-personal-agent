@@ -275,9 +275,18 @@ async def refresh(body: RefreshRequest, session: AsyncSession = Depends(get_db_s
         # 首次读行（无锁）与拿到 device 行锁之间存在窗口，期间这行可能已被
         # 第 6 次登录的上限修剪或 logout 删除（挤出/登出的既定语义是普通
         # 401、不吊销设备），也可能恰好跨过 expires_at。锁内重读该行归因：
+        # INV-12——上面的条件 UPDATE 用 synchronize_session=False，不会更新
+        # 本会话已加载的 row 对象；这里若 select(RefreshToken) 会命中
+        # identity map 里首读的旧对象（revoked_at=None），把并发轮换后的
+        # 重放误判成「过期 401」、设备保持活跃。只查标量列：Row 不是实体、
+        # 不走 identity map，读到的就是锁内此刻的真值
         current = (
-            await session.execute(select(RefreshToken).where(RefreshToken.id == row.id))
-        ).scalar_one_or_none()
+            await session.execute(
+                select(RefreshToken.id, RefreshToken.revoked_at).where(
+                    RefreshToken.id == row.id
+                )
+            )
+        ).first()
         if current is None:
             # 行已不存在（被挤出/登出删除）：普通 401，不吊销设备
             raise ApiError(401, "unauthorized", "invalid refresh token")
