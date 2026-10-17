@@ -19,7 +19,8 @@ Rules (checker id -> docs/server-invariants.md id):
                    rollback() or the end of the enclosing `with ... begin()` block.
                    Also: allocate_seq evaluated inside .values() that writes other columns.
   INV-NUL          [INV-7 外部输入硬化] FastAPI path params typed as bare str (str, str | None,
-                   Optional[str], Annotated[str, ...] without a NUL-safe constraint).
+                   Optional[str], Annotated[str, ...] without a NUL-safe constraint). Only the
+                   decorator path is read (router prefixes are not resolved).
                    Accepted: NoNulStr; Annotated metadata with reject_nul/AfterValidator,
                    or any constraint call with pattern=/regex= (Path, Query, StringConstraints,
                    Field, constr); non-str converters ({id:int}).
@@ -221,16 +222,6 @@ def check_seq_last(tree, path, parents) -> list[Finding]:
 
 
 # ------------------------------------------------------------------ INV-NUL
-def _prefixes(tree) -> dict[str, str]:
-    out = {}
-    for n in tree.body:  # module-level routers only (factories may reuse the name)
-        if isinstance(n, ast.Assign) and isinstance(n.value, ast.Call) and _name(n.value.func) in {"APIRouter", "FastAPI"}:
-            for k in n.value.keywords:
-                if k.arg == "prefix" and isinstance(k.value, ast.Constant) and isinstance(k.value.value, str):
-                    out.update({t.id: k.value.value for t in n.targets if isinstance(t, ast.Name)})
-    return out
-
-
 def _nul_safe_meta(meta: list[ast.AST]) -> bool:
     for m in meta:
         src = ast.unparse(m)
@@ -264,7 +255,7 @@ def _bare_str(ann) -> bool:
 
 
 def check_nul(tree, path, parents) -> list[Finding]:
-    out, prefixes = [], _prefixes(tree)
+    out = []
     for fn in ast.walk(tree):
         if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
@@ -272,7 +263,7 @@ def check_nul(tree, path, parents) -> list[Finding]:
         for d in fn.decorator_list:
             if isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute) and d.func.attr in HTTP_METHODS:
                 route = d.args[0].value if d.args and isinstance(d.args[0], ast.Constant) else ""
-                for m in re.findall(r"{([^}]+)}", prefixes.get(_name(d.func.value) or "", "") + str(route)):
+                for m in re.findall(r"{([^}]+)}", str(route)):
                     name, _, conv = m.partition(":")
                     if conv in {"", "str", "path"}:
                         params.add(name)

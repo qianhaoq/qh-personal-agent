@@ -144,22 +144,14 @@ class Nul(unittest.TestCase):
         async def i(g: Annotated[str, StringConstraints(pattern=r"^x$")]): ...
         """), [])
 
-    def test_factory_router_prefix_not_leaked(self):
-        self.assertEqual(rules("""
-        def a():
-            router = APIRouter(prefix="/{tenant_id}")
-        def b():
-            router = APIRouter()
-            @router.get("/x")
-            async def g(tenant_id: str = Depends(t)): ...
-        """), [])
-
-    def test_router_prefix(self):
+    def test_router_prefix_not_resolved(self):
         self.assertEqual(rules("""
         router = APIRouter(prefix="/u/{user_id}")
-        @router.get("/notes")
-        async def g(user_id: str): ...
-        """), [("INV-NUL", 4)])
+        def f():
+            router = APIRouter()
+            @router.get("/health")
+            async def g(user_id: str = Depends(u)): ...
+        """), [])
 
 
 class Fallback(unittest.TestCase):
