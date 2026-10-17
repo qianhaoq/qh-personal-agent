@@ -2,11 +2,11 @@
 
 > **事实来源**：服务端不变量以 [docs/server-invariants.md](server-invariants.md) 为准（随 PR #2 落地；落地前以 #2 中 AGENTS.md「写代码」各条为准）。本文只收集“同一类问题被 Codex 反复提出”的模式、正反例和怎么被发现的，帮助后来的 agent 少走回头路。两者冲突时以 server-invariants.md 为准，并回来改本文。
 >
-> 能机械检查的规则由 `scripts/check-invariants.py` 在 CI 的 `ci / Invariant Check (non-required)` 里执行；单行豁免写 `# invariant-ok: <理由>`，评审时要能说清理由。
+> 机检是**低误报的启发式**（AST），只覆盖常见写法，不证明代码满足不变量；它漏掉的情况仍由评审和 PG 并发测试兜底。能机械检查的规则由 `scripts/check-invariants.py` 在 CI 的 `ci / Invariant Check (non-required)` 里执行；单行豁免写 `# invariant-ok: <理由>`，评审时要能说清理由。
 
 ## 统计（PR #2 共 5 轮 Codex + PR #3，2026-10-17）
 
-共 45 条 Codex 发现（P0 0 / P1 22 / P2 23）。同一类问题平均要被提 2~3 轮，因为每次只修了被点名的那一行。
+共 45 条 Codex 发现（P0 0 / P1 21 / P2 24）。同一类问题平均要被提 2~3 轮，因为每次只修了被点名的那一行。
 
 | # | 类别 | P1 | P2 | 合计 | 典型线程（PR #2 文件） | 机检 |
 | --- | --- | --- | --- | --- | --- | --- |

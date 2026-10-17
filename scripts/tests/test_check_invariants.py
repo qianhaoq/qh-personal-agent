@@ -75,6 +75,27 @@ class SeqLast(unittest.TestCase):
         self.assertEqual(rules(src), [])
 
 
+class SeqOrmAssign(unittest.TestCase):
+    def test_attribute_write_after_allocate_flagged(self):
+        src = """
+        async def f(session, note):
+            seq = await allocate_seq(session)
+            note.change_seq = seq
+            note.text = "v"
+        """
+        self.assertEqual(rules(src), [("INV-SEQ-LAST", 5)])
+
+    def test_attribute_write_before_allocate_ok(self):
+        src = """
+        async def f(session, note):
+            note.text = "v"
+            await session.flush()
+            note.change_seq = await allocate_seq(session)
+            note.updated_at = now
+        """
+        self.assertEqual(rules(src), [])
+
+
 class SeqLoop(unittest.TestCase):
     def test_write_before_allocate_in_same_loop_flagged(self):
         src = """
@@ -126,6 +147,14 @@ class Nul(unittest.TestCase):
             ...
         """
         self.assertEqual(rules(src), [])
+
+    def test_optional_and_union_str_flagged(self):
+        src = """
+        @router.get("/{a}/{b}/{c}")
+        async def g(a: str | None, b: Optional[str], c: Union[int, str]):
+            ...
+        """
+        self.assertEqual([r for r, _ in rules(src)], ["INV-NUL"] * 3)
 
     def test_annotated_bare_str_flagged(self):
         src = """
@@ -179,6 +208,38 @@ class Fallback(unittest.TestCase):
         """
         self.assertEqual(rules(src), [("INV-NO-FALLBACK", 7)])
 
+    def test_permissive_or_selector_flagged(self):
+        src = """
+        def get_llm(provider, api_key):
+            if provider == "mock" or not api_key:
+                return MockLLM()
+            if provider != "mock":
+                return OpenAI()
+        """
+        self.assertEqual(rules(src), [("INV-NO-FALLBACK", 4)])
+
+    def test_negated_and_substring_selectors_flagged(self):
+        src = """
+        def a(p):
+            if p != "openai":
+                return MockLLM()
+        def b(p):
+            if "mock" in p:
+                return MockLLM()
+        """
+        self.assertEqual([r for r, _ in rules(src)], ["INV-NO-FALLBACK"] * 2)
+
+    def test_and_and_membership_selectors_ok(self):
+        src = """
+        def a(p, s):
+            if p == "mock" and not s.prod:
+                return MockLLM()
+            if p in ("inmemory", "fake"):
+                return InMemoryStore()
+            raise ValueError(p)
+        """
+        self.assertEqual(rules(src), [])
+
     def test_mock_class_name_without_call_or_in_mock_factory_ok(self):
         src = """
         def make_mock_llm():
@@ -208,6 +269,17 @@ class Ddl(unittest.TestCase):
         """
         found = ci.check_source(textwrap.dedent(src), "server/app/main.py")
         self.assertEqual([(f.rule, f.line) for f in found], [("INV-STARTUP-DDL", 6)])
+
+    def test_ddl_callable_inside_lifespan_warns(self):
+        src = """
+        @asynccontextmanager
+        async def lifespan(app):
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            yield
+        """
+        found = ci.check_source(textwrap.dedent(src), "server/app/main.py")
+        self.assertEqual([(f.rule, f.line) for f in found], [("INV-STARTUP-DDL", 5)])
 
     def test_cross_module_helper_warns(self):
         found = ci.check_source("async def lifespan(a):\n    await init_db()\n", "server/app/main.py", {"init_db"})

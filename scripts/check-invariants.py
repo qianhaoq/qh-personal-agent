@@ -128,6 +128,20 @@ def check_seq_last(tree: ast.AST, path: str, parents) -> list[Finding]:
                 out.append(Finding(path, c.lineno, "INV-SEQ-LAST",
                     f"{bad} after {SEQ_FUNC}() (line {first.lineno}) in {fn.name}(): allocate_seq must be the "
                     "last lock before commit; only change_seq/updated_at may be written after it."))
+        # ORM attribute writes (`note.text = v`) are flushed later and lock the row after the seq lock
+        for st in ast.walk(fn):
+            if not isinstance(st, (ast.Assign, ast.AugAssign, ast.AnnAssign)) or _enclosing_func(st, parents) is not fn:
+                continue
+            targets = st.targets if isinstance(st, ast.Assign) else [st.target]
+            attrs = [t.attr for t in targets if isinstance(t, ast.Attribute) and t.attr not in SEQ_COLUMNS]
+            if not attrs or any(_inside(sc, st, parents) for sc in seq_calls):
+                continue
+            in_loop = any(_inside(st, lp, parents) for lp in loop_bodies)
+            if _pos(st) <= _pos(first) and not in_loop:
+                continue
+            out.append(Finding(path, st.lineno, "INV-SEQ-LAST",
+                f"ORM attribute write .{attrs[0]} after {SEQ_FUNC}() (line {first.lineno}) in {fn.name}(): it is flushed "
+                "(row-locked) after the sequence lock; write business columns before allocate_seq."))
     return out
 
 
@@ -189,6 +203,11 @@ def _is_bare_str(ann: ast.AST | None) -> bool:
         return True
     if isinstance(ann, ast.Constant) and ann.value == "str":
         return True
+    if isinstance(ann, ast.BinOp) and isinstance(ann.op, ast.BitOr):  # str | None
+        return _is_bare_str(ann.left) or _is_bare_str(ann.right)
+    if isinstance(ann, ast.Subscript) and _name(ann.value) in {"Optional", "Union"}:
+        sl = ann.slice
+        return any(_is_bare_str(e) for e in (sl.elts if isinstance(sl, ast.Tuple) else [sl]))
     if isinstance(ann, ast.Subscript) and _name(ann.value) == "Annotated":
         sl = ann.slice
         first = sl.elts[0] if isinstance(sl, ast.Tuple) else sl
@@ -219,10 +238,31 @@ def check_nul(tree: ast.AST, path: str, parents) -> list[Finding]:
 
 
 # ---------------------------------------------------------------- INV-NO-FALLBACK
+def _is_fake_literal(n: ast.AST) -> bool:
+    vals = []
+    if isinstance(n, ast.Constant) and isinstance(n.value, str):
+        vals = [n.value]
+    elif isinstance(n, (ast.Tuple, ast.List, ast.Set)):
+        if not n.elts or not all(isinstance(e, ast.Constant) and isinstance(e.value, str) for e in n.elts):
+            return False
+        vals = [e.value for e in n.elts]
+    return bool(vals) and all(v.lower() in SELECTOR_WORDS for v in vals)
+
+
 def _selects_explicitly(test: ast.AST) -> bool:
-    for n in ast.walk(test):
-        if isinstance(n, ast.Constant) and isinstance(n.value, str) and any(w in n.value.lower() for w in SELECTOR_WORDS):
-            return True
+    """True only if the condition being true *implies* a fake was selected:
+    `x == "mock"`, `x in ("mock", "fake")`, or an `and` with such a term.
+    `or`, negations, `!=`, `not in` and substrings never qualify."""
+    if isinstance(test, ast.BoolOp):
+        if isinstance(test.op, ast.And):
+            return any(_selects_explicitly(v) for v in test.values)
+        return all(_selects_explicitly(v) for v in test.values)  # Or: every branch
+    if isinstance(test, ast.Compare) and len(test.ops) == 1:
+        op, left, right = test.ops[0], test.left, test.comparators[0]
+        if isinstance(op, ast.Eq):
+            return _is_fake_literal(left) or _is_fake_literal(right)
+        if isinstance(op, ast.In):
+            return _is_fake_literal(right)
     return False
 
 
@@ -296,12 +336,30 @@ def check_ddl(tree: ast.AST, path: str, parents, helpers: set[str] | None = None
     for c in ast.walk(tree):
         if isinstance(c, ast.Call) and _call_name(c) in names:
             fn = _enclosing_func(c, parents)
-            if fn is not None and not isinstance(fn, ast.Lambda) and fn.name in names:
+            if fn is not None and not isinstance(fn, ast.Lambda) and fn.name in names and not _is_startup(fn):
                 continue  # inside a DDL helper definition: flag its callers instead
             out.append(Finding(path, c.lineno, "INV-STARTUP-DDL",
                 "schema DDL at process startup: API workers and the worker service race on create_all. "
                 "Run it once in a bootstrap/migration step (e.g. app/cli.py) before starting services.", warning=True))
+    # DDL passed as a callable directly inside a startup entrypoint
+    # (lifespan: `await conn.run_sync(Base.metadata.create_all)`)
+    for fn in ast.walk(tree):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and _is_startup(fn) and fn.name in ddl_helpers(fn):
+            for n in ast.walk(fn):
+                if isinstance(n, ast.Attribute) and n.attr in DDL_NAMES and isinstance(n.value, ast.Attribute) and n.value.attr == "metadata":
+                    out.append(Finding(path, n.lineno, "INV-STARTUP-DDL",
+                        f"metadata.{n.attr} inside startup entrypoint {fn.name}(): every API/worker process runs it. "
+                        "Run DDL once in a bootstrap/migration step (e.g. app/cli.py).", warning=True))
     return out
+
+
+STARTUP_NAME = re.compile(r"lifespan|startup|worker_main|run_worker", re.I)
+
+
+def _is_startup(fn) -> bool:
+    if STARTUP_NAME.search(fn.name):
+        return True
+    return any("on_event" in ast.unparse(d) or "asynccontextmanager" in ast.unparse(d) for d in fn.decorator_list)
 
 
 CHECKS = (check_seq_last, check_nul, check_fallback)  # check_ddl needs cross-module helpers
