@@ -13,10 +13,16 @@
 - 客户端 token 存 EncryptedSharedPreferences，`allowBackup=false`。
 - LLM / 第三方密钥只从环境变量读取，仓库只放 `.env.example`。
 
+## 服务端不变量
+
+- server 改动以 `docs/server-invariants.md` 为准评审；高发类别和正反例见 `docs/agent-pitfalls.md`。违反不变量的按 P1 报，并注明是哪一条，同时检查同类模式在 diff 之外是否也存在。
+- 并发相关改动没有 PostgreSQL 并发测试，按 P1 报。
+
 ## 提交前自检
 
 ```bash
 bash scripts/ci-test.sh
+python3 scripts/check-invariants.py
 ```
 
 ## Merge gates

@@ -31,6 +31,25 @@
 - 不得绕过分支保护（不用管理员合并、不关保护再开）。
 - 详见 [docs/MERGE_GATES.md](docs/MERGE_GATES.md)。
 
+## 改 server 前必读 / 自检清单
+
+改 `server/` 之前（含修 review 意见），先读完：[docs/server-invariants.md](docs/server-invariants.md)（服务端不变量，事实来源）和 [docs/agent-pitfalls.md](docs/agent-pitfalls.md)（反复踩的坑和正反例）。提交前逐条自检：
+
+- [ ] 改动涉及并发（锁、条件更新、job、sync、记忆同步）时，配了能在 **PostgreSQL** 上跑的并发测试（`PG Tests` job），不能只在 SQLite 上过。
+- [ ] **按类修，不按行修**：一个 review 发现修好后，用 `rg` 把同一类模式在整个 `server/` 里排查一遍，并在线程回复里写清排查了哪些地方。
+- [ ] **同一类 P1 第二次出现时**，先更新 docs/server-invariants.md（必要时加上 `scripts/check-invariants.py` 的检查），再改代码。
+- [ ] 本地跑 `python3 scripts/check-invariants.py` 通过；豁免必须写 `# invariant-ok: <理由>`。
+- [ ] 单个 PR 改动超过 **约 800 行**时先拆分；评审轮次多，往往是因为一次改动的面太大。
+
+## Review guidelines
+
+Codex / 评审 bot 评审本仓 PR 时：
+
+- 以 docs/server-invariants.md 为准检查 server 改动；发现违反时注明是哪一条不变量，并检查同一类模式在 diff 之外是否还有。
+- 重点看 docs/agent-pitfalls.md 里列出的高发类别：先读后写竞态、加锁顺序 / allocate_seq 位置、job 收尾租约、提交后副作用、外部输入 NUL / 配置校验、静默回落假实现、多进程启动 DDL。
+- 并发相关改动没有 PG 并发测试，按 P1 报。
+- 豁免标记 `# invariant-ok:` 后面的理由站不住时，按违反不变量处理。
+
 ## 交接
 
 - 工作交给下一个 bot 时，**单独私信**那个 bot，并标记**优先级**把它唤醒；不要只在群里 @ 或只留 PR 评论。消息里写清：仓库、PR 链接、head SHA、已完成什么、下一步要它做什么。

@@ -1,0 +1,186 @@
+"""Unit tests for scripts/check-invariants.py (stdlib unittest, no deps).
+
+Run: python3 -m unittest discover -s scripts/tests -v
+"""
+import importlib.util
+import sys
+import tempfile
+import textwrap
+import unittest
+from pathlib import Path
+
+_SPEC = importlib.util.spec_from_file_location(
+    "check_invariants", Path(__file__).resolve().parents[1] / "check-invariants.py"
+)
+ci = importlib.util.module_from_spec(_SPEC)
+sys.modules["check_invariants"] = ci
+_SPEC.loader.exec_module(ci)
+
+
+def rules(src: str, path: str = "server/app/x.py"):
+    return [(f.rule, f.line) for f in ci.check_source(textwrap.dedent(src), path)]
+
+
+class SeqLast(unittest.TestCase):
+    def test_enqueue_after_allocate_flagged(self):
+        src = """
+        async def create(session):
+            session.add(note)
+            await session.flush()
+            note.change_seq = await allocate_seq(session)
+            await enqueue(session, "organize_note", {})
+        """
+        self.assertEqual(rules(src), [("INV-SEQ-LAST", 6)])
+
+    def test_allocate_nested_in_business_update_flagged(self):
+        src = """
+        async def patch(session):
+            await session.execute(update(Note).values(text=t, rev=Note.rev + 1, change_seq=await allocate_seq(session)))
+        """
+        self.assertEqual(rules(src), [("INV-SEQ-LAST", 3)])
+
+    def test_business_update_after_allocate_flagged(self):
+        src = """
+        async def fail(session):
+            seq = await allocate_seq(session)
+            await session.execute(update(Note).values(status="failed", change_seq=seq))
+        """
+        self.assertEqual(rules(src), [("INV-SEQ-LAST", 4)])
+
+    def test_correct_order_ok(self):
+        src = """
+        async def patch(session):
+            await session.execute(update(Note).values(text=t, rev=Note.rev + 1))
+            await enqueue(session, "organize_note", {})
+            seq = await allocate_seq(session)
+            await session.execute(update(Note).where(Note.id == i).values(change_seq=seq))
+            for r in ids:
+                await session.execute(update(Reminder).values(change_seq=next(s), updated_at=now))
+        """
+        self.assertEqual(rules(src), [])
+
+    def test_allowlist_comment(self):
+        src = """
+        async def create(session):
+            seq = await allocate_seq(session)
+            await enqueue(session, "k", {})  # invariant-ok: new row, no lock contention
+        """
+        self.assertEqual(rules(src), [])
+
+    def test_definition_itself_ignored(self):
+        src = """
+        async def allocate_seq(session):
+            await session.execute(insert(Sequence).values(name="g", value=0))
+        """
+        self.assertEqual(rules(src), [])
+
+
+class Nul(unittest.TestCase):
+    def test_bare_str_path_param_flagged(self):
+        src = """
+        @router.get("/{note_id}")
+        async def get_note(note_id: str, user_id: str = Depends(u)):
+            ...
+        """
+        self.assertEqual(rules(src), [("INV-NUL", 3)])
+
+    def test_nonulstr_ok_and_query_param_ignored(self):
+        src = """
+        @router.patch("/{note_id}")
+        async def patch_note(note_id: NoNulStr, q: str = ""):
+            ...
+        @router.get("/{a}/{b:path}")
+        async def g(a: Annotated[str, AfterValidator(reject_nul)], b: NoNulStr):
+            ...
+        """
+        self.assertEqual(rules(src), [])
+
+    def test_annotated_bare_str_flagged(self):
+        src = """
+        @app.delete(path="/{x}")
+        async def d(x: Annotated[str, Path(max_length=64)]):
+            ...
+        """
+        self.assertEqual(rules(src), [("INV-NUL", 3)])
+
+
+class Fallback(unittest.TestCase):
+    def test_silent_fallback_flagged(self):
+        src = """
+        def get_llm(s):
+            if s.provider == "openai" and s.key:
+                return OpenAI()
+            return MockLLM()
+        """
+        self.assertEqual(rules(src), [("INV-NO-FALLBACK", 5)])
+
+    def test_explicit_selector_ok(self):
+        src = """
+        def get_store(backend):
+            if backend == "mem0":
+                return Mem0()
+            elif backend == "inmemory":
+                return InMemoryStore()
+            raise ValueError(backend)
+        """
+        self.assertEqual(rules(src), [])
+
+    def test_guarded_by_prod_raise_ok(self):
+        src = """
+        def get_llm(s):
+            if s.provider == "openai":
+                return OpenAI()
+            if s.database_url.startswith("postgresql") and not s.allow:
+                raise RuntimeError("no mock in prod")
+            return MockLLM()
+        """
+        self.assertEqual(rules(src), [])
+
+    def test_mock_class_name_without_call_or_in_mock_factory_ok(self):
+        src = """
+        def make_mock_llm():
+            return MockLLM()
+        """
+        self.assertEqual(rules(src), [])
+
+
+class Ddl(unittest.TestCase):
+    def test_lifespan_create_all_warns(self):
+        src = """
+        async def lifespan(app):
+            await create_all()
+            yield
+        """
+        found = ci.check_source(textwrap.dedent(src), "server/app/main.py")
+        self.assertEqual([(f.rule, f.warning) for f in found], [("INV-STARTUP-DDL", True)])
+
+    def test_helper_and_cli_ok(self):
+        helper = """
+        async def create_all():
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+        """
+        self.assertEqual(rules(helper, "server/app/db.py"), [])
+        self.assertEqual(rules("async def main():\n    await create_all()\n", "server/app/cli.py"), [])
+
+
+class Main(unittest.TestCase):
+    def test_no_server_dir_exits_zero(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(ci.main(["x", d]), 0)
+
+    def test_errors_exit_one_tests_skipped_warnings_zero(self):
+        with tempfile.TemporaryDirectory() as d:
+            app = Path(d, "server/app")
+            app.mkdir(parents=True)
+            tests = Path(d, "server/tests")
+            tests.mkdir()
+            (tests / "test_x.py").write_text("def f():\n    return MockLLM()\n")
+            (app / "main.py").write_text("async def lifespan(a):\n    await create_all()\n")
+            self.assertEqual(ci.main(["x", d]), 0)
+            (app / "llm.py").write_text("def f(p):\n    return MockLLM()\n")
+            self.assertEqual(ci.main(["x", d]), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
