@@ -53,7 +53,8 @@ DDL_ALLOWED_FILES = ("cli.py", "bootstrap.py", "migrate.py")
 DDL_ALLOWED_DIRS = ("migrations", "alembic")
 HTTP_METHODS = {"get", "post", "put", "patch", "delete", "head", "options", "trace", "websocket", "api_route"}
 OK_MARK = re.compile(r"#\s*invariant-ok(?:\[(?P<rules>[A-Z0-9,\s-]+)\])?:\s*\S")
-COLLECTION_WRITES = {"append", "extend", "remove", "discard"}
+COLLECTION_WRITES = {"append", "extend", "remove", "discard", "clear"}
+NON_ORM_RECV = {"response", "resp", "request", "req", "metrics", "metric", "result", "out", "ctx", "context", "state", "app", "config", "settings", "headers", "cookies", "query", "params"}
 FAKE_TOKENS = {"mock", "fake", "inmemory"}
 
 
@@ -133,6 +134,8 @@ def check_seq_last(tree: ast.AST, path: str, parents) -> list[Finding]:
                 continue
             if any(_exclusive(c, sc, parents) for sc in seq_calls):
                 continue
+            if not any(_same_txn(c, sc, parents) for sc in seq_calls):
+                continue
             name = _call_name(c)
             bad = None
             if name in WRITE_CALLS or (name or "").startswith("enqueue"):
@@ -152,7 +155,16 @@ def check_seq_last(tree: ast.AST, path: str, parents) -> list[Finding]:
             if not isinstance(st, (ast.Assign, ast.AugAssign, ast.AnnAssign)) or _enclosing_func(st, parents) is not fn:
                 continue
             targets = st.targets if isinstance(st, ast.Assign) else [st.target]
-            attrs = [t.attr for t in targets if isinstance(t, ast.Attribute) and t.attr not in SEQ_COLUMNS]
+            attrs = []
+            for t in targets:
+                if not isinstance(t, ast.Attribute) or t.attr in SEQ_COLUMNS:
+                    continue
+                recv = t.value
+                while isinstance(recv, ast.Attribute):
+                    recv = recv.value
+                if isinstance(recv, ast.Name) and recv.id.lower() in NON_ORM_RECV:
+                    continue  # response.status_code / metrics.value / … cannot lock a business row
+                attrs.append(t.attr)
             if not attrs or any(_inside(sc, st, parents) for sc in seq_calls):
                 continue
             in_loop = any(_inside(st, lp, parents) for lp in loop_bodies)
@@ -160,10 +172,34 @@ def check_seq_last(tree: ast.AST, path: str, parents) -> list[Finding]:
                 continue
             if any(_exclusive(st, sc, parents) for sc in seq_calls):
                 continue
+            if not any(_same_txn(st, sc, parents) for sc in seq_calls):
+                continue
             out.append(Finding(path, st.lineno, "INV-SEQ-LAST",
                 f"ORM attribute write .{attrs[0]} after {SEQ_FUNC}() (line {first.lineno}) in {fn.name}(): it is flushed "
                 "(row-locked) after the sequence lock; write business columns before allocate_seq."))
     return out
+
+
+def _txn_context(n, parents):
+    """Nearest with/async-with ancestor whose items mention begin/commit/transaction/sessionmaker."""
+    p = parents.get(n)
+    while p is not None:
+        if isinstance(p, (ast.With, ast.AsyncWith)):
+            text = " ".join(ast.unparse(it) for it in p.items)
+            if any(k in text for k in ("begin", "commit", "transaction", "sessionmaker", "Session(")):
+                return p
+        p = parents.get(p)
+    return None
+
+
+def _same_txn(a, b, parents) -> bool:
+    """False when a and b live under different (non-nested) transaction with-blocks."""
+    ta, tb = _txn_context(a, parents), _txn_context(b, parents)
+    if ta is None or tb is None or ta is tb:
+        return True
+    if _inside(ta, tb, parents) or _inside(tb, ta, parents):
+        return True
+    return False
 
 
 def _exclusive(a, b, parents) -> bool:
@@ -274,7 +310,12 @@ def check_nul(tree: ast.AST, path: str, parents) -> list[Finding]:
         for d in fn.decorator_list:
             rp = _route_path(d, prefixes)
             if rp:
-                params |= {m.split(":")[0] for m in re.findall(r"{([^}]+)}", rp)}
+                for m in re.findall(r"{([^}]+)}", rp):
+                    name, _, conv = m.partition(":")
+                    # Starlette non-string converters never pass a raw path string (NUL cannot reach)
+                    if conv and conv.split("(")[0] not in {"", "str", "path"}:
+                        continue
+                    params.add(name)
         if not params:
             continue
         for a in fn.args.args + fn.args.kwonlyargs:
@@ -330,8 +371,8 @@ def check_fallback(tree: ast.AST, path: str, parents) -> list[Finding]:
             if isinstance(p, ast.If) and child in p.body and _selects_explicitly(p.test):
                 ok = True
                 break
-            if isinstance(p, ast.match_case) and _fake_pattern(p.pattern) and p.guard is None:
-                ok = True
+            if isinstance(p, ast.match_case) and _fake_pattern(p.pattern):
+                ok = True  # guard only narrows; reaching the body still proves provider is the fake literal
                 break
             child, p = p, parents.get(p)
         if not ok and _guarded_by_earlier_raise(c, fn):

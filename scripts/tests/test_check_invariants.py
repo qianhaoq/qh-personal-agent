@@ -395,6 +395,47 @@ class Round3(unittest.TestCase):
             self.assertIn("server/app/main.py:3: warning [INV-STARTUP-DDL]", buf.getvalue())
 
 
+class FalsePositiveFixes(unittest.TestCase):
+    def test_int_path_converter_ok(self):
+        src = """
+        @router.get("/{item_id:int}")
+        async def g(item_id):
+            ...
+        """
+        self.assertEqual(rules(src), [])
+
+    def test_match_case_with_guard_ok(self):
+        src = """
+        def get(p, enabled):
+            match p:
+                case "mock" if enabled:
+                    return MockLLM()
+                case _:
+                    raise ValueError(p)
+        """
+        self.assertEqual(rules(src), [])
+
+    def test_separate_transactions_ok(self):
+        src = """
+        async def f(maker, note):
+            async with maker() as session, session.begin():
+                note.change_seq = await allocate_seq(session)
+            async with maker() as session, session.begin():
+                session.add(note)
+                note.text = "v"
+        """
+        self.assertEqual(rules(src), [])
+
+    def test_non_orm_assignment_ok(self):
+        src = """
+        async def f(session, response, note):
+            note.change_seq = await allocate_seq(session)
+            response.status_code = 201
+            note.text = "v"
+        """
+        self.assertEqual(rules(src), [("INV-SEQ-LAST", 5)])
+
+
 class Main(unittest.TestCase):
     def test_no_server_dir_exits_zero(self):
         with tempfile.TemporaryDirectory() as d:
