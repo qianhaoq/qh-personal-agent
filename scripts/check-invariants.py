@@ -18,8 +18,11 @@ Rules (id -> invariant):
                      a one-shot bootstrap/migration entrypoint, never in the
                      API lifespan or worker startup.
 
-Suppress a single finding with a trailing comment on the flagged line:
-    # invariant-ok: <reason>
+Suppress a finding with a trailing comment on the flagged line:
+    # invariant-ok[INV-SEQ-LAST]: <reason>   (scoped to listed rule ids)
+    # invariant-ok: <reason>                 (only if the line has exactly one finding)
+These are low-false-positive heuristics, not a proof; review and PG
+concurrency tests remain the backstop.
 Exit 0 when server/ does not exist (e.g. main before PR #2).
 """
 from __future__ import annotations
@@ -38,8 +41,10 @@ FALLBACK_PREFIXES = ("Mock", "InMemory", "Fake")
 SELECTOR_WORDS = ("mock", "inmemory", "fake", "test")
 DDL_ALLOWED_FILES = ("cli.py", "bootstrap.py", "migrate.py")
 DDL_ALLOWED_DIRS = ("migrations", "alembic")
-HTTP_METHODS = {"get", "post", "put", "patch", "delete", "api_route"}
-OK_MARK = re.compile(r"#\s*invariant-ok:\s*\S")
+HTTP_METHODS = {"get", "post", "put", "patch", "delete", "head", "options", "trace", "websocket", "api_route"}
+OK_MARK = re.compile(r"#\s*invariant-ok(?:\[(?P<rules>[A-Z0-9,\s-]+)\])?:\s*\S")
+COLLECTION_WRITES = {"append", "extend", "remove", "discard"}
+FAKE_TOKENS = {"mock", "fake", "inmemory"}
 
 
 @dataclass
@@ -116,10 +121,14 @@ def check_seq_last(tree: ast.AST, path: str, parents) -> list[Finding]:
             in_loop = any(_inside(c, lp, parents) for lp in loop_bodies)
             if _pos(c) <= _pos(first) and not in_loop:
                 continue
+            if any(_exclusive(c, sc, parents) for sc in seq_calls):
+                continue
             name = _call_name(c)
             bad = None
             if name in WRITE_CALLS or (name or "").startswith("enqueue"):
                 bad = f"{name}()"
+            elif name in COLLECTION_WRITES and isinstance(c.func, ast.Attribute) and isinstance(c.func.value, ast.Attribute):
+                bad = f"relationship mutation .{c.func.value.attr}.{name}()"
             elif name == "values":
                 extra = sorted({k.arg for k in c.keywords if k.arg} - SEQ_COLUMNS)
                 if extra or any(k.arg is None for k in c.keywords) or c.args:
@@ -139,10 +148,35 @@ def check_seq_last(tree: ast.AST, path: str, parents) -> list[Finding]:
             in_loop = any(_inside(st, lp, parents) for lp in loop_bodies)
             if _pos(st) <= _pos(first) and not in_loop:
                 continue
+            if any(_exclusive(st, sc, parents) for sc in seq_calls):
+                continue
             out.append(Finding(path, st.lineno, "INV-SEQ-LAST",
                 f"ORM attribute write .{attrs[0]} after {SEQ_FUNC}() (line {first.lineno}) in {fn.name}(): it is flushed "
                 "(row-locked) after the sequence lock; write business columns before allocate_seq."))
     return out
+
+
+def _exclusive(a, b, parents) -> bool:
+    """a and b sit in different arms (body / orelse) of the same if, try or match (and not in a loop over it)."""
+    anc_b = []
+    p = parents.get(b)
+    while p is not None:
+        anc_b.append(p)
+        p = parents.get(p)
+    child, p = a, parents.get(a)
+    while p is not None:
+        if p in anc_b:
+            if isinstance(p, ast.If):
+                arm_a = "body" if child in p.body else "orelse" if child in p.orelse else None
+                cb = anc_b[anc_b.index(p) - 1] if anc_b.index(p) > 0 else b
+                arm_b = "body" if cb in p.body else "orelse" if cb in p.orelse else None
+                return arm_a is not None and arm_b is not None and arm_a != arm_b
+            if isinstance(p, ast.Match):
+                cb = anc_b[anc_b.index(p) - 1] if anc_b.index(p) > 0 else b
+                return child is not cb and isinstance(child, ast.match_case) and isinstance(cb, ast.match_case)
+            return False
+        child, p = p, parents.get(p)
+    return False
 
 
 def _enclosing_loop(n, fn, parents):
@@ -201,8 +235,11 @@ def _is_bare_str(ann: ast.AST | None) -> bool:
         return True  # FastAPI treats unannotated path params as str
     if isinstance(ann, ast.Name) and ann.id == "str":
         return True
-    if isinstance(ann, ast.Constant) and ann.value == "str":
-        return True
+    if isinstance(ann, ast.Constant) and isinstance(ann.value, str):  # quoted forward annotation
+        try:
+            return _is_bare_str(ast.parse(ann.value, mode="eval").body)
+        except SyntaxError:
+            return False
     if isinstance(ann, ast.BinOp) and isinstance(ann.op, ast.BitOr):  # str | None
         return _is_bare_str(ann.left) or _is_bare_str(ann.right)
     if isinstance(ann, ast.Subscript) and _name(ann.value) in {"Optional", "Union"}:
@@ -275,12 +312,15 @@ def check_fallback(tree: ast.AST, path: str, parents) -> list[Finding]:
         if not name.startswith(FALLBACK_PREFIXES) or not name[:1].isupper():
             continue
         fn = _enclosing_func(c, parents)
-        if fn is None or isinstance(fn, ast.Lambda) or any(w in fn.name.lower() for w in SELECTOR_WORDS):
-            continue
+        if fn is None or isinstance(fn, ast.Lambda) or FAKE_TOKENS & set(fn.name.lower().split("_")):
+            continue  # deliberate fake factory (make_mock_llm, fake_store, ...)
         ok = False
         child, p = c, parents.get(c)
         while p is not None and p is not fn:
             if isinstance(p, ast.If) and child in p.body and _selects_explicitly(p.test):
+                ok = True
+                break
+            if isinstance(p, ast.match_case) and _fake_pattern(p.pattern) and p.guard is None:
                 ok = True
                 break
             child, p = p, parents.get(p)
@@ -293,17 +333,40 @@ def check_fallback(tree: ast.AST, path: str, parents) -> list[Finding]:
     return out
 
 
+def _fake_pattern(pat: ast.AST) -> bool:
+    if isinstance(pat, ast.MatchValue):
+        return _is_fake_literal(pat.value)
+    if isinstance(pat, ast.MatchOr):
+        return all(_fake_pattern(x) for x in pat.patterns)
+    return False
+
+
+PROD_NAMES = {"prod", "production", "is_prod", "is_production"}
+
+
+def _is_prod_predicate(t: ast.AST) -> bool:
+    """Positive production test: `url.startswith("postgres…")`, `env == "production"`, `settings.is_prod`."""
+    if isinstance(t, ast.Call) and _call_name(t) == "startswith" and t.args:
+        a = t.args[0]
+        return isinstance(a, ast.Constant) and isinstance(a.value, str) and a.value.lower().startswith("postgres")
+    if isinstance(t, ast.Compare) and len(t.ops) == 1 and isinstance(t.ops[0], ast.Eq):
+        return any(isinstance(x, ast.Constant) and str(x.value).lower() in {"prod", "production"} for x in (t.left, t.comparators[0]))
+    return (_name(t) or "").lower() in PROD_NAMES
+
+
 def _guarded_by_earlier_raise(c: ast.Call, fn) -> bool:
-    """Fall-through construction after a top-level `if <is production>: raise` guard."""
+    """Fall-through construction after a top-level `if <is production> [and <explicit opt-in off>]: raise`.
+
+    The test must be a positive production predicate, alone or as one term of
+    an `and` (extra terms may only narrow it, e.g. an explicit allow flag).
+    Negated (`if not prod`), `or`, or merely text-matching conditions never count."""
     for st in fn.body:
         if getattr(st, "lineno", 0) >= c.lineno:
             break
-        # Only an unconditional prod/PostgreSQL rejection counts: a guard that
-        # merely mentions "mock" (e.g. `provider not in {"openai", "mock"}`)
-        # does not stop a later fall-through from silently picking the fake.
         if isinstance(st, ast.If) and not st.orelse and any(isinstance(n, ast.Raise) for n in st.body):
-            t = ast.unparse(st.test).lower()
-            if "prod" in t or "postgres" in t:
+            t = st.test
+            terms = t.values if isinstance(t, ast.BoolOp) and isinstance(t.op, ast.And) else [t]
+            if any(_is_prod_predicate(x) for x in terms):
                 return True
     return False
 
@@ -376,10 +439,20 @@ def check_source(src: str, path: str, helpers: set[str] | None = None) -> list[F
     found = []
     results = [f for chk in CHECKS for f in chk(tree, path, parents)]
     results += check_ddl(tree, path, parents, helpers)
+    per_line: dict[int, int] = {}
+    for f in results:
+        per_line[f.line] = per_line.get(f.line, 0) + 1
     for f in results:
         line = lines[f.line - 1] if 0 < f.line <= len(lines) else ""
-        if not OK_MARK.search(line):
-            found.append(f)
+        m = OK_MARK.search(line)
+        if m:
+            scoped = m.group("rules")
+            if scoped:
+                if f.rule in {r.strip() for r in scoped.split(",")}:
+                    continue
+            elif per_line[f.line] == 1:
+                continue  # bare marker only exempts a line with exactly one finding
+        found.append(f)
     return sorted(found, key=lambda f: (f.path, f.line, f.rule))
 
 
@@ -398,8 +471,13 @@ def main(argv: list[str]) -> int:
         files.append((rel, f.read_text(encoding="utf-8")))
     # cross-module DDL helpers (e.g. db.init_db wrapping metadata.create_all)
     helpers = set()
-    for _, src in files:
-        helpers |= ddl_helpers(ast.parse(src))
+    trees = [(rel, src, ast.parse(src)) for rel, src in files]
+    for _, _, tree in trees:
+        helpers |= ddl_helpers(tree)
+    for _, _, tree in trees:  # `from .db import init_db as setup_database`
+        for n in ast.walk(tree):
+            if isinstance(n, ast.ImportFrom):
+                helpers |= {a.asname for a in n.names if a.asname and a.name in helpers}
     for rel, src in files:
         findings += check_source(src, str(rel), helpers)
     for f in findings:

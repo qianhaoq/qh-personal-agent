@@ -38,7 +38,7 @@
 - [ ] 改动涉及并发（锁、条件更新、job、sync、记忆同步）时，配了能在 **PostgreSQL** 上跑的并发测试（`PG Tests` job），不能只在 SQLite 上过。
 - [ ] **按类修，不按行修**：一个 review 发现修好后，用 `rg` 把同一类模式在整个 `server/` 里排查一遍，并在线程回复里写清排查了哪些地方。
 - [ ] **同一类 P1 第二次出现时**，先更新 docs/server-invariants.md（必要时加上 `scripts/check-invariants.py` 的检查），再改代码。
-- [ ] 本地跑 `python3 scripts/check-invariants.py` 通过；豁免必须写 `# invariant-ok: <理由>`。
+- [ ] 本地跑 `python3 scripts/check-invariants.py` 通过；豁免必须写 `# invariant-ok[<规则id>]: <理由>`。
 - [ ] 单个 PR 改动超过 **约 800 行**时先拆分；评审轮次多，往往是因为一次改动的面太大。
 
 ## Review guidelines

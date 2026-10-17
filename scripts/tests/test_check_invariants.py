@@ -295,6 +295,106 @@ class Ddl(unittest.TestCase):
         self.assertEqual(rules("async def main():\n    await create_all()\n", "server/app/cli.py"), [])
 
 
+class Round3(unittest.TestCase):
+    def test_negated_prod_guard_does_not_excuse(self):
+        src = """
+        def get_llm(s):
+            if not s.prod:
+                raise RuntimeError("x")
+            return MockLLM()
+        """
+        self.assertEqual(rules(src), [("INV-NO-FALLBACK", 5)])
+
+    def test_positive_prod_guard_with_optin_ok(self):
+        src = """
+        def get_llm(s):
+            if s.database_url.startswith("postgresql") and not s.allow_mock:
+                raise RuntimeError("x")
+            return MockLLM()
+        """
+        self.assertEqual(rules(src), [])
+
+    def test_name_substring_not_exempt_but_token_is(self):
+        src = """
+        def latest_client():
+            return MockLLM()
+        def make_fake_store():
+            return FakeStore()
+        """
+        self.assertEqual(rules(src), [("INV-NO-FALLBACK", 3)])
+
+    def test_match_case_selector_ok_wildcard_flagged(self):
+        src = """
+        def get(p):
+            match p:
+                case "mock":
+                    return MockLLM()
+                case _:
+                    return MockLLM()
+        """
+        self.assertEqual(rules(src), [("INV-NO-FALLBACK", 7)])
+
+    def test_quoted_annotations_flagged(self):
+        src = """
+        @router.get("/{a}/{b}")
+        async def g(a: "str | None", b: "Optional[str]"):
+            ...
+        """
+        self.assertEqual([r for r, _ in rules(src)], ["INV-NUL"] * 2)
+
+    def test_head_and_websocket_routes(self):
+        src = """
+        @router.head("/{a}")
+        async def h(a: str): ...
+        @router.websocket("/ws/{b}")
+        async def w(b: str): ...
+        """
+        self.assertEqual([r for r, _ in rules(src)], ["INV-NUL"] * 2)
+
+    def test_relationship_mutation_after_seq_flagged_local_list_ok(self):
+        src = """
+        async def f(session, note, tag):
+            seq = await allocate_seq(session)
+            out = []
+            out.append(seq)
+            note.tags.append(tag)
+        """
+        self.assertEqual(rules(src), [("INV-SEQ-LAST", 6)])
+
+    def test_exclusive_branches_ok(self):
+        src = """
+        async def f(session, row, flag):
+            if flag:
+                row.change_seq = await allocate_seq(session)
+            else:
+                session.add(row)
+        """
+        self.assertEqual(rules(src), [])
+
+    def test_exemption_scoped_to_rule(self):
+        base = """
+        async def f(session, note):
+            seq = await allocate_seq(session)
+            note.text = await enqueue(session, "k", {})  # MARK
+        """
+        bare = base.replace("# MARK", "# invariant-ok: enqueue is safe")
+        self.assertEqual(len(rules(bare)), 2)  # ambiguous: two findings on the line
+        scoped = base.replace("# MARK", "# invariant-ok[INV-SEQ-LAST]: both reviewed")
+        self.assertEqual(rules(scoped), [])
+
+    def test_aliased_ddl_helper_warns(self):
+        with tempfile.TemporaryDirectory() as d:
+            app = Path(d, "server/app")
+            app.mkdir(parents=True)
+            (app / "db.py").write_text("async def init_db():\n    await conn.run_sync(Base.metadata.create_all)\n")
+            (app / "main.py").write_text("from .db import init_db as setup_database\nasync def lifespan(a):\n    await setup_database()\n")
+            import io, contextlib
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                ci.main(["x", d])
+            self.assertIn("server/app/main.py:3: warning [INV-STARTUP-DDL]", buf.getvalue())
+
+
 class Main(unittest.TestCase):
     def test_no_server_dir_exits_zero(self):
         with tempfile.TemporaryDirectory() as d:
