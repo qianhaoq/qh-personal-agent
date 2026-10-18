@@ -44,6 +44,8 @@ async def run_pending_jobs(
     2. 执行：事务划分由具体 job 实现负责——extract 内部是“短读事务 →
        事务外 LLM → 短写事务”，memory_sync 是“短读 → 事务外写记忆 →
        复查/再入队”多个短事务，外部调用（LLM/记忆后端）从不在数据库事务里。
+       两类 job 写回数据库前都先原子复核租约（threads15 P1 / INV-6/13：
+       外部调用慢于锁超时时任务已被回收换主，过期结果不得落库）。
        memory_sync 复查发现笔记状态已变时删掉本次新增的记忆并再入队
        （按 note 幂等收敛，见 app.pipeline.memory_sync）
     3. 收尾事务（带租约校验，见 finalize_claim）：成功标 done；失败则
@@ -133,12 +135,19 @@ async def _finalize(
 async def execute_job(kind: str, payload: dict, *, claim: _Claimed | None = None) -> None:
     """执行一个 job。事务划分由具体实现负责（extract / memory_sync 都是
     多个短事务 + 事务外调用，见各自模块的 docstring）。claim 携带租约
-    凭证：memory_sync 复查时据此确认自己仍是持有者（threads5 P2-1，
-    INV-5 第 3 步/INV-6 的租约栅栏）。"""
+    凭证：两类 job 把外部调用结果写回数据库前都据此原子复核自己仍是
+    持有者（memory_sync 复查/置位自 threads5 P2-1 起，extract 写回自
+    threads15 P1 起，INV-5 第 3 步/INV-6/13 的租约栅栏）。"""
     if kind == "extract":
         from app.pipeline.extract import extract_note
 
-        await extract_note(payload["note_id"], enqueued_rev=payload.get("rev"))
+        await extract_note(
+            payload["note_id"],
+            enqueued_rev=payload.get("rev"),
+            job_id=claim.id if claim is not None else None,
+            worker_id=claim.locked_by if claim is not None else None,
+            locked_at=claim.locked_at if claim is not None else None,
+        )
     elif kind == "memory_sync":
         from app.pipeline.memory_sync import sync_note_memory
 

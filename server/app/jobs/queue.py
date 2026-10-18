@@ -31,7 +31,10 @@ change_seq 写回，与业务路径（note → … → jobs → sequences）不�
 
 租约（P2）：领取时写入 locked_by（worker 实例 id）与 locked_at，收尾
 （finalize_claim）按两者 + status='running' 条件校验——任务被回收给
-别的 worker 后，旧 worker 的收尾一律放弃，不再改动 job/note。
+别的 worker 后，旧 worker 的收尾一律放弃，不再改动 job/note。threads15
+P1 起**外部调用结果的写回事务**同样先过 lease_still_held（锁 job 行
+复核同一三元组）：extract 的 LLM 慢于锁超时时，被回收/判死后的迟到
+结果不得写回 note 或入队 memory_sync。
 
 用法：
     await enqueue(session, "extract", {"note_id": "...", "rev": 1},
@@ -394,6 +397,44 @@ async def _mark_memory_sync_failed(session: AsyncSession, *, note_id: str, job_i
         .execution_options(synchronize_session=False)
     )
     return bool(result.rowcount)
+
+
+async def lease_still_held(
+    session: AsyncSession,
+    *,
+    job_id: str | None,
+    worker_id: str | None,
+    locked_at: datetime | None,
+) -> bool:
+    """锁 job 行并复核租约（threads15 P1 / INV-6/13）：把外部调用结果写回
+    业务数据的事务，写之前先在这里原子确认「自己仍是这个 job 的持有者」。
+
+    - PG：SELECT ... FOR UPDATE 拿行锁后比对 (status, locked_by, locked_at)
+      ——回收路径（对 running 行的条件 UPDATE）在本事务提交前拿不到行锁，
+      锁内读到的就是当前真值，等价于 finalize_claim 的收尾栅栏；SQLite 无
+      行锁，单写者模型天然串行。
+    - 比对在 Python 里做 as_utc 归一（SQLite 以字符串存 datetime，SQL 等
+      值比较对 aware 参数不可靠），与 finalize_claim / _mark_memory_status
+      同口径。
+    - job_id 为 None（测试 / 无租约上下文的调用）按无栅栏处理，返回 True。
+
+    锁序（INV-1）：本函数只锁 job 行；调用方随后的业务行写入必须排在它
+    之后（jobs → note，与 finalize/判死路径同向，不与业务路径成环）。
+    """
+    if job_id is None:
+        return True
+    stmt = select(Job).where(Job.id == job_id)
+    if is_postgres():
+        stmt = stmt.with_for_update()
+    job_row = (await session.execute(stmt)).scalar_one_or_none()
+    return (
+        job_row is not None
+        and job_row.status == "running"
+        and worker_id is not None
+        and job_row.locked_by == worker_id
+        and locked_at is not None
+        and as_utc(job_row.locked_at) == locked_at
+    )
 
 
 async def finalize_claim(

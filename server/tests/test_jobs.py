@@ -726,3 +726,133 @@ async def test_memory_sync_finalize_failure_marks_memory_status_not_note_status(
         note = await session.get(Note, note_id)
     assert note.status == "organized"
     assert note.memory_status == "failed"
+
+
+# ---------------------------------------------------------------------------
+# threads15 P1（runner.py:141 / extract.py）/ INV-6/13：extract 的 LLM 慢于
+# lease 被回收后的迟到写回栅栏——写回事务先原子复核 (status, locked_by,
+# locked_at)，与 finalize_claim 同口径。
+# ---------------------------------------------------------------------------
+
+
+async def _hang_then_succeed_llm(monkeypatch, entered: asyncio.Event, release: asyncio.Event):
+    """第 1 次 LLM 调用（旧 worker）挂起后**返回有效结果**（慢而没死，
+    threads15 的场景区别于 threads5 的「挂起后抛错」）。"""
+    calls = {"llm": 0}
+
+    class SlowButAliveLLM:
+        async def chat(self, messages, response_format=None):
+            calls["llm"] += 1
+            if calls["llm"] == 1:
+                entered.set()
+                await release.wait()
+            return json.dumps(
+                {
+                    "title": "迟到结果",
+                    "tags": ["迟到"],
+                    "todos": [],
+                    "suggested_reminders": [
+                        {"title": "迟到提醒", "fire_at": "2099-01-01T09:00:00+08:00"}
+                    ],
+                },
+                ensure_ascii=False,
+            )
+
+    async def fake_get_llm():
+        return SlowButAliveLLM()
+
+    monkeypatch.setattr("app.pipeline.extract.get_llm_client", fake_get_llm)
+    return calls
+
+
+async def test_extract_stale_valid_result_fenced_after_dead_reclaim(
+    client, user, monkeypatch
+):
+    """threads15 P1：旧 worker 认领后停在 LLM 里（租约过期）→ 回收重跑的
+    次数也耗尽（判死：job failed + note.status=failed，rev 不动）→ 旧
+    worker 的 LLM 才返回**有效**结果。写回事务先原子复核租约：不得把
+    note 改回 organized、不建提醒、不入队 memory_sync——最终状态与
+    reclaim 判死一致。"""
+    from app.models import Reminder
+
+    note_id, job_id = await _create_note_with_job(client, user)
+
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = await _hang_then_succeed_llm(monkeypatch, entered, release)
+
+    old_worker = asyncio.create_task(run_pending_jobs(limit=1, worker_id="wkr_old"))
+    await asyncio.wait_for(entered.wait(), timeout=5)  # 旧 worker 认领后停在 LLM
+
+    # 等价模拟「回收重跑也一直死、次数用尽」：锁过期 + attempts 推到上限
+    # （每次回收 attempts+1，直接置满避免多轮真实等待）
+    await _expire_lock(job_id)
+    async with get_sessionmaker()() as session, session.begin():
+        await session.execute(
+            update(Job).where(Job.id == job_id).values(attempts=Job.max_attempts)
+        )
+    processed = await run_pending_jobs(worker_id="wkr_new")  # 扫描到判死候选
+    assert processed == 0
+    async with get_sessionmaker()() as session:
+        job = await session.get(Job, job_id)
+        note = await session.get(Note, note_id)
+    assert job.status == "failed"
+    assert note.status == "failed"  # 判死标记落在入队 rev 上（rev 未动）
+
+    release.set()  # 旧 worker 的 LLM 此刻才拿到有效结果并尝试写回
+    assert await asyncio.wait_for(old_worker, timeout=5) == 1
+
+    async with get_sessionmaker()() as session:
+        job = await session.get(Job, job_id)
+        note = await session.get(Note, note_id)
+        memjobs = (
+            await session.execute(
+                select(Job).where(Job.kind == "memory_sync", Job.note_id == note_id)
+            )
+        ).scalars().all()
+        reminders = (
+            await session.execute(select(Reminder).where(Reminder.note_id == note_id))
+        ).scalars().all()
+    # 迟到写回被租约栅栏挡住：note 不复活为 organized、无提醒、无记忆任务
+    assert job.status == "failed", "旧 worker 不得改动已判死的 job"
+    assert note.status == "failed", "旧 worker 不得把 note 写回 organized"
+    assert note.llm_calls == 0, "迟到结果不得计入 llm_calls"
+    assert note.rev == 1, "迟到结果不得推进 rev"
+    assert memjobs == [], "迟到写回不得入队 memory_sync"
+    assert reminders == [], "迟到写回不得创建 suggested reminders"
+    assert calls["llm"] == 1
+
+
+async def test_extract_stale_valid_result_fenced_after_new_worker_done(
+    client, user, monkeypatch
+):
+    """threads15 P1 的对照场景：新 worker 回收后用第 2 次调用完成（note
+    organized、job done）→ 旧 worker 的迟到有效结果同样不得产生第二份
+    产物（llm_calls/rev 只计一次、收尾不污染新 worker 的 job 状态）。"""
+    note_id, job_id = await _create_note_with_job(client, user)
+
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = await _hang_then_succeed_llm(monkeypatch, entered, release)
+
+    old_worker = asyncio.create_task(run_pending_jobs(limit=1, worker_id="wkr_old"))
+    await asyncio.wait_for(entered.wait(), timeout=5)
+    await _expire_lock(job_id)
+
+    processed = await run_pending_jobs(worker_id="wkr_new")  # 回收并用第 2 次调用完成
+    assert processed >= 1
+    async with get_sessionmaker()() as session:
+        note = await session.get(Note, note_id)
+    assert note.status == "organized"
+    assert note.llm_calls == 1
+
+    release.set()
+    assert await asyncio.wait_for(old_worker, timeout=5) == 1
+
+    async with get_sessionmaker()() as session:
+        job = await session.get(Job, job_id)
+        note = await session.get(Note, note_id)
+    assert job.status == "done"  # 未被旧 worker 的收尾改动
+    assert job.last_error is None
+    assert note.status == "organized"
+    assert note.llm_calls == 1, "迟到写回不得二次计数"
+    assert note.rev == 2, "rev 只被新 worker 的 apply 推进一次"
+    assert calls["llm"] == 2

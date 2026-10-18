@@ -10,13 +10,16 @@ memory_sync job 负责（唯一入口，见 app/pipeline/memory_sync.py）——
    被 PATCH，PATCH 已重新入队）→ 跳过 = done（过期任务无副作用）。
 2. LLM 结构化抽取（JSON Schema：title/tags/todos/suggested_reminders）
    在所有事务之外调用——最长 llm_timeout_seconds。
-3. 短写事务：锁 note（PG：FOR UPDATE；SQLite 无行锁跳过）并复查——
-   已删除或 rev != 入队 rev 则放弃本次结果（job 视为完成）；否则清旧
-   产物、写 note 与建议提醒、enqueue memory_sync（同事务）。业务行
-   （note → reminders → jobs）的 UPDATE/INSERT 全部 flush 之后才
-   allocate_seq（全局加锁顺序规则，见 app.common.allocate_seq：
-   sequences 必须是事务里最后一把锁），change_seq 由其后的第二条
-   UPDATE 写回。
+3. 短写事务：**先锁 job 行复核租约**（threads15 P1 / INV-6/13：LLM 调用
+   可能慢于 JOB_LOCK_TIMEOUT_SECONDS，job 已被回收换主甚至判死——
+   `(status='running', locked_by, locked_at)` 与 finalize_claim 同口径，
+   复核不过放弃全部写入，job 与 note 由新持有者决定），再锁 note（PG：
+   FOR UPDATE；SQLite 无行锁跳过）并复查——已删除或 rev != 入队 rev 则
+   放弃本次结果（job 视为完成）；否则清旧产物、写 note 与建议提醒、
+   enqueue memory_sync（同事务）。业务行（note → reminders → jobs）的
+   UPDATE/INSERT 全部 flush 之后才 allocate_seq（全局加锁顺序规则，见
+   app.common.allocate_seq：sequences 必须是事务里最后一把锁），
+   change_seq 由其后的第二条 UPDATE 写回。
 
 相对时间以 note.recorded_at（及其时区）为参照；早于参照时间或早于服务器
 当前时间的 fire_at 都不生成建议提醒。失败最多重试 job_max_attempts 次
@@ -35,7 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.common import allocate_seq, new_id
 from app.config import get_settings
 from app.db import get_sessionmaker
-from app.jobs.queue import enqueue, is_postgres
+from app.jobs.queue import enqueue, is_postgres, lease_still_held
 from app.llm.base import EXTRACTION_SCHEMA, get_llm_client
 from app.models import Note, Reminder
 from app.schemas import clean_llm_str, utc_safe_datetime
@@ -152,8 +155,22 @@ def _coerce_extraction(data: dict) -> dict:
     }
 
 
-async def extract_note(note_id: str, enqueued_rev: int | None = None) -> None:
-    """抽取并落库一条笔记的整理产物。抛异常由调用方（runner）决定重试。"""
+async def extract_note(
+    note_id: str,
+    enqueued_rev: int | None = None,
+    *,
+    job_id: str | None = None,
+    worker_id: str | None = None,
+    locked_at: datetime | None = None,
+) -> None:
+    """抽取并落库一条笔记的整理产物。抛异常由调用方（runner）决定重试。
+
+    job_id/worker_id/locked_at 是认领快照里的租约凭证（threads15 P1）：
+    LLM 调用可能慢于 JOB_LOCK_TIMEOUT_SECONDS、任务被回收换主/判死，
+    写回事务先原子复核租约（见 _apply_extraction）——只查 note rev 挡不住
+    「复活慢 worker 的迟到写回」（回收判死不动 rev）。不带租约信息的调用
+    （测试/未来路径）按无栅栏处理。
+    """
     maker = get_sessionmaker()
 
     # 1. 短读事务：不加锁、不占序列，读完即提交
@@ -181,7 +198,16 @@ async def extract_note(note_id: str, enqueued_rev: int | None = None) -> None:
     extraction = _coerce_extraction(_parse_llm_json(raw))
 
     # 3. 短写事务：复查不过说明结果已过期，放弃本次（job 视为完成）
-    await _apply_extraction(maker, note_id, enqueued_rev, snapshot, extraction)
+    await _apply_extraction(
+        maker,
+        note_id,
+        enqueued_rev,
+        snapshot,
+        extraction,
+        job_id=job_id,
+        worker_id=worker_id,
+        locked_at=locked_at,
+    )
 
 
 async def _apply_extraction(
@@ -190,13 +216,27 @@ async def _apply_extraction(
     enqueued_rev: int | None,
     snapshot: _NoteSnapshot,
     extraction: dict,
+    *,
+    job_id: str | None = None,
+    worker_id: str | None = None,
+    locked_at: datetime | None = None,
 ) -> bool:
-    """短写事务：锁行复查后写入整理产物，同事务 enqueue memory_sync。
+    """短写事务：租约复核 + 锁行复查后写入整理产物，同事务 enqueue
+    memory_sync。
 
-    返回 True 表示放弃（已删除/rev 已变）。
+    返回 True 表示放弃（租约已丢/已删除/rev 已变）。
     """
     settings = get_settings()
     async with maker() as session, session.begin():
+        # 租约栅栏（threads15 P1 / INV-6/13）必须在 note FOR UPDATE **之前**：
+        # 锁序与队列路径同向（jobs → note，INV-1——反向会在 PG 上与
+        # finalize/判死路径构成 AB-BA）。复核不过 → 放弃全部写入（含
+        # memory_sync 入队），job 与 note 的状态由新持有者决定；本执行
+        # 的收尾同样会被 finalize_claim 的租约校验放弃
+        if not await lease_still_held(
+            session, job_id=job_id, worker_id=worker_id, locked_at=locked_at
+        ):
+            return True
         stmt = select(Note).where(Note.id == note_id)
         if is_postgres():
             stmt = stmt.with_for_update()  # SQLite 忽略行锁，靠单写者模型
