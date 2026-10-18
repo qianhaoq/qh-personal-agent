@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import UTC, datetime, timedelta
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.schemas import utc_safe_datetime
 
@@ -217,9 +217,19 @@ class MockLLM:
                     now = datetime.fromisoformat(m.group(1))
                 except ValueError:
                     pass
-            m = re.search(r"时区[:：]\s*([A-Za-z_]+/[A-Za-z_+\-0-9]+)", content)
+            m = re.search(r"时区[:：]\s*([A-Za-z0-9_+\-/]+)", content)
             if m:
-                tzname = m.group(1)
+                # INV-7（threads12 P2，mock.py:222）：完整保留**已校验**的
+                # 时区——UTC（无斜杠段）不再漏捕回退 Asia/Shanghai，多段
+                # IANA 名（America/Argentina/Buenos_Aires）不再被窄正则
+                # 截成前两段（截断值过 ZoneInfo 会抛错）。正则只圈词法
+                # 合法的候选，有效性交给 ZoneInfo 判定：非法候选保持
+                # 默认/已捕获值，绝不让 ZoneInfo 异常炸掉整次抽取
+                try:
+                    ZoneInfo(m.group(1))
+                    tzname = m.group(1)
+                except (ZoneInfoNotFoundError, ValueError):
+                    pass
         return note_text, now, tzname
 
     def _extraction(self, messages: list[dict]) -> str:
