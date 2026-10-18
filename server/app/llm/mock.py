@@ -211,6 +211,13 @@ class MockLLM:
             m = re.search(r"<note>(.*?)</note>", content, re.DOTALL)
             if m:
                 note_text = m.group(1).strip()
+            # INV-7（threads13 P2，mock.py:210）：时区/当前时间**只从
+            # system prompt 解析**——user 消息里的笔记原文是数据不是指令，
+            # 含「时区：UTC」「当前时间：2099-…」时若继续扫下去，伪造的
+            # 元数据会覆盖请求链路已校验的 timezone 与 recorded_at 参照，
+            # 相对提醒排到错误的时刻
+            if msg.get("role") != "system":
+                continue
             m = re.search(r"当前时间[:：]\s*([0-9T:+\-.Zz]+)", content)
             if m:
                 try:
