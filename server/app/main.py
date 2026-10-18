@@ -1,4 +1,5 @@
 """FastAPI 入口。"""
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -21,6 +22,13 @@ from app.middleware import (
     NulRejectMiddleware,
     SafeErrorFallbackMiddleware,
 )
+
+# healthz DB 探测的应用层超时（threads14 P2，main.py:118）：连接建立或
+# SELECT 1 卡住（而非立即抛错）时，驱动自身的超时远长于探针周期——
+# compose 健康检查 5s 放弃、10s 一轮，挂起的服务端探测请求会跨轮累积
+# 占住连接尝试。上界必须短于探针超时，到点即按 db_ok=False 降级 503
+# （wait_for 同时取消被卡的探测协程）
+_HEALTHZ_DB_TIMEOUT_SECONDS = 2.5
 
 
 @asynccontextmanager
@@ -108,15 +116,14 @@ def create_app() -> FastAPI:
     @app.get("/healthz", tags=["health"])
     async def healthz():
         from fastapi.responses import JSONResponse
-        from sqlalchemy import text
-
-        from app.db import get_engine
 
         db_ok = True
         try:
-            async with get_engine().connect() as conn:
-                await conn.execute(text("SELECT 1"))
-        except Exception:  # noqa: BLE001 健康检查必须兜住一切异常，返回降级状态而不是 500
+            # threads14 P2（main.py:118）：探测整体套应用层超时——卡住
+            # （连接挂起/查询无响应）与抛错同按 db_ok=False 降级 503，
+            # 不等驱动的长超时
+            await asyncio.wait_for(_db_probe(), timeout=_HEALTHZ_DB_TIMEOUT_SECONDS)
+        except Exception:  # noqa: BLE001 健康检查必须兜住一切异常（含超时），返回降级状态而不是 500
             db_ok = False
         body = {"ok": db_ok, "db": db_ok, "llm": _llm_status()}
         if not db_ok:
@@ -128,6 +135,17 @@ def create_app() -> FastAPI:
 
 
 app = create_app()
+
+
+async def _db_probe() -> None:
+    """healthz 的数据库探测（threads14 P2 拆出：整段连接+查询作为一个
+    可等待单元，供 healthz 套 wait_for 应用层超时）。"""
+    from sqlalchemy import text
+
+    from app.db import get_engine
+
+    async with get_engine().connect() as conn:
+        await conn.execute(text("SELECT 1"))
 
 
 def _llm_status() -> str:
