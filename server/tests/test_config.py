@@ -133,9 +133,12 @@ def test_memory_backend_only_accepts_known_values(monkeypatch):
     assert Settings(memory_backend="disabled").memory_backend == "disabled"
     with pytest.raises(ValidationError, match="memory_backend"):
         Settings(memory_backend="redis")
-    # mem0 需已安装才过 _require_memory_backend_installed；这里只验枚举
+    # mem0 需已安装 + PG + embedding 凭据；这里只验枚举（安装探测 mock）
     monkeypatch.setattr("app.config._mem0ai_installed", lambda: True)
-    assert Settings(memory_backend="mem0").memory_backend == "mem0"
+    assert (
+        _pg_settings(memory_backend="mem0", llm_api_key="sk-test-only").memory_backend
+        == "mem0"
+    )
 
 
 def test_production_inmemory_memory_backend_rejected():
@@ -153,7 +156,53 @@ def test_mem0_backend_missing_mem0ai_rejected_at_startup(monkeypatch):
     提示 pip install -r requirements-mem0.txt（不静默退化）。"""
     monkeypatch.setattr("app.config._mem0ai_installed", lambda: False)
     with pytest.raises(ValidationError, match=r"mem0ai|requirements-mem0"):
-        Settings(memory_backend="mem0")
+        # 用 PG + 凭据基线，避免被「需 postgresql / 缺 embedding 凭据」顶掉
+        _pg_settings(memory_backend="mem0", llm_api_key="sk-test-only")
+
+
+def test_mem0_requires_postgres_database_url(monkeypatch):
+    """P2：mem0 的 pgvector 后端要求 PostgreSQL——sqlite + mem0 启动即拒。"""
+    monkeypatch.setattr("app.config._mem0ai_installed", lambda: True)
+    # 显式传 sqlite：PG 套件下 conftest 会把 DATABASE_URL 环境变量设为 PG，
+    # 不压住的话本用例会误过
+    with pytest.raises(ValidationError, match="postgresql"):
+        Settings(
+            database_url="sqlite+aiosqlite:///./app.sqlite3",
+            memory_backend="mem0",
+            llm_api_key="sk-test-only",
+        )
+
+
+def test_mem0_without_embedding_credentials_rejected(monkeypatch):
+    """P2：MEMORY_BACKEND=mem0 时 embedding key（回落 LLM_API_KEY）必须
+    非空——mock + 空/纯空白 LLM 不得启动成功；错误文案不含密钥原值。"""
+    monkeypatch.setattr("app.config._mem0ai_installed", lambda: True)
+    for blank in ("", "   "):
+        with pytest.raises(ValidationError, match="MEM0_EMBEDDING_API_KEY"):
+            _pg_settings(memory_backend="mem0", llm_api_key=blank)
+    assert (
+        _pg_settings(memory_backend="mem0", llm_api_key="sk-test-only").memory_backend
+        == "mem0"
+    )
+    assert (
+        _pg_settings(
+            memory_backend="mem0", mem0_embedding_api_key="sk-embed"
+        ).memory_backend
+        == "mem0"
+    )
+
+
+def test_mem0_embedding_dims_positive_and_bounded(monkeypatch):
+    """P2：MEM0_EMBEDDING_DIMS 必须为正且有有限上界（pgvector 单列维度
+    上限 16000），与既有数值配置同口径。"""
+    monkeypatch.setattr("app.config._mem0ai_installed", lambda: True)
+    for bad in (0, -1, 16001, 10**9):
+        with pytest.raises(ValidationError, match="有限上界|必须为正"):
+            _pg_settings(
+                memory_backend="mem0",
+                llm_api_key="sk-test-only",
+                mem0_embedding_dims=bad,
+            )
 
 
 def test_production_inmemory_rejection_mentions_mem0():
@@ -818,6 +867,7 @@ def test_numeric_upper_bounds_table_covers_all_checked_fields():
         "WORKER_POLL_INTERVAL_SECONDS": settings.worker_poll_interval_seconds,
         "WORKER_BATCH_SIZE": settings.worker_batch_size,
         "ASK_TOP_K": settings.ask_top_k,
+        "MEM0_EMBEDDING_DIMS": settings.mem0_embedding_dims,
     }
     assert set(_NUMERIC_UPPER_BOUNDS) == set(checked), "两张表必须覆盖同一组字段"
     # 上界必须有限且为正（float("inf") 当上界等于没设）

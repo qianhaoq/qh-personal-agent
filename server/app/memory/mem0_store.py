@@ -5,6 +5,8 @@
   启动期的安装探测在 app.config（INV-10.3）。
 - 向量库 pgvector 与业务库同一个 PostgreSQL 实例；mem0 内部的 LLM/embedding 走
   OpenAI 兼容配置。
+- schema（vector 扩展 / personal_agent_memories 表与索引）由 init-db 在
+  MEMORY_BACKEND=mem0 时幂等引导（P1-3 / INV-9），本适配器请求路径不做 DDL。
 - mem0 是同步库，这里用 asyncio.to_thread 包一层。
 - add 一律 infer=False，返回本次写入的全部记忆（metadata 带
   note_id/source_rev，INV-3）；delete 按 id 列表删（复查不一致时只删本次
@@ -77,6 +79,9 @@ class Mem0Store:
                 "config": {
                     "connection_string": _pg_connection_string(settings.database_url),
                     "collection_name": "personal_agent_memories",
+                    # P2：维度显式传（缺省 1536，与 init-db 建表一致）——
+                    # 换 embedding 型号时表与请求 dimensions 不再各说各话
+                    "embedding_model_dims": settings.mem0_embedding_dims,
                 },
             },
             "llm": {
@@ -99,6 +104,12 @@ class Mem0Store:
                     # 自定义 embedding 源却拿 LLM 的 key 打过去，运行期必 401
                     "api_key": settings.mem0_embedding_api_key or settings.llm_api_key,
                     "model": settings.mem0_embedding_model or "text-embedding-3-small",
+                    # P2：与 vector_store.embedding_model_dims 对齐；传了才会
+                    # 让 OpenAI 兼容客户端带 dimensions（matryoshka 模型）
+                    "embedding_dims": settings.mem0_embedding_dims,
+                    # 应用级 timeout：mem0ai 2.2.1 BaseEmbedderConfig 无 timeout
+                    # 字段，盲传会 TypeError；构造后改 SDK client 内部属性会钉
+                    # 内部结构——本轮不传（P2 defer），依赖 SDK 默认超时
                 },
             },
         }

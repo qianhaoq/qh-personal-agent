@@ -408,4 +408,14 @@ def test_mem0_config_keys_match_real_backend(fake_mem0):
     _make_store(fake_mem0)
     config = fake_mem0.Memory.last_config
     assert config["llm"]["config"].keys() == {"openai_base_url", "api_key", "model"}
-    assert config["embedder"]["config"].keys() == {"openai_base_url", "api_key", "model"}
+    assert config["embedder"]["config"].keys() == {
+        "openai_base_url",
+        "api_key",
+        "model",
+        "embedding_dims",
+    }
+    assert config["vector_store"]["config"].keys() == {
+        "connection_string",
+        "collection_name",
+        "embedding_model_dims",
+    }

@@ -1,6 +1,13 @@
 """SQLAlchemy 2 async 引擎与会话。"""
+import os
+
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncConnection,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 from sqlalchemy.orm import DeclarativeBase
 
 from app.config import get_settings
@@ -46,6 +53,57 @@ async def create_all() -> None:
 _INIT_DB_ADVISORY_KEY = 918273645070
 
 
+# mem0 pgvector 集合的幂等引导 DDL（P1-3 / INV-9）：mem0ai 首次操作时懒建
+# schema（CREATE EXTENSION vector + 建 personal_agent_memories 表与 HNSW/
+# GIN 索引）——多 worker 并发首跑竞态，且受限角色可能没有建扩展权限。这里
+# 在 init-db 的咨询锁事务内一次性幂等建好，请求路径（api/worker 运行期）
+# 绝不做 DDL。对齐 mem0ai==2.2.1 默认 collection_name=personal_agent_memories、
+# embedding_model_dims=1536、hnsw=True。
+
+
+def _mem0_embedding_dims() -> int:
+    """init-db 侧的向量维度：只读原始环境变量——init-db 只加载 DbSettings
+    （INV-9 分层），MEM0_EMBEDDING_DIMS 不属于数据库层。缺省/非法回落 1536
+    （mem0ai 2.2.1 默认）；非法值会在 api/worker 的完整 Settings 校验报错，
+    不影响建表。"""
+    try:
+        dims = int(os.environ.get("MEM0_EMBEDDING_DIMS", "") or 0)
+    except ValueError:
+        return 1536
+    return dims if 0 < dims <= 16000 else 1536
+
+
+def _mem0_schema_statements() -> tuple[str, ...]:
+    dims = _mem0_embedding_dims()
+    return (
+        "CREATE EXTENSION IF NOT EXISTS vector",
+        (
+            "CREATE TABLE IF NOT EXISTS personal_agent_memories (\n"
+            "  id UUID PRIMARY KEY,\n"
+            f"  vector vector({dims}),\n"
+            "  payload JSONB\n"
+            ")"
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS personal_agent_memories_hnsw_idx\n"
+            "  ON personal_agent_memories USING hnsw (vector vector_cosine_ops)"
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS personal_agent_memories_text_lemmatized_idx\n"
+            "  ON personal_agent_memories USING gin "
+            "(to_tsvector('simple', payload->>'text_lemmatized'))"
+        ),
+    )
+
+
+async def _ensure_mem0_schema(conn: AsyncConnection) -> None:
+    """当前事务内幂等建 mem0 集合（语句见 _mem0_schema_statements）。"""
+    for stmt in _mem0_schema_statements():
+        await conn.execute(text(stmt))
+
+
+
+
 async def init_db() -> None:
     """一次性建表：python -m app.cli init-db（INV-9，修 C6）。
 
@@ -71,6 +129,12 @@ async def init_db() -> None:
                     text("SELECT pg_advisory_xact_lock(:key)"), {"key": _INIT_DB_ADVISORY_KEY}
                 )
                 await conn.run_sync(Base.metadata.create_all)
+                # mem0 集合引导（P1-3）：仅 MEMORY_BACKEND=mem0（compose 的
+                # migrate 服务显式置位）；与 create_all 同事务同一把咨询锁，
+                # 幂等可重入。读原始环境变量而非 Settings——init-db 只加载
+                # 数据库层配置（INV-9 分层），不引入记忆后端校验
+                if os.environ.get("MEMORY_BACKEND", "") == "mem0":
+                    await _ensure_mem0_schema(conn)
             return
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)

@@ -86,11 +86,36 @@ async def sync_note_memory(
     organized = note.status == "organized"
 
     # 2. 写外部：无任何数据库会话/锁
+    # P1-4 / INV-5：外部写（delete_by_note / add）可能部分成功后抛异常
+    # （如 mem0 已写 PG vector 再写 history.db 失败）。异常不得直接退出而
+    # 跳过租约复查——租约已被 reclaim 时 finalize_claim 拒旧租约且不排队，
+    # 会留下陈旧/重复记忆。异常路径仍判租约；已失效则补偿 enqueue 再
+    # re-raise（added 可能为空，收敛靠后继任务的 delete_by_note + add）。
     store = get_memory_store()
-    await store.delete_by_note(user_id, note_id)
     added: list[MemoryItem] = []
-    if not was_deleted and organized:
-        added = await store.add(user_id, text, note_id=note_id, source_rev=rev)
+    try:
+        await store.delete_by_note(user_id, note_id)
+        if not was_deleted and organized:
+            added = await store.add(user_id, text, note_id=note_id, source_rev=rev)
+    except Exception:
+        if job_id is not None:
+            async with maker() as session:
+                job_row = await session.get(Job, job_id)
+            lease_ok = (
+                job_row is not None
+                and job_row.status == "running"
+                and worker_id is not None
+                and job_row.locked_by == worker_id
+                and locked_at is not None
+                and as_utc(job_row.locked_at) == locked_at
+            )
+            if not lease_ok:
+                try:
+                    if added:
+                        await store.delete(user_id, [m.id for m in added])
+                finally:
+                    await _compensating_requeue(maker, note_id)
+        raise
 
     # 3. 复查：新短读事务重读 (rev, deleted_at, status) + job 行租约
     async with maker() as session:

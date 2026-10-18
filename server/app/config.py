@@ -53,6 +53,8 @@ _NUMERIC_UPPER_BOUNDS = {
     "WORKER_BATCH_SIZE": 1000,
     # /v1/ask 检索条数：100 封顶（更大无意义且拖慢问答）
     "ASK_TOP_K": 100,
+    # pgvector 单列维度上界（超界建表/检索即失败）；缺省 1536
+    "MEM0_EMBEDDING_DIMS": 16000,
 }
 
 
@@ -145,6 +147,9 @@ class Settings(BaseSettings):
     mem0_embedding_model: str = ""
     # 缺省回落 LLM_API_KEY（共用 OpenAI 兼容源时不用重复填）
     mem0_embedding_api_key: str = ""
+    # mem0 的 embedding 维度（pgvector 列维度 / embedding 请求 dimensions）；
+    # 缺省 1536 = mem0ai 2.2.1 默认，也与 init-db 建的 vector(1536) 一致
+    mem0_embedding_dims: int = 1536
 
     # 流水线
     default_timezone: str = "Asia/Shanghai"
@@ -236,6 +241,37 @@ class Settings(BaseSettings):
                 "MEMORY_BACKEND=mem0 但未安装 mem0ai：请执行 "
                 "pip install -r requirements-mem0.txt（Docker 镜像已装），"
                 "然后重启"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _require_mem0_postgres_database(self) -> "Settings":
+        """P2：mem0 的向量存 pgvector（与业务库同实例）——DATABASE_URL 非
+        postgresql 时启动即拒，而不是运行期连不上/建不出表。本地开发请用
+        inmemory（单进程）或 disabled。"""
+        if self.memory_backend == "mem0" and not self.database_url.startswith(
+            "postgresql"
+        ):
+            raise ValueError(
+                "MEMORY_BACKEND=mem0 需要 PostgreSQL（DATABASE_URL 以 postgresql "
+                "开头）：向量存 pgvector、与业务库同实例。本地开发请用 "
+                "MEMORY_BACKEND=inmemory（单进程）或 disabled"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _require_mem0_embedding_credentials(self) -> "Settings":
+        """P2：MEMORY_BACKEND=mem0 时解析出的 embedding key
+        （MEM0_EMBEDDING_API_KEY，缺省回落 LLM_API_KEY）必须非空——mock +
+        空白 LLM 不得启动成功，否则首个 add/search 才 401。错误文案不含
+        密钥原值（INV-14）。"""
+        if self.memory_backend != "mem0":
+            return self
+        if not (self.mem0_embedding_api_key or self.llm_api_key).strip():
+            raise ValueError(
+                "MEMORY_BACKEND=mem0 缺少 embedding 凭据：请设置 "
+                "MEM0_EMBEDDING_API_KEY，或与 LLM 共源（不设置 "
+                "MEM0_EMBEDDING_* 即回落 LLM_API_KEY）"
             )
         return self
 
@@ -372,6 +408,7 @@ class Settings(BaseSettings):
             "WORKER_POLL_INTERVAL_SECONDS": self.worker_poll_interval_seconds,
             "WORKER_BATCH_SIZE": self.worker_batch_size,
             "ASK_TOP_K": self.ask_top_k,
+            "MEM0_EMBEDDING_DIMS": self.mem0_embedding_dims,
         }
         # not (v > 0) 连 NaN 也拦下（NaN <= 0 为 False）
         bad = {name: value for name, value in checks.items() if not (value > 0)}

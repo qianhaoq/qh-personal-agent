@@ -56,10 +56,9 @@ cp .env.example .env          # 默认即 mock + sqlite + inmemory，可直接�
 本地默认的记忆后端是 `inmemory`（不装额外依赖也能跑），但它**只属于单进程**：
 api 与 worker 是两个进程、各持一份内存，worker 写的记忆在 api 的 `/v1/search`
 里搜不到。分进程/生产请用 `MEMORY_BACKEND=mem0`（compose 默认）；
-也可显式设 `MEMORY_BACKEND=disabled` 关闭记忆功能
-（compose 已如此配置）——检索/问答返回空结果，`memory_sync` 仍会把
-`memory_status` 标为 synced（空后端下「记忆 == f(note)」平凡成立），任何
-环境都允许。
+也可显式设 `MEMORY_BACKEND=disabled` 关闭记忆功能——检索/问答返回空结果，
+`memory_sync` 仍会把 `memory_status` 标为 synced（空后端下「记忆 == f(note)」
+平凡成立），任何环境都允许。
 
 ### 生产（Docker Compose：caddy + api + worker + postgres）
 
@@ -73,6 +72,7 @@ docker compose exec api python -m app.cli create-invite
 ```
 
 - PostgreSQL 用 `pgvector/pgvector:pg16` 镜像，数据卷持久化，healthcheck 就绪后再起 api/worker。
+- `migrate`（init-db）建表同时在 `MEMORY_BACKEND=mem0` 时幂等创建 vector 扩展与 mem0 集合表/索引（请求路径不做 DDL）。
 - `POSTGRES_PASSWORD` 由 compose 以分项变量（`PGHOST/PGUSER/PGPASSWORD/…`）注入各服务，应用侧拼接 `DATABASE_URL` 时对密码做百分号编码——密码含 `@`、`:`、`/`、`#` 等字符也能正确连接（不要手工把密码写进 URL）。
 - 公网只开放 80/443，由 Caddy 自动签 TLS；域名对外服务前需完成 ICP 备案。
 

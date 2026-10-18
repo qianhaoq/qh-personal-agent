@@ -35,8 +35,11 @@ services:
       PGPASSWORD: ${POSTGRES_PASSWORD}
       PGDATABASE: personal_agent
       # init-db 只加载 DbSettings（数据库层校验，threads7 P1 / INV-9）：
-      # 建表不依赖 LLM/记忆后端/JWT 配置，沿用 .env 本地默认即可通过；
-      # api/worker 按各自 command 过完整 Settings 启动校验
+      # 建表不依赖 LLM/JWT 配置，沿用 .env 本地默认即可通过；
+      # api/worker 按各自 command 过完整 Settings 启动校验。
+      # MEMORY_BACKEND=mem0 仅作 init-db 的 schema 引导信号（P1-3）：
+      # 幂等建 vector 扩展与 mem0 集合表/索引；DbSettings 忽略该键
+      MEMORY_BACKEND: mem0
     command: python -m app.cli init-db
     depends_on:
       postgres:
@@ -97,9 +100,8 @@ services:
         condition: service_completed_successfully
 
   postgres:
-    # pgvector 镜像同时是业务库：vector 扩展当前未使用，保留该镜像是为了
-    # pgvector 扩展与 mem0 集合卷；与业务库同实例，
-    # 二次迁移
+    # pgvector 镜像同时是业务库：vector 扩展与 mem0 集合表/索引由
+    # migrate（init-db，MEMORY_BACKEND=mem0）幂等引导；与业务库同实例
     image: pgvector/pgvector:pg16
     restart: unless-stopped
     environment:
