@@ -196,6 +196,48 @@ async def _revoke_device_for_reuse(
     raise ApiError(401, "refresh_reused", "检测到 refresh token 复用，设备已吊销")
 
 
+async def _claim_invite_first_use(
+    session: AsyncSession, invite_code: str, user_id: str, now
+) -> bool:
+    """首用抢占（原 login 内联）：条件 UPDATE 把 owner_user_id 从 NULL 置为
+    本事务用户 id、used+1，WHERE 同时原子判定未用尽与未过期。rowcount!=0
+    即抢占成功（调用方创建账号）；0 行 → 调用方走 _resolve_lost_invite。"""
+    claimed = await session.execute(
+        update(InviteCode)
+        .where(
+            InviteCode.code == invite_code,
+            InviteCode.owner_user_id.is_(None),
+            InviteCode.used < InviteCode.max_uses,
+            or_(InviteCode.expires_at.is_(None), InviteCode.expires_at > now),
+        )
+        .values(owner_user_id=user_id, used=InviteCode.used + 1)
+        .execution_options(synchronize_session=False)
+    )
+    return claimed.rowcount != 0
+
+
+async def _resolve_lost_invite(session: AsyncSession, invite_code: str) -> str:
+    """并发首登抢占的输方：回滚后重读已提交状态归因（INV-12）。owner 已
+    有值 → 登录该 owner（“同码后续登录复用同一账号”的既有语义，而不是
+    403：拿着同一个码的设备本就该落到同一个账号）；仍无 owner / 已过期 /
+    不存在 → 403。
+
+    INV-13（threads9 P1，auth.py:240）：输方的条件 UPDATE 在 invite 行锁
+    上等待赢家事务，输掉后重读到的已是等待之后的世界——过期判定必须用
+    **重读之后**重取的 now，沿用等锁之前的旧 now 会接受等待期间跨过
+    expires_at 的邀请并登录赢家账号（同一时刻起步的全新登录反而 403）。"""
+    await session.rollback()
+    invite = await session.get(InviteCode, invite_code)
+    now = utcnow()
+    if (
+        invite is None
+        or invite.owner_user_id is None
+        or (invite.expires_at is not None and as_utc(invite.expires_at) <= now)
+    ):
+        raise ApiError(403, "invalid_invite", "邀请码不存在或已过期")
+    return invite.owner_user_id
+
+
 @router.post("/login")
 async def login(body: LoginRequest, session: AsyncSession = Depends(get_db_session)):
     invite = await session.get(InviteCode, body.invite_code)
@@ -215,36 +257,13 @@ async def login(body: LoginRequest, session: AsyncSession = Depends(get_db_sessi
         if invite.used >= invite.max_uses:
             raise ApiError(403, "invalid_invite", "邀请码已用完")
         user_id = new_id("usr")
-        claimed = await session.execute(
-            update(InviteCode)
-            .where(
-                InviteCode.code == body.invite_code,
-                InviteCode.owner_user_id.is_(None),
-                InviteCode.used < InviteCode.max_uses,
-                or_(InviteCode.expires_at.is_(None), InviteCode.expires_at > now),
-            )
-            .values(owner_user_id=user_id, used=InviteCode.used + 1)
-            .execution_options(synchronize_session=False)
-        )
-        if claimed.rowcount == 0:
-            # 并发首登被别的事务抢走（或恰好过期/用尽）：回滚后重读已提交
-            # 状态。owner 已有值 → 登录该 owner（保持既有语义，而不是 403：
-            # 拿着同一个码的设备本就该落到同一个账号）；仍无 owner 或已
-            # 过期 → 按无效邀请码处理
-            await session.rollback()
-            invite = await session.get(InviteCode, body.invite_code)
-            if (
-                invite is None
-                or invite.owner_user_id is None
-                or (invite.expires_at is not None and as_utc(invite.expires_at) <= now)
-            ):
-                raise ApiError(403, "invalid_invite", "邀请码不存在或已过期")
-            user_id = invite.owner_user_id
-        else:
+        if await _claim_invite_first_use(session, body.invite_code, user_id, now):
             session.add(User(id=user_id))
             await session.flush()
+        else:
+            # 并发首登被别的事务抢走（或恰好过期/用尽）：重读归因
+            user_id = await _resolve_lost_invite(session, body.invite_code)
 
-    result = _token_pair(user_id, body.device_id)
     upserted = await session.execute(_device_upsert(body.device_id, user_id, body, now))
     if upserted.rowcount == 0:
         # WHERE 不成立：设备已绑定其他账号。复查确认后 403（行不存在 =
@@ -254,6 +273,14 @@ async def login(body: LoginRequest, session: AsyncSession = Depends(get_db_sessi
         if device is None or device.user_id == user_id:
             raise ApiError(500, "internal_error", "设备行状态异常，登录未落定")
         raise ApiError(403, "device_conflict", "设备已绑定其他账号")
+    # INV-13（threads9 P1，auth.py:248）：凭证在 device 行锁落定**之后**
+    # 签发——upsert 的行/PK 锁是本接口最长的等待窗口（同设备并发登录在
+    # 此串行化），锁前算好的 iat/exp 在短 TTL + 长等待下会让 access token
+    # 到手即过期（refresh 路径一直是锁后签发）。锁后重取 now 供签发与
+    # 追加行的 created_at/修剪判定；upsert 的 last_seen 用旧 now 是
+    # 纯展示边界（无任何决策读它）
+    now = utcnow()
+    result = _token_pair(user_id, body.device_id)
     # 登录只追加：本次返回的 token 与既有各行互不覆盖（INV-8）
     await _append_refresh_token(session, body.device_id, user_id, result["refresh_token"], now)
     await session.commit()

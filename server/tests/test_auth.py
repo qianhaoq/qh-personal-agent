@@ -593,6 +593,105 @@ async def test_refresh_token_expires_while_waiting_device_lock_401(
     assert as_utc(rows[0].expires_at) == expires_at
 
 
+async def test_invite_expires_while_loser_waiting_claim_403(client, monkeypatch):
+    """threads9 P1 / INV-13（auth.py:240）：并发首登同一邀请码，输方的
+    条件 UPDATE 在 invite 行锁上等待赢家事务；等待期间邀请码跨过
+    expires_at 时，重读后必须用**重取的 now** 判过期 → 403。旧行为沿用
+    等锁之前的旧 now，输方接受已过期邀请并登录赢家账号（同一时刻起步
+    的全新登录反而 403）。赢家在独立会话提交抢占，对回滚后的输方重读
+    可见——与真实「等锁等来赢家的已提交状态」等价，双后端同语义。"""
+    from datetime import UTC, datetime, timedelta
+
+    from app.api import auth as auth_api
+    from app.db import get_sessionmaker
+    from app.models import Device, InviteCode
+
+    t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    expires = t0 + timedelta(seconds=5)
+    clock = {"now": t0}
+    monkeypatch.setattr(auth_api, "utcnow", lambda: clock["now"])
+
+    code = "inv_race_loser_expiry"
+    async with get_sessionmaker()() as session:
+        session.add(
+            InviteCode(code=code, owner_user_id=None, used=0, max_uses=10, expires_at=expires)
+        )
+        await session.commit()
+
+    real_claim = auth_api._claim_invite_first_use
+
+    async def claim_after_winner_commit(session, invite_code, user_id, now):
+        # 输方在 invite 行锁上等待：赢家在独立会话里抢占并提交（首读与
+        # UPDATE 之间的窗口内落定），输方醒来时 owner 已有值
+        async with get_sessionmaker()() as winner:
+            assert await real_claim(winner, invite_code, "usr_winner_race", now)
+            await winner.commit()
+        # 等待本身消耗了时间：时钟被推过 expires_at
+        clock["now"] = expires + timedelta(seconds=1)
+        return await real_claim(session, invite_code, user_id, now)
+
+    monkeypatch.setattr(auth_api, "_claim_invite_first_use", claim_after_winner_commit)
+
+    resp = await client.post(
+        "/v1/auth/login", json={"invite_code": code, "device_id": "dev_loser_expiry"}
+    )
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["error"]["code"] == "invalid_invite"
+
+    async with get_sessionmaker()() as session:
+        invite = await session.get(InviteCode, code)
+        assert invite.owner_user_id == "usr_winner_race"
+        assert invite.used == 1
+        loser_device = await session.get(Device, "dev_loser_expiry")
+    assert loser_device is None, "输方不得凭已过期邀请登录：无设备行、无凭证"
+
+
+async def test_login_mints_tokens_after_device_row_lock(client, invite_code, monkeypatch):
+    """threads9 P1 / INV-13（auth.py:248）：_token_pair 必须在 device
+    upsert 落定之后调用——upsert 的行/PK 锁是 login 最长的等待窗口
+    （同设备并发登录在此串行化），锁前算好的 iat/exp 在短 TTL + 长等待
+    下会让返回的 access token 到手即过期。refresh 路径一直是锁后签发，
+    这里锁定 login 与之间序。旧行为先 mint 后 upsert（顺序断言直接
+    判别）。"""
+    from app.api import auth as auth_api
+    from app.auth.tokens import decode_access_token
+    from app.config import get_settings
+
+    order: list[str] = []
+    real_upsert = auth_api._device_upsert
+    real_pair = auth_api._token_pair
+
+    def upsert_recorder(*args, **kwargs):
+        # 语句构造时刻 < execute 时刻（锁在 execute 里拿）；mint 记录点
+        # 在其后出现即证明签发发生在 upsert 执行完成之后
+        order.append("upsert_built")
+        return real_upsert(*args, **kwargs)
+
+    def pair_recorder(user_id, device_id):
+        order.append("mint")
+        return real_pair(user_id, device_id)
+
+    monkeypatch.setattr(auth_api, "_device_upsert", upsert_recorder)
+    monkeypatch.setattr(auth_api, "_token_pair", pair_recorder)
+
+    resp = await client.post(
+        "/v1/auth/login",
+        json={"invite_code": invite_code, "device_id": "dev_mint_order", "device_name": "d"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert order == ["upsert_built", "mint"], "签发必须在 device upsert 执行之后"
+
+    body = resp.json()
+    claims = decode_access_token(body["access_token"])
+    ttl = get_settings().access_token_ttl_seconds
+    assert claims["exp"] - claims["iat"] == ttl  # iat/exp 为 int 时间戳
+
+    refreshed = await client.post(
+        "/v1/auth/refresh", json={"refresh_token": body["refresh_token"]}
+    )
+    assert refreshed.status_code == 200, refreshed.text
+
+
 async def test_refresh_reuse_row_deleted_under_lock_401_no_revoke(
     client, invite_code, monkeypatch
 ):
