@@ -12,6 +12,8 @@ import re
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from app.schemas import utc_safe_datetime
+
 DEFAULT_TZ = "Asia/Shanghai"
 
 _CN_DIGITS = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
@@ -60,6 +62,19 @@ def _day_offset(word: str) -> int:
     return {"今天": 0, "明天": 1, "后天": 2, "大后天": 3}.get(word, 0)
 
 
+def _safe_relative(base: datetime, **delta: float) -> datetime | None:
+    """相对时间的安全构造（threads8 P2 / INV-7）：巨大数量（如
+    「999999999999999999分钟后」「10000000天后」）会让 timedelta 构造或
+    datetime 加法抛 OverflowError，或把结果推出 utc_safe_datetime 的
+    ±14h 安全线——都视为「这条文本解析不出时间」，返回 None（不出提醒），
+    而不是把异常抛上去让确定性重试耗尽、把有效笔记标 failed。"""
+    try:
+        dt = base + timedelta(**delta)
+    except (OverflowError, ValueError, OSError):
+        return None
+    return utc_safe_datetime(dt)
+
+
 def parse_datetime(text: str, now: datetime, tzname: str = DEFAULT_TZ) -> datetime | None:
     """从中文文本里解析一个相对/绝对时间。找不到返回 None。"""
     tz = ZoneInfo(tzname)
@@ -75,17 +90,17 @@ def parse_datetime(text: str, now: datetime, tzname: str = DEFAULT_TZ) -> dateti
     if m:
         n = _cn_to_int(m.group(1))
         if n is not None:
-            return base + timedelta(minutes=n)
+            return _safe_relative(base, minutes=n)
     m = _RE_IN_HOURS.search(text)
     if m:
         n = _cn_to_int(m.group(1))
         if n is not None:
-            return base + timedelta(hours=n)
+            return _safe_relative(base, hours=n)
     m = _RE_IN_DAYS.search(text)
     if m:
         n = _cn_to_int(m.group(1))
         if n is not None:
-            return base + timedelta(days=n)
+            return _safe_relative(base, days=n)
 
     day_m = _RE_DAY.search(text)
     clock_m = _RE_CLOCK.search(text)

@@ -104,3 +104,49 @@ async def test_mockllm_chat_answer_without_context():
     llm = MockLLM()
     answer = await llm.chat([{"role": "user", "content": "问题：我喜欢吃什么"}])
     assert answer.startswith("我没有相关记录")
+
+
+def test_parse_datetime_huge_relative_returns_none():
+    """threads8 P2 / INV-7（mock.py:78）：巨大的相对时间数量（timedelta
+    构造/加法溢出，或结果越出 utc_safe_datetime 的安全线）→ 解析为 None
+    （这条文本不出提醒），不把 OverflowError 抛上去耗尽重试把笔记标
+    failed。"""
+    assert parse_datetime("999999999999999999分钟后提醒我喝水", _now()) is None
+    assert parse_datetime("999999999999999999小时后开会", _now()) is None
+    assert parse_datetime("10000000天后交报告", _now()) is None
+    # 合理数量不受影响
+    assert parse_datetime("30分钟后提醒我", _now()) is not None
+    assert parse_datetime("三天后交报告", _now()) is not None
+
+
+async def test_mockllm_huge_relative_quantity_no_reminder_no_500(client, user, run_jobs):
+    """threads8 P2 端到端：正文含「999999999999999999分钟后」→ MockLLM
+    不抛 OverflowError，笔记照常 organized，只是不出这条提醒。"""
+    import uuid
+
+    from sqlalchemy import select
+
+    from app.db import get_sessionmaker
+    from app.models import Note, Reminder
+    from tests.conftest import auth_headers
+
+    created = await client.post(
+        "/v1/notes",
+        json={
+            "client_note_id": str(uuid.uuid4()),
+            "text": "999999999999999999分钟后提醒我喝水",
+        },
+        headers=auth_headers(user),
+    )
+    assert created.status_code == 202, created.text
+    note_id = created.json()["note_id"]
+    await run_jobs()
+
+    async with get_sessionmaker()() as session:
+        note = await session.get(Note, note_id)
+        reminders = (
+            await session.execute(select(Reminder).where(Reminder.note_id == note_id))
+        ).scalars().all()
+    assert note.status == "organized", "越界数量只影响这条提醒，不影响整理本身"
+    assert note.title == "999999999999999999分钟后提醒我喝水"[:20]
+    assert reminders == []

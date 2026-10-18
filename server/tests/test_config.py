@@ -402,3 +402,35 @@ def test_env_example_documents_new_runtime_flags():
     assert "LOG_LEVEL=info" in lines
     assert any(ln.startswith("# CORS_ALLOW_ORIGINS=") for ln in lines)
 
+
+
+def test_non_positive_numeric_settings_rejected():
+    """threads8 P2 / INV-10.7（config.py:99）：数值配置 0/负值启动即拒，
+    一次性列出**全部**非正字段（WORKER_BATCH_SIZE=0 会让 worker 循环体
+    永不执行而日志一切正常）。任何环境生效。"""
+    with pytest.raises(ValidationError, match="数值配置必须为正") as exc_info:
+        Settings(
+            database_url="sqlite+aiosqlite:///./app.sqlite3",
+            worker_batch_size=0,
+            ask_top_k=-1,
+        )
+    msg = str(exc_info.value)
+    assert "WORKER_BATCH_SIZE=0" in msg and "ASK_TOP_K=-1" in msg, msg
+
+    for field, value in (
+        ("access_token_ttl_seconds", 0),
+        ("refresh_token_ttl_days", 0),
+        ("llm_timeout_seconds", 0),
+        ("job_max_attempts", -1),
+        ("job_lock_timeout_seconds", 0),
+        ("worker_poll_interval_seconds", 0),
+    ):
+        with pytest.raises(ValidationError, match="数值配置必须为正"):
+            Settings(database_url="sqlite+aiosqlite:///./app.sqlite3", **{field: value})
+
+
+def test_positive_numeric_settings_defaults_ok():
+    settings = Settings(database_url="sqlite+aiosqlite:///./app.sqlite3")
+    assert settings.worker_batch_size > 0
+    assert settings.job_max_attempts > 0
+    assert settings.ask_top_k > 0

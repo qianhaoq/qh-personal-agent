@@ -217,6 +217,32 @@ class Settings(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def _require_positive_numeric_settings(self) -> "Settings":
+        """INV-10.7（threads8 P2，config.py:99）：数值配置必须为正。0/负值
+        会让相应循环或调用静默失效（WORKER_BATCH_SIZE=0 时 worker 日志一切
+        正常但循环体永不执行、任何笔记都不被整理）——启动时一次性列出
+        **全部**非正字段。新增数值型配置必须加进下表并同步 .env.example
+        （docs/server-invariants.md 自查清单第 15 条）。"""
+        checks = {
+            "ACCESS_TOKEN_TTL_SECONDS": self.access_token_ttl_seconds,
+            "REFRESH_TOKEN_TTL_DAYS": self.refresh_token_ttl_days,
+            "LLM_TIMEOUT_SECONDS": self.llm_timeout_seconds,
+            "JOB_MAX_ATTEMPTS": self.job_max_attempts,
+            "JOB_LOCK_TIMEOUT_SECONDS": self.job_lock_timeout_seconds,
+            "WORKER_POLL_INTERVAL_SECONDS": self.worker_poll_interval_seconds,
+            "WORKER_BATCH_SIZE": self.worker_batch_size,
+            "ASK_TOP_K": self.ask_top_k,
+        }
+        # not (v > 0) 连 NaN 也拦下（NaN <= 0 为 False）
+        bad = {name: value for name, value in checks.items() if not (value > 0)}
+        if bad:
+            raise ValueError(
+                "数值配置必须为正（0/负值会让相应循环或调用静默失效）："
+                + "、".join(f"{NAME}={value!r}" for NAME, value in bad.items())
+            )
+        return self
+
 
 @lru_cache
 def get_settings() -> Settings:

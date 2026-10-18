@@ -108,24 +108,48 @@ def _parse_llm_json(raw: str) -> dict:
     return data
 
 
+# LLM 产出字符串里必须剥掉的不安全字符（threads8 P2 / INV-7）：NUL、
+# C0 控制符（保留 \t\n）、DEL、孤立 UTF-16 代理对——json.loads 会接受
+# 它们，但写 PostgreSQL text/JSON 列时编码失败是**确定性**的，重试耗尽
+# 会把一条完全有效的笔记标成 failed
+_UNSAFE_LLM_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\ud800-\udfff]")
+
+
+def _clean_llm_str(value, limit: int) -> str:
+    """LLM 字符串字段收口：转 str、剥不安全字符、截断。"""
+    return _UNSAFE_LLM_CHARS.sub("", str(value or ""))[:limit]
+
+
 def _coerce_extraction(data: dict) -> dict:
-    """字段兜底与类型收口。"""
-    tags = data.get("tags") or []
-    todos = data.get("todos") or []
-    reminders = data.get("suggested_reminders") or []
+    """字段兜底与类型收口。每个字符串都过 _clean_llm_str（INV-7）；剥完
+    为空的 tags/todos/提醒标题整条丢弃。fire_at 不在这里清：_parse_fire_at
+    的 fromisoformat + utc_safe_datetime 天然拒绝含控制字符的值。"""
+    todos = []
+    for t in data.get("todos") or []:
+        if not isinstance(t, dict):
+            continue
+        text = _clean_llm_str(t.get("text"), 200)
+        if not text:
+            continue
+        todo = {"text": text}
+        due = _clean_llm_str(t.get("due"), 64)
+        if due:
+            todo["due"] = due
+        todos.append(todo)
+    reminders = []
+    for r in data.get("suggested_reminders") or []:
+        if not isinstance(r, dict):
+            continue
+        title = _clean_llm_str(r.get("title"), 200)
+        if title:
+            reminders.append({"title": title, "fire_at": r.get("fire_at")})
     return {
-        "title": str(data.get("title") or "")[:100],
-        "tags": [str(t)[:32] for t in tags][:8],
-        "todos": [
-            {"text": str(t.get("text", ""))[:200], **({"due": t["due"]} if t.get("due") else {})}
-            for t in todos
-            if isinstance(t, dict) and t.get("text")
-        ][:20],
-        "suggested_reminders": [
-            {"title": str(r.get("title", ""))[:200], "fire_at": r.get("fire_at")}
-            for r in reminders
-            if isinstance(r, dict) and r.get("title")
-        ][:10],
+        "title": _clean_llm_str(data.get("title"), 100),
+        "tags": [
+            t for t in (_clean_llm_str(tag, 32) for tag in data.get("tags") or []) if t
+        ][:8],
+        "todos": todos[:20],
+        "suggested_reminders": reminders[:10],
     }
 
 
