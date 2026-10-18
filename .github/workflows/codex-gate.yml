@@ -8,35 +8,40 @@
 # while evaluating untrusted PRs; the reusable gate is read-only and
 # never checks out the PR head.
 #
-# NOTE on thread resolution: `pull_request_review_thread` is a WEBHOOK
-# event only — GitHub Actions cannot trigger a workflow with it (a file
-# that lists it under `on:` is rejected/never fires). Resolved Codex
-# threads are picked up by the scheduled refresh below, or manually via
-# workflow_dispatch (pr_number below) / a re-run of a
-# pull_request_target-originated Gate job.
+# Triggers (PR-only, deduplicated to save Actions minutes):
+#   - pull_request_target: push / open / ready / draft, and labeled /
+#     unlabeled for `skip-codex-gate` only (other labels are skipped by the
+#     caller `if:` below — no runner boots, and the skipped check is named
+#     "codex", never the required "codex / Codex Review Gate").
+#   - pull_request_review (submitted) by Codex only. One Codex review with
+#     N inline comments = ONE run.
+#   - pull_request_review_comment by Codex only, and only when it is an
+#     EDIT or a thread REPLY (e.g. a finding edited into P0/P1). New
+#     top-level inline comments are part of a submitted review, which
+#     already evaluates — the old unfiltered trigger fired N more runs.
+#   - issue_comment → the REFRESH job, only for comments by Codex (summary
+#     created/edited, "no major issues") or a "/recheck" comment. Its
+#     conclusion would land on the default branch, so it does not
+#     evaluate: it re-runs the latest failed head gate run only if the
+#     gate would now pass (else at most the newest cancelled one; one
+#     re-run per PR; never past run_attempt 3).
+#   - workflow_dispatch(pr_number): evaluates; attaches to the PR head only
+#     when dispatched ON the PR branch (e.g. GITHUB_TOKEN-created PRs).
+#   - No schedule: thread resolution (webhook-only, cannot trigger
+#     Actions) is picked up by the next Codex comment, a push, or a
+#     "/recheck" comment on the PR. Add an hourly-or-slower cron only if
+#     you really need it (each scheduled run boots a runner).
 #
-# Schedule (*/15): a scheduled run's own conclusion does NOT attach to
-# any PR head check (neither does workflow_dispatch), so the schedule
-# path never evaluates. The reusable workflow's "Codex Gate Refresh" job
-# instead re-runs the most recent FAILED pull_request_target-originated
-# Gate run for every open non-draft PR whose gate check is failing
-# (actions.reRunWorkflowFailedJobs) — a re-run keeps the original
-# pull_request_target event, so the fresh conclusion re-attaches to the
-# PR head check. That API needs `actions: write`, granted here on the
-# schedule-path job ONLY (`codex-refresh`); the evaluator job `codex`
-# stays read-only. Expect failing PRs to be re-evaluated every 15
-# minutes until green or closed.
-#
-# Concurrency: one evaluation per PR; a stale in-flight run is cancelled
-# by the newer event. Schedule runs fall back to a unique run_id group
-# (nothing to cancel).
+# Concurrency (never lets one event class cancel another):
+#   - push-class runs (opened / synchronize / reopened) share one group per
+#     PR with cancel-in-progress: a new commit cancels the evaluation of
+#     the OLDER head only (that cancelled check sits on the old SHA).
+#   - relevant refresh runs (Codex / "/recheck" comments) queue per PR
+#     (a running one is never cancelled).
+#   - every other run (labels, Codex reviews, dispatch, skipped events)
+#     gets its own group: never cancelled, never cancels. Gate runs are
+#     ~15 s, read live state, and are idempotent.
 
-# PERMISSIONS: GitHub validates the permissions of EVERY job in a called
-# workflow against the calling job's ceiling, even jobs skipped by `if`.
-# The reusable file contains both the evaluator (issues: read) and the
-# refresh job (actions: write), so both caller jobs grant the union. The
-# callee still narrows each job's own token (evaluator stays read-only).
-#
 name: Codex Review Gate
 
 on:
@@ -51,43 +56,70 @@ on:
   workflow_dispatch:
     inputs:
       pr_number:
-        description: 'PR number to evaluate (e.g. after resolving Codex threads)'
+        description: 'PR number to evaluate (dispatch on the PR branch to attach the check)'
         required: true
         type: string
-  schedule:
-    - cron: '*/15 * * * *'
 
 permissions:
   contents: read
   pull-requests: read
   issues: read
 
+# Re-run attempts (run_attempt > 1, e.g. from a refresh) never join the
+# cancelling push group: a re-run of an OLD head's synchronize run would
+# otherwise cancel the newest head's evaluation.
 concurrency:
-  # pull_request_target runs get their own group: only they attach the
-  # required check to the PR head, so an issue_comment / review event must
-  # never cancel an in-flight target run (it would leave the check cancelled).
-  group: codex-gate-pr-${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pr_number || github.run_id }}-${{ github.event_name == 'pull_request_target' && 'target' || 'aux' }}
-  cancel-in-progress: true
+  group: >-
+    codex-gate-pr-${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pr_number || 'none' }}-${{
+    (github.event_name == 'pull_request_target' && github.run_attempt == '1' && contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action)) && 'push' ||
+    (github.event_name == 'issue_comment' &&
+      (github.event.comment.user.login == 'chatgpt-codex-connector[bot]' || github.event.comment.user.login == 'chatgpt-codex-connector' ||
+       startsWith(github.event.comment.body, '/recheck'))) && 'refresh' ||
+    format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request_target' && github.run_attempt == '1' && contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action) }}
 
 jobs:
   codex:
-    if: github.event_name != 'schedule'
+    # Removing `no-auto-merge` re-evaluates so the gate's completion
+    # starts an Auto Merge sweep (its workflow_run is not 'skipped').
+    # Caller-level filter: irrelevant events skip WITHOUT booting a runner
+    # and attach a check named "codex" (not the required one).
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request_review' &&
+        (github.event.review.user.login == 'chatgpt-codex-connector[bot]' || github.event.review.user.login == 'chatgpt-codex-connector')) ||
+      (github.event_name == 'pull_request_review_comment' &&
+        (github.event.comment.user.login == 'chatgpt-codex-connector[bot]' || github.event.comment.user.login == 'chatgpt-codex-connector') &&
+        (github.event.action == 'edited' || github.event.comment.in_reply_to_id)) ||
+      (github.event_name == 'pull_request_target' &&
+        ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
+         github.event.label.name == 'skip-codex-gate' ||
+         (github.event.action == 'unlabeled' && github.event.label.name == 'no-auto-merge')))
+    # GitHub checks EVERY job of the called file against this job's
+    # ceiling (incl. the refresh job, which needs actions: write); the
+    # evaluator's own token stays read-only.
     permissions:
       contents: read
       pull-requests: read
       issues: read
       actions: write
-    uses: qianhaoq/devflow-gates/.github/workflows/codex-gate.yml@1a6a4a85728b0c1f3482a52020f94cb8208c73f5  # devflow-gates main @ 1a6a4a8 (pinned; bump deliberately)
+    uses: qianhaoq/devflow-gates/.github/workflows/codex-gate.yml@3853cc9dedbf1ffd8b10def841ed4c822dae7906  # devflow-gates main @ 3853cc9 (pinned; bump deliberately)
     with:
       wait_minutes: 20
 
-  # Schedule path only — see the header note. actions: write is scoped to
-  # this job so the evaluator above never holds it.
+  # Refresh path — Codex comments and "/recheck" only (see header).
   codex-refresh:
-    if: github.event_name == 'schedule'
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+      (github.event.comment.user.login == 'chatgpt-codex-connector[bot]' ||
+       github.event.comment.user.login == 'chatgpt-codex-connector' ||
+       startsWith(github.event.comment.body, '/recheck'))
     permissions:
       contents: read
       pull-requests: read
       issues: read
       actions: write
-    uses: qianhaoq/devflow-gates/.github/workflows/codex-gate.yml@1a6a4a85728b0c1f3482a52020f94cb8208c73f5  # devflow-gates main @ 1a6a4a8 (pinned; bump deliberately)
+    uses: qianhaoq/devflow-gates/.github/workflows/codex-gate.yml@3853cc9dedbf1ffd8b10def841ed4c822dae7906  # devflow-gates main @ 3853cc9 (pinned; bump deliberately)
+    with:
+      wait_minutes: 20
