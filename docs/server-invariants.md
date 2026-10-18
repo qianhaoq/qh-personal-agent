@@ -8,6 +8,7 @@
 > 第六轮输入：threads6.txt 的 6 条（3 P1 + 3 P2），在对应 INV 内注明：INV-5 补「丢租约必再入队」（迟到的 delete_by_note 会删掉换主后写入的记忆）；新增 INV-11（写接口乐观锁与 rev 语义，含幂等/无操作快路径）；新增 INV-12（条件更新/删除 0 行后的归因规则）；INV-8 补 refresh 行消失/过期的分类与过期行清理；INV-7 补 LLM 输出时间同套 ±14h 安全界；INV-10 补 MEM0_EMBEDDING_API_KEY。
 > 第七轮输入：threads7.txt 的 5 条 P1（2 条 C 类 auth、1 条 A 类 memory_sync、1 条 compose；mem0_store.py 的 infer 一条**不在本分支修**，随生产记忆后端整体移交 feat/mem0-backend 分支），在对应 INV 内注明：INV-12 补「条件写后的重读必须绕过 identity map」（synchronize_session=False 不更新已加载对象）；INV-8 补「所有失败分支（含吊销/重放分支）先 _lock_device、锁内重读 token 行再判定」；INV-5 补「补偿入队必须在 try/finally——store.delete 抛异常也一定入队」；INV-9/INV-10 补「init-db 只校验数据库配置（校验分层），compose 各服务按 command 通过各自的启动校验（有测试）」。同轮把 mem0 生产后端拆分出去：`MEMORY_BACKEND` 取值变为 `inmemory | disabled`（新增空后端），mem0 相关实现细节从本仓移除、由后续 PR（feat/mem0-backend）提供，本文相应标注。
 > 第八轮输入：threads8.txt 的 7 条（3 P1 + 4 P2），按类全仓排查后修：新增 INV-13（加锁后使用的派生值必须在锁内由重读数据重算，含 now；P1 auth.py:294）、INV-14（日志/数据库/错误响应不存异常原文与用户内容；P1 runner.py:71）、INV-15（改源字段必须让派生字段失效；P1 notes.py:215）；INV-5/6 补「置位 UPDATE 与租约校验原子」（P2 memory_sync.py:131）；INV-7 补「LLM 输出字符串剔除 NUL/不安全控制字符」（P2 extract.py:120）与「MockLLM 相对时间数量上界」（P2 mock.py:78）；INV-10 补「数值配置必须为正」（P2 config.py:99）。机械检查器同步新增 INV-NO-RAW-EXC（映射 INV-14）。
+> 第九轮输入：threads9.txt 的 6 条（5 P1 + 1 P2），按类全仓排查后修：INV-13 补 login 的两个锁点（P1 auth.py:240 邀请码输方重读后沿用等锁前的 now 判过期；P1 auth.py:248 `_token_pair` 在 device upsert 锁前签发 iat/exp）并附全仓锁点核查表；INV-14 扩到**框架层与构建上下文**（P1 main.py:56 ServerErrorMiddleware 必 re-raise、P1 docker-compose.yml:44 uvicorn access log 带 query、P1 docker-compose.yml:21 无 .dockerignore——.env 与本地库进构建上下文；另 SQLAlchemy echo 的 URL query 向量、httpx/httpcore/openai logger 级别钉扎）；INV-7 补「MockLLM 十进制数量位数上界」（P2 mock.py:49，CPython int() 约 4300 位上限）。
 
 ## 0. 总览：新任务与记忆模型
 
@@ -206,7 +207,7 @@ memory_sync(note_id)     不带 rev。短读事务取 note 当前状态 →（�
 
 ### INV-7 外部输入硬化：NUL 拒绝 + 病态输入一律 4xx
 
-**陈述**：任何可能进入数据库（或被拼进 LLM prompt / JSON 序列化）的外部输入，含 `\x00` 时必须得到 422，而不是 PG 编码错误 500。同类「编码/绑定/换算必炸」的病态输入也不允许 500（4c1c9be P2-4，全部拦成 400/422）：lone surrogate（UTF-8 编码失败）、非法 UTF-8 请求体（解码失败）、超深嵌套 JSON（解析器递归栈炸裂）、超大整数（SQL 绑定 OverflowError）、换算/本地化成 UTC 越界的极端日期（astimezone OverflowError）。threads5 P2-4 补：**aware 时间的边界与 naive 统一**——先转 UTC，再套用同一条 `[0001-01-02 00:00:00, 9998-12-31 23:59:59.999999]` 安全界（预留最坏 IANA 偏移 ±14h；此前 `9999-12-31T23:59:59Z` 配用户时区 Asia/Shanghai 能过 schema，却在抽取/提醒解析的 `astimezone` 处 OverflowError → note 被标 failed 而不是 422）。threads6 P2 补：**LLM 输出的时间同样套用这条 ±14h 安全界**——`extract` 的 `suggested_reminders[].fire_at` 解析（`_parse_fire_at`）把换算溢出（`astimezone` OverflowError/ValueError）或越界的值**当无效丢弃**（不生成该条 suggested reminder），绝不把异常上抛让 job 重试耗尽、把本来有效的笔记标 failed（`9999-12-31T23:59:59` 配 America/New_York 这类「语法合法、换算必炸」的值只能丢提醒，不能丢笔记）。threads8 P2 补两条：**(a) LLM 输出的字符串字段与请求体同一条硬化规则**——`_coerce_extraction` 对 title/tags/todos[].text/todos[].due/suggested_reminders[].title 一律剔除 NUL、不安全控制字符（C0 除 `\t\n`、DEL `\x7f`）与 lone surrogate（`json.loads` 会放过这些值，原样写 PG text/JSON 列必炸编码，确定性响应会耗尽重试把有效笔记标 failed）；剔除后变空的 tag/todo/提醒标题直接丢弃。**(b) MockLLM 的相对时间数量加上界**——`parse_datetime` 的「X分钟后/小时后/天后」分支统一走安全加法：`timedelta` 构造/相加溢出（`OverflowError`，如 `999999999999999999分钟后`）或结果越出 `utc_safe_datetime` 的安全界（如 `10000000天后` 超 datetime 可表示范围）都**不产生提醒**（返回 None），异常不上抛。界常量与判定函数放在 `app/schemas.py` 一处（`utc_safe_datetime`），请求体校验（SafeDatetime）、LLM 输出解析与 MockLLM 的数量上界共用，不允许各写一套边界。统一方案 = **中间件 + schemas + 异常兜底三层**：
+**陈述**：任何可能进入数据库（或被拼进 LLM prompt / JSON 序列化）的外部输入，含 `\x00` 时必须得到 422，而不是 PG 编码错误 500。同类「编码/绑定/换算必炸」的病态输入也不允许 500（4c1c9be P2-4，全部拦成 400/422）：lone surrogate（UTF-8 编码失败）、非法 UTF-8 请求体（解码失败）、超深嵌套 JSON（解析器递归栈炸裂）、超大整数（SQL 绑定 OverflowError）、换算/本地化成 UTC 越界的极端日期（astimezone OverflowError）。threads5 P2-4 补：**aware 时间的边界与 naive 统一**——先转 UTC，再套用同一条 `[0001-01-02 00:00:00, 9998-12-31 23:59:59.999999]` 安全界（预留最坏 IANA 偏移 ±14h；此前 `9999-12-31T23:59:59Z` 配用户时区 Asia/Shanghai 能过 schema，却在抽取/提醒解析的 `astimezone` 处 OverflowError → note 被标 failed 而不是 422）。threads6 P2 补：**LLM 输出的时间同样套用这条 ±14h 安全界**——`extract` 的 `suggested_reminders[].fire_at` 解析（`_parse_fire_at`）把换算溢出（`astimezone` OverflowError/ValueError）或越界的值**当无效丢弃**（不生成该条 suggested reminder），绝不把异常上抛让 job 重试耗尽、把本来有效的笔记标 failed（`9999-12-31T23:59:59` 配 America/New_York 这类「语法合法、换算必炸」的值只能丢提醒，不能丢笔记）。threads8 P2 补两条：**(a) LLM 输出的字符串字段与请求体同一条硬化规则**——`_coerce_extraction` 对 title/tags/todos[].text/todos[].due/suggested_reminders[].title 一律剔除 NUL、不安全控制字符（C0 除 `\t\n`、DEL `\x7f`）与 lone surrogate（`json.loads` 会放过这些值，原样写 PG text/JSON 列必炸编码，确定性响应会耗尽重试把有效笔记标 failed）；剔除后变空的 tag/todo/提醒标题直接丢弃。**(b) MockLLM 的相对时间数量加上界**——`parse_datetime` 的「X分钟后/小时后/天后」分支统一走安全加法：`timedelta` 构造/相加溢出（`OverflowError`，如 `999999999999999999分钟后`）或结果越出 `utc_safe_datetime` 的安全界（如 `10000000天后` 超 datetime 可表示范围）都**不产生提醒**（返回 None），异常不上抛。**(c) MockLLM 十进制数量的位数上界（threads9 P2，mock.py:49）**——CPython 的 `int(str)` 对约 4300 位以上的十进制串直接 `ValueError`（`[0-9]+` 无位数限制，一条合法的 5000 字符笔记含「(4900+ 位数字)分钟后」时在 `_safe_relative` **之前**就炸，确定性重试全部失败 → 笔记被标 failed）。`_cn_to_int` 对十进制串限 **≤6 位**（999999 分钟 ≈ 1.9 年，更大数量本就荒谬）并捕获 `ValueError/OverflowError` 返回 None；**有意不用**正则 `[0-9]{1,6}` 限位——超长数字串的**末 6 位**仍会匹配「分钟后」前的窗口，把 5000 位数错当成 999999 分钟生成错误提醒；长度判定让整串不通过 → 该短语无提醒，语义正确。界常量与判定函数放在 `app/schemas.py` 一处（`utc_safe_datetime`），请求体校验（SafeDatetime）、LLM 输出解析与 MockLLM 的数量上界共用，不允许各写一套边界。统一方案 = **中间件 + schemas + 异常兜底三层**：
 
 1. **中间件**（`app/middleware.py`，注册于 `create_app`）：对每个请求的 URL path 与 query string **解码后**检查 `\x00`（`request.url.path` 与 `query_params` 各值），命中直接返回 422 `{"error":{"code":"validation_error",...}}`，不进入路由。覆盖所有路由的 path/query 参数。
 2. **schemas**（既有 `NoNulStr`/`reject_nul` 保留）：所有请求体字符串字段；path/query 参数声明处再加 `Annotated[NoNulStr, ...]`（如 `note_id`）作第二道防线。在此之上：typed str 字段的 lone surrogate 由 pydantic 自带拒绝（string_unicode）；`NoteCreate.asr` 走 `_reject_invalid_unicode_everywhere` 递归（NUL + surrogate + 嵌套深度 ≤ `_MAX_ASR_DEPTH=16`）；`SafeDatetime`（`NoteCreate.recorded_at`/`AskRequest.client_time`）对 **aware 与 naive 一视同仁**：换算/视为 UTC 后的值必须落在 `[0001-01-02 00:00:00, 9998-12-31 23:59:59.999999]`（任何 ±14h 内的 `astimezone` 都不再越界）；`NotePatch.rev` 约束在 int4 范围。
@@ -224,11 +225,12 @@ memory_sync(note_id)     不带 rev。短读事务取 note 当前状态 →（�
 | LLM 输出：suggested_reminders[].fire_at（threads6 P2） | `_parse_fire_at` 复用 `utc_safe_datetime`：换算溢出/越界 → 丢弃该提醒（笔记照常 organized），不上抛异常 |
 | LLM 输出：title/tags/todos[].text/todos[].due/提醒标题（threads8 P2） | `_coerce_extraction` 的 `_clean_llm_str`：剔除 NUL/C0 控制字符（保留 \t\n）/DEL/lone surrogate；剔后为空的条目丢弃（笔记照常 organized） |
 | MockLLM：相对时间数量（threads8 P2） | `parse_datetime` 的 `_safe_relative`：timedelta 构造/相加溢出或结果越出 utc_safe_datetime 安全界 → 不产生提醒（None），不上抛 |
+| MockLLM：十进制数量位数（threads9 P2） | `_cn_to_int` 限 ≤6 位并捕获 ValueError/OverflowError → 超长数字串（CPython int() 约 4300 位上限）不产生提醒、不上抛 |
 | path：`/v1/notes/{note_id}` 等 | 中间件 + 参数 `NoNulStr` 注解（修 C8） |
 | query：`/v1/search?q=`、`/v1/sync?since=&limit=`、`/v1/notes?cursor=&limit=` | 中间件（q 已有 `NoNulStr`）；since/cursor 补 `le=int8 上界`（超大整数绑定 OverflowError） |
 | header | 当前**无任何 header 值入库**（authorization 只做 JWT 解析，不落库）；规则：未来任何从 header 取值入库的字段必须走 `NoNulStr`（自查清单项） |
 
-**保证代码**：`app/middleware.py`、`app/main.py::create_app`（注册）、`app/schemas.py`（含 `utc_safe_datetime` 界判定）、`app/errors.py`、`app/api/notes.py`（path 参数注解、cursor 上界）、`app/api/sync.py`（since 上界）、`app/pipeline/extract.py::_parse_fire_at`（LLM 输出同界）、`app/pipeline/extract.py::_coerce_extraction/_clean_llm_str`（LLM 字符串剔控制字符）、`app/llm/mock.py::parse_datetime/_safe_relative`（相对时间数量上界）。
+**保证代码**：`app/middleware.py`、`app/main.py::create_app`（注册）、`app/schemas.py`（含 `utc_safe_datetime` 界判定）、`app/errors.py`、`app/api/notes.py`（path 参数注解、cursor 上界）、`app/api/sync.py`（since 上界）、`app/pipeline/extract.py::_parse_fire_at`（LLM 输出同界）、`app/pipeline/extract.py::_coerce_extraction/_clean_llm_str`（LLM 字符串剔控制字符）、`app/llm/mock.py::parse_datetime/_safe_relative`（相对时间数量上界）、`app/llm/mock.py::_cn_to_int`（十进制位数上界，threads9 P2）。
 
 **验证测试**：
 - `test_nul_in_path_param_422`（`/v1/notes/n%00x` 的 GET/PATCH/DELETE）
@@ -245,6 +247,7 @@ memory_sync(note_id)     不带 rev。短读事务取 note 当前状态 →（�
 - `test_llm_boundary_fire_at_overflow_discarded`（threads6 P2：LLM 返回 `9999-12-31T23:59:59+00:00`、`0001-01-01T00:00:00+00:00`、naive `9999-12-31T23:59:59`（America/New_York 换算溢出）→ 提醒丢弃、笔记照常 organized 不落 failed；界内未来时间照常生成）
 - `test_llm_output_unsafe_control_chars_stripped`（threads8 P2：LLM 输出的 title/tag/todo/due/提醒标题含 `\x00`、`\x01`、lone surrogate → 剔除后落库（保留 \t\n），剔空的 tag/提醒丢弃，笔记照常 organized 不 500 不 failed）
 - `test_parse_datetime_huge_relative_returns_none` / `test_mockllm_huge_relative_quantity_no_reminder_no_500`（threads8 P2：`999999999999999999分钟后`（timedelta 构造溢出）与 `10000000天后`（越出安全界）→ 不产生提醒；端到端笔记照常 organized、不 500 不 failed）
+- `test_parse_datetime_overlong_digit_quantity_returns_none` / `test_mockllm_overlong_digit_quantity_no_reminder_no_500`（threads9 P2：5000 位数字 +「分钟后/天后」→ `_cn_to_int` 返回 None（CPython int() 4300 位上限不再触发 ValueError）；7 位数同样无提醒，≤6 位照常解析；端到端笔记照常 organized、不 500 不 failed）
 
 ### INV-8 登录与 refresh：device 原子 upsert + 每设备多枚 refresh token
 
@@ -389,21 +392,53 @@ memory_sync(note_id)     不带 rev。短读事务取 note 当前状态 →（�
 2. **锁内重读**：来自行数据的派生值由锁定行的当前值得出——显式重读（绕 identity map，见 INV-12）或由条件 UPDATE 的 WHERE 对行当前值**原子判定**；
 3. **版本栅栏**：锁前的快照值被一个锁内原子复查的版本号（如 note 的 rev）守护——快照之后任何会改它的写都必然推进版本，复查不过即放弃（extract apply 对 `timezone/recorded_at` 的用法）。
 
-违反样例（threads8 P1）：`refresh` 在请求起始取 `now`，拿到 device 行锁后的轮换条件 UPDATE 仍用 `RefreshToken.expires_at > now`（旧 now）判过期——token 首读有效、等锁期间跨过 `expires_at` 时已过期的 token 仍被轮换成新凭证（200），「等锁期间跨过期」的归因分支（INV-12）对此场景永不可达。修复：`_lock_device` 之后重取 `now`，条件 UPDATE 对行内当前 `expires_at` 原子判定。
+违反样例：
 
-**边界（允许的例外，须注释论证）**：纯展示/时间戳用途的旧值（如 PATCH `.values(updated_at=utcnow())` 在语句构造时求值，陈旧 µs–ms 级、无决策依赖）；方向保守的判定（如 `_claim_postgres` 的 `cutoff = now - timeout` 在循环外取——陈旧只会让刚过期的租约晚一轮被回收，不会错回收/错放行）；无等待窗口的首个写（login 的 invite 条件 UPDATE 前 `now` 即取即用）。全仓各锁点的逐条核查记录见第八轮 sweep（`/workspace/.agent-tmp/sweep8.md` D 类）。
+- threads8 P1（auth.py:294）：`refresh` 在请求起始取 `now`，拿到 device 行锁后的轮换条件 UPDATE 仍用 `RefreshToken.expires_at > now`（旧 now）判过期——token 首读有效、等锁期间跨过 `expires_at` 时已过期的 token 仍被轮换成新凭证（200），「等锁期间跨过期」的归因分支（INV-12）对此场景永不可达。修复：`_lock_device` 之后重取 `now`，条件 UPDATE 对行内当前 `expires_at` 原子判定。
+- threads9 P1（auth.py:240，login 邀请码输方）：并发首登同一邀请码，输方的条件 UPDATE 在 invite 行锁上等待赢家事务，输了之后 rollback 重读已提交状态，过期比较却仍用**等锁之前**取的 `now`——等待期间邀请码跨过 `expires_at` 时，输方接受已过期邀请并登录赢家账号（晚于此时刻开始的同一登录反而 403）。修复：`_resolve_lost_invite` 重读之后重取 `now = utcnow()` 再判过期。
+- threads9 P1（auth.py:248，login 锁前签发）：`_token_pair`（内部取 `datetime.now` 定 iat/exp）在 `_device_upsert` **之前**调用——device upsert 的行锁是本接口最长的等待窗口，短 `ACCESS_TOKEN_TTL_SECONDS` + 长等待下返回的 access token **到手即过期**。修复：`_token_pair` 移到 upsert（及 rowcount 复查）之后，并在锁后重取 `now` 供签发与 `_append_refresh_token`（与 refresh 路径同序）。
 
-**保证代码**：`app/api/auth.py::refresh`（锁内重取 now；`_revoke_device_for_reuse` 的锁内 `utcnow()` 判过期为 threads7 已有正面样例）、`app/pipeline/extract.py::_apply_extraction`（版本栅栏 + 锁内 now）、`app/jobs/queue.py::finalize_claim`（锁内读值判定）、`app/pipeline/memory_sync.py::_mark_memory_status`（置位事务内原子租约复核，INV-5/6）。
+**全仓锁点核查表**（threads9 A 类全仓清扫；「锁点」= 存在等待窗口的写路径，逐点核查锁后用于决策的派生值来源）：
+
+| 锁点 | 等待窗口 | 锁后派生值 | 结论 |
+| --- | --- | --- | --- |
+| auth.login 邀请码首用条件 UPDATE（抢占） | invite 行锁 | 无（WHERE 对行当前值原子判定） | 正面样例 |
+| auth.login 抢占输方重读（threads9 P1 修） | 同上（等待后输） | 过期判定的 `now` | **已修**：重读后重取 now |
+| auth.login device upsert → 签发/追加/修剪（threads9 P1 修） | device 行锁（PK 冲突串行化） | iat/exp、`_append_refresh_token` 的 created_at/prune 基线 | **已修**：`_token_pair` 与 now 都移到锁后；`last_seen` 陈旧为纯展示边界 |
+| auth.login device upsert rowcount==0 复查 | 同上 | 无时间判定（归属比较） | 正面样例（rollback 后重读，INV-12） |
+| auth.refresh（threads8 P1 修） | device 行锁 | 轮换/过期判定的 now、iat/exp、追加/修剪基线 | 正面样例：`_lock_device` 后重取 now、锁后签发 |
+| auth._revoke_device_for_reuse（threads7 修） | device 行锁 | 过期比较与写入的 utcnow | 正面样例：锁内取 |
+| auth.logout | 无等待窗口（session.get 无锁） | last_seen（纯展示） | 边界，注释论证 |
+| notes.patch_note / delete_note | note 条件 UPDATE（即锁） | 0 行复查无时间判定；`updated_at=utcnow()` 语句构造时求值 | 复查正面；时间戳为 INV-13 边界（纯展示） |
+| extract._apply_extraction（PG note FOR UPDATE） | note 行锁 | 提醒窗口判定的 now、timezone/recorded_at 快照 | 正面样例：锁内 now + rev 版本栅栏 |
+| memory_sync._mark_memory_status 置位事务 | job 行 FOR UPDATE | 租约复核（等值比较锁内行值，非时间派生） | 正面样例 |
+| queue.claim（PG FOR UPDATE SKIP LOCKED / SQLite 条件 UPDATE） | job 行锁 | `_lock_cutoff` 的 cutoff（循环外取） | 边界：方向保守（晚一轮回收，不错收/不错放），注释论证 |
+| queue.finalize_claim（PG job FOR UPDATE） | job 行锁 | `run_after = utcnow()+delay` | 正面样例：锁内取 |
+| db.init_db（pg_advisory_xact_lock） | 咨询锁 | 无业务派生值（create_all） | 不适用 |
+
+**边界（允许的例外，须注释论证）**：纯展示/时间戳用途的旧值（如 PATCH `.values(updated_at=utcnow())` 在语句构造时求值，陈旧 µs–ms 级、无决策依赖；device `last_seen` 无任何决策读它）；方向保守的判定（如 `_claim_postgres` 的 `cutoff = now - timeout` 在循环外取——陈旧只会让刚过期的租约晚一轮被回收，不会错回收/错放行）；无等待窗口的首个写（login 的 invite 条件 UPDATE 前 `now` 即取即用）。全仓各锁点的逐条核查记录见第八/九轮 sweep（`/workspace/.agent-tmp/sweep8.md` D 类、`sweep9.md` A 类）。
+
+**保证代码**：`app/api/auth.py::login`（`_resolve_lost_invite` 重读后重取 now；`_token_pair` 移到 device upsert 之后，threads9 P1）、`app/api/auth.py::refresh`（锁内重取 now；`_revoke_device_for_reuse` 的锁内 `utcnow()` 判过期为 threads7 已有正面样例）、`app/pipeline/extract.py::_apply_extraction`（版本栅栏 + 锁内 now）、`app/jobs/queue.py::finalize_claim`（锁内读值判定）、`app/pipeline/memory_sync.py::_mark_memory_status`（置位事务内原子租约复核，INV-5/6）。
 
 **验证测试**：
 - `test_refresh_token_expires_while_waiting_device_lock_401`（threads8 P1：可控时钟 + 注入等锁窗口，token 在窗口内跨过 expires_at → 401 unauthorized、行未轮换、设备未吊销）
+- `test_invite_expires_while_loser_waiting_claim_403`（threads9 P1：可控时钟推进 + 赢家在独立会话提交抢占（跨会话提交对 rollback 后的输方可见，与真实等锁等价），邀请码在等待窗口内跨过 expires_at → 403 invalid_invite、无凭证签发）
+- `test_login_mints_tokens_after_device_row_lock`（threads9 P1：钩子记录 device upsert 语句执行与 `_token_pair` 签发的先后，断言 upsert→mint；解码 access token 断言 exp−iat==TTL 且 refresh 可用）
 - 既有正面样例回归：`test_refresh_reuse_revoked_but_expired_401_no_revoke`（锁内 `utcnow()` 判过期的既有行为不变）
 
 ### INV-14 日志/数据库/错误响应不存异常原文与用户内容（threads8 P1，runner.py:71）
 
-**陈述**：**异常的消息文本与用户内容不得进入任何持久层或跨用户可见面**——worker/api 日志（`logger.*`、traceback、`exc_info`）、数据库错误字段（`jobs.last_error` 等）、500 错误响应体。异常只以**类型名 + 粗粒度错误码**记录（`app/errors.py::safe_error_summary` / `safe_error_text`：`{"type": "StatementError", "code": "db_statement"}`）。
+**陈述**：**异常的消息文本与用户内容不得进入任何持久层或跨用户可见面**——应用自身的日志（`logger.*`、traceback、`exc_info`）、数据库错误字段（`jobs.last_error` 等）、500 错误响应体，以及**框架层替应用打的日志与构建产物**（threads9 扩写，见下）。异常只以**类型名 + 粗粒度错误码**记录（`app/errors.py::safe_error_summary` / `safe_error_text`：`{"type": "StatementError", "code": "db_statement"}`）。
 
 **为什么不记「脱敏截断摘要」（有意决定，不是疏漏）**：评审原始诉求是 SQLAlchemy `StatementError` 的 `str(exc)` 默认内嵌 SQL 绑定参数——参数就是笔记正文/标题/待办/提醒文本这类**自然语言用户内容**；数字串/邮箱/URL/token 式的脱敏挡不住自由文本，任何长度的「截断摘要」都会把用户内容带进日志与 `jobs.last_error`。类型名 + 错误码足以定位失败类别（`timeout`/`db_statement`/`db_integrity`/`json_parse`/`internal`…），具体细节由可复现的测试或本地复跑获取。同理 `worker` 的常驻循环不用 `logger.exception`/`exc_info=True`（traceback 会带上异常消息原文）。
+
+**框架层（threads9 扩写）**——这些口子应用代码看不见，各自专门收口：
+
+1. **uvicorn access log（P1 docker-compose.yml:44）**：默认开启，请求行含完整 query——`GET /v1/search?q=<笔记正文>` 整行进 stdout（compose 日志收集面）。收口：compose 与 Dockerfile 的 uvicorn 命令一律 `--no-access-log`（`test_uvicorn_commands_disable_access_log` 机械锁定）；进程内保留请求级排障入口的是自有 `AccessLogMiddleware`（`app/middleware.py`）——只记 **method、路由模板（`scope["route"].path`，如 `/v1/notes/{note_id}`）、status、耗时**，不记 query、不记路径参数原值（未匹配路由记 `(unmatched)`）。
+2. **ServerErrorMiddleware 必 re-raise（P1 main.py:56）**：`add_exception_handler(Exception, …)` 只消毒**响应体**；Starlette 的 `ServerErrorMiddleware` 调完 handler 后总是 re-raise，原始异常与 traceback 进 uvicorn.error 日志（SQLAlchemy StatementError 的 str 内嵌 SQL 绑定参数）。收口：最外层用户中间件 `SafeErrorFallbackMiddleware`（纯 ASGI）捕获一切 `Exception` → 记一行 `safe_error_text` → 响应未开始则回固定 500 JSON、**永不 re-raise**（uvicorn 收不到异常，traceback 无从落日志）；响应已开始（流式半途，本仓无流式端点）同样不 re-raise——re-raise 只会换回「uvicorn 打整段 traceback」这条被禁路径。**有意不给 `uvicorn.error` 配 filter**：兜底中间件永不 re-raise 后该分支不可达，无异常可滤；全局 filter 会把基础设施异常（连接错误等，不含用户内容）的 traceback 也抹掉，缩小诊断面。
+3. **SQLAlchemy echo 的 URL query 向量**：全仓未传 `echo`，但 `create_async_engine` 会把 URL query 当引擎参数——`DATABASE_URL=…?echo=true` 静默开 echo，SQL+绑定参数整体进 sqlalchemy.engine 日志。收口：`app/config.py::_reject_sqlalchemy_echo`（任何环境）对 `make_url(database_url).query` 里真值的 `echo` 启动即 ValueError；排障需要 SQL 时本地临时改代码，不开配置口。
+4. **第三方 HTTP 客户端 logger**：httpx INFO 级打每个请求行、未来版本可能打请求细节（LLM 请求体含笔记正文）。收口：`app/logs.py::harden_third_party_loggers` 把 `httpx`、`httpcore`、`openai` 钉 >= WARNING；`create_app`（api）与 worker `main()`（basicConfig 之后）统一调用。**gunicorn**：本仓无（requirements 只有 `uvicorn[standard]`，compose/Dockerfile 直接 uvicorn）；将来引入时必须同查其 access/error logger 配置。
+5. **构建上下文也是泄漏面（P1 docker-compose.yml:21）**：compose 三个服务 `build: .` 而仓库曾无 `server/.dockerignore`——按 README 生产部署创建的 `server/.env`（JWT/LLM/PG 密钥）与本地 SQLite 笔记库会**整体发给 builder**（legacy/remote builder 都拿得到全量上下文，Dockerfile 不 COPY 也拦不住传输）。收口：`server/.dockerignore` 排除 `.env`/`.env.*`、`*.db`/`*.db-*`/`*.sqlite*`、`*.log`、`.venv/`/`venv/`、`__pycache__/`/`*.py[cod]`、各缓存目录、`tests/`、`.git/`；镜像只 COPY `requirements-app.txt` 与 `app/`（tests 不进镜像，测试锁定）。
 
 **边界（允许的回显，写明以防扩大化）**：
 
@@ -411,7 +446,7 @@ memory_sync(note_id)     不带 rev。短读事务取 note 当前状态 →（�
 - **管理员 CLI**：`python -m app.cli create-invite` 把新生成的邀请码打到 stdout——stdout 即交付渠道，不进日志/数据库/错误响应。
 - **500 响应体**：固定文案（`internal server error`），绝不回显异常文本。
 
-**保证代码**：`app/errors.py::safe_error_summary/safe_error_text`（唯一摘要出口）、`app/pipeline/runner.py`（日志与 `last_error` 只走摘要）、`app/jobs/worker.py`（常驻循环 `logger.error` + 摘要，无 traceback）、`app/errors.py::unhandled_exception_handler`（500 固定文案）、`app/errors.py::validation_exception_handler`（剔除 input/ctx）、机械检查 `scripts/check-invariants.py::INV-NO-RAW-EXC`。
+**保证代码**：`app/errors.py::safe_error_summary/safe_error_text`（唯一摘要出口）、`app/pipeline/runner.py`（日志与 `last_error` 只走摘要）、`app/jobs/worker.py`（常驻循环 `logger.error` + 摘要，无 traceback）、`app/errors.py::unhandled_exception_handler`（500 固定文案）、`app/errors.py::validation_exception_handler`（剔除 input/ctx）、`app/middleware.py::SafeErrorFallbackMiddleware`（最外层兜底、永不 re-raise）与 `AccessLogMiddleware`（模板级访问日志）、`app/logs.py::harden_third_party_loggers`（create_app 与 worker main 调用）、`app/config.py::_reject_sqlalchemy_echo`、`server/docker-compose.yml` 与 `server/Dockerfile`（`--no-access-log`）、`server/.dockerignore`、`app/main.py::create_app`（中间件挂载序：兜底兜在 NulReject/CORS 之外）、机械检查 `scripts/check-invariants.py::INV-NO-RAW-EXC`。
 
 **验证测试**：
 - `test_safe_error_summary_type_and_code_only`（消息含伪造密钥/笔记正文时 summary 只有 type/code）
@@ -419,6 +454,13 @@ memory_sync(note_id)     不带 rev。短读事务取 note 当前状态 →（�
 - `test_worker_loop_exception_logged_sanitized_no_traceback`（常驻循环异常 → 日志无原文、无 exc_info、循环不退出）
 - `test_500_response_body_contains_no_exception_text`（handler 抛含用户内容的异常 → 500 体为固定文案）
 - `test_validation_error_response_does_not_echo_input`（422 体不含请求正文原值）
+- `test_500_no_sentinel_in_any_logger_record`（threads9 P1：ASGITransport `raise_app_exceptions=False` 触发含哨兵的 500，caplog **所有** logger 的记录 message/args/exc_text 均不含哨兵，兜底日志只含类型名+错误码）
+- `test_500_real_uvicorn_no_raw_traceback_in_logs`（threads9 P1：真实 `uvicorn.Server` 起本地端口 + 真 HTTP 请求触发 500，uvicorn/uvicorn.error/root 全部捕获记录无哨兵、无 traceback）
+- `test_uvicorn_commands_disable_access_log`（threads9 P1：解析 compose command 与 Dockerfile CMD，每条 uvicorn 命令必须含 `--no-access-log`）
+- `test_access_log_records_template_only_no_query_or_path_values`（threads9：含哨兵的 `/v1/search?q=`、带路径参数值的 GET、未匹配路由 → 访问日志只出现路由模板，不出现 query 值与路径原值）
+- `test_dockerignore_excludes_secrets_and_local_data`（threads9 P1：.dockerignore 存在且含密钥/本地库/venv/缓存/tests 模式；Dockerfile COPY 只带 requirements-app.txt 与 app/）
+- `test_database_url_echo_query_rejected`（threads9：`?echo=true` 启动即拒，任何环境；`?echo=false`/无参数放行）
+- `test_third_party_http_loggers_pinned_to_warning`（threads9：先降级 DEBUG，`create_app()` 后 httpx/httpcore/openai 均 >= WARNING）
 - 既有 `test_first_llm_failure_leaves_no_side_effects` 的 last_error 断言随本条改为「含类型名且不含原文」
 
 ### INV-15 改源字段必须让派生字段失效（threads8 P1，notes.py:215）
@@ -485,6 +527,13 @@ memory_sync(note_id)     不带 rev。短读事务取 note 当前状态 →（�
 | LLM 字符串硬化（threads8 P2，extract.py:120） | `_clean_llm_str` 剥 NUL、C0（留 `\t\n`）、DEL、孤立代理对；剥后为空的条目整条丢弃 | 按 422 拒绝整次抽取：LLM 输出不是用户请求，无通道回显错误，剥字符即可救回；不处理：PG text/JSON 编码失败 → 确定性重试耗尽 → 有效笔记被标 failed |
 | 数值配置为正（threads8 P2，config.py:99） | `_require_positive_numeric_settings`：启动时列出**全部**非正数值字段并报错 | 逐字段零散校验：报错只暴露第一个；运行时才暴露更糟——`WORKER_BATCH_SIZE=0` 时 worker 日志一切正常但循环体永不执行 |
 | MockLLM 相对时间上界（threads8 P2，mock.py:78） | `_safe_relative`：timedelta 构造溢出或结果越出 `utc_safe_datetime` 界 → 该提醒不出（返回 None） | 直接构造 timedelta：`999999999999999999分钟后` OverflowError → 确定性失败 → 有效笔记被标 failed；上界与请求侧/抽取侧共用同一安全界 |
+| MockLLM 十进制位数上界（threads9 P2，mock.py:49） | `_cn_to_int` 限 ≤6 位 + 捕获 ValueError/OverflowError（超长数量无提醒） | 正则限位 `[0-9]{1,6}`：超长数字串的末 6 位仍匹配「分钟后」，5000 位数被错当 999999 分钟；不处理：CPython int() 约 4300 位上限 → ValueError 上抛 → 确定性重试耗尽 → 有效笔记被标 failed |
+| login 锁前签发（threads9 P1，auth.py:248） | `_token_pair` 移到 device upsert 之后，锁后重取 now 供签发与追加（与 refresh 同序） | 保持锁前签发：短 TTL + 长等锁 → 返回的 access token 到手即过期；两条 auth 路径签发时序不一致本身就是缺陷信号 |
+| 邀请码输方的过期判定（threads9 P1，auth.py:240） | 重读之后重取 now 再判 expires_at（INV-13） | 沿用等锁前 now：等待期间跨过 expires_at 的邀请被输方接受并登录赢家账号——同一时刻起的全新登录反而 403 |
+| 未处理异常的框架层去向（threads9 P1，main.py:56） | 最外层纯 ASGI 兜底中间件：记 `safe_error_text`、回固定 500、**永不 re-raise**（uvicorn 收不到异常） | 只依赖 `Exception` handler：ServerErrorMiddleware 调完 handler 总是 re-raise，原始 traceback 进 uvicorn.error；给 uvicorn.error 配 filter：该分支已不可达，且会连基础设施异常的诊断 traceback 一起抹掉 |
+| access log 形态（threads9 P1，docker-compose.yml:44） | uvicorn `--no-access-log`（compose+Dockerfile）+ 自有 `AccessLogMiddleware` 只记 method/路由模板/status/耗时 | 保留 uvicorn access log 并 redact：请求行格式不受应用控制（query 之外还有路径参数原值）；完全不要访问日志：进程内再无请求级排障入口（哪个接口慢/多少 5xx） |
+| 第三方 logger 级别（threads9） | `app/logs.py::harden_third_party_loggers` 钉 httpx/httpcore/openai >= WARNING，create_app 与 worker main 统一调用 | 不设置：级别随部署环境默认漂移，库升级把请求细节（LLM 请求体含笔记正文）打进日志时无防线 |
+| 构建上下文（threads9 P1，docker-compose.yml:21） | `server/.dockerignore` 排除 .env/本地库/venv/缓存/tests；镜像只 COPY requirements-app.txt 与 app/ | 只依赖 Dockerfile COPY 白名单：上下文在 COPY 之前整体（含 remote builder）传输，.env 与本地 SQLite 笔记库照样离机 |
 
 ## 3. 数据模型与迁移
 
@@ -519,6 +568,8 @@ memory_sync(note_id)     不带 rev。短读事务取 note 当前状态 →（�
 16. 新增/修改持锁写路径（FOR UPDATE / 条件 UPDATE / advisory lock）：对照 INV-13——等锁之前算好的派生值（now、状态、计数、rev、expires_at、活跃标记）不得在锁内沿用；锁内重取、由条件 UPDATE 原子判定或版本栅栏守护；方向保守的陈旧值必须注释论证（见 INV-13 边界）。
 17. 新增任何异常出口（日志、DB 错误字段、HTTP 错误响应）：只走 `app/errors.py::safe_error_summary`（类型名 + 错误码），不 `str(exc)` / `repr(exc)` / f-string 插值 / `exc_info=True` / `logger.exception`；跑 `scripts/check-invariants.py` 确认 INV-NO-RAW-EXC 0 报错 0 误报（INV-14）。
 18. 新增写源字段的接口（note text、recorded_at、timezone，含未来 sync push / 批量写）：对照 INV-15 源→派生映射表，同事务清派生 + 作废 suggested + 入队重算；改映射表本身时同步本表与验证测试。
+19. 部署/日志面改动（INV-14 框架层）：uvicorn 命令一律 `--no-access-log`（compose 与 Dockerfile 都要，`test_uvicorn_commands_disable_access_log` 锁定）；自有访问日志只记 method/路由模板/status/耗时；新增第三方客户端库时把其 logger 钉进 `app/logs.py::harden_third_party_loggers`（create_app 与 worker main 双入口）；构建上下文新增敏感/本地文件类型时同步 `server/.dockerignore`；`DATABASE_URL` 不得经 URL query 开 echo（config 启动即拒）。
+20. 新增等锁窗口的写路径（含把无锁路径改成条件 UPDATE/ON CONFLICT）：对照 INV-13 全仓锁点表补一行——锁后用于决策的每个派生值（now、计数、过期判定、iat/exp）标注来源（锁内重取/原子判定/版本栅栏/边界论证）。
 
 ## 5. 测试计划汇总（INV ↔ 计划测试名 ↔ 后端要求）
 
@@ -530,14 +581,14 @@ memory_sync(note_id)     不带 rev。短读事务取 note 当前状态 →（�
 | INV-4 | test_patch_and_delete_never_touch_memory_store_directly | 双后端 |
 | INV-5 | test_memory_sync_writes_memory_with_source_rev_and_marks_synced；test_memory_sync_on_deleted_note_removes_memory；test_memory_sync_on_unorganized_note_clears_stale_memory_without_add；test_memory_sync_requeues_and_deletes_only_own_ids_on_rev_change；test_memory_sync_converges_after_delete_during_add；test_memory_sync_recheck_fences_reclaimed_lease_deletes_own_ids；test_memory_sync_stalled_delete_by_note_past_lease_requeues_and_converges；test_memory_sync_lost_lease_delete_failure_still_requeues；test_memory_sync_rev_change_delete_failure_still_requeues；test_memory_sync_worker_killed_mid_run_reclaimed_converges；test_memory_sync_attempts_exhausted_marks_failed_only_without_newer_job；test_memory_sync_mark_status_skipped_when_lease_lost_before_update | 双后端语义；交错窗口用 DelayedAddStore 类时间注入复现（threads6 的停顿在 delete_by_note，同一手法），无需 PG |
 | INV-6 | test_stale_worker_finalize_ignored_after_lease_reclaimed_extract、test_stale_worker_finalize_ignored_after_lease_reclaimed_memory_sync；test_extract_finalize_marks_failed_only_at_enqueued_rev；test_memory_sync_finalize_failure_marks_memory_status_not_note_status；test_memory_sync_mark_status_skipped_when_lease_lost_before_update（置位原子租约复核） | 双后端 |
-| INV-7 | test_nul_in_path_param_422；test_nul_in_query_param_422；test_nul_middleware_covers_all_routes；test_lone_surrogate_in_body_rejected_422；test_invalid_utf8_body_rejected_4xx；test_deeply_nested_asr_over_depth_limit_422；test_absurdly_deep_body_recursion_guard_422；test_huge_int_inputs_422；test_extreme_datetime_inputs_422；test_aware_datetime_boundary_rejected_before_extraction_no_500；test_llm_boundary_fire_at_overflow_discarded；test_llm_output_unsafe_control_chars_stripped；test_parse_datetime_huge_relative_returns_none；test_mockllm_huge_relative_quantity_no_reminder_no_500 | 双后端 |
+| INV-7 | test_nul_in_path_param_422；test_nul_in_query_param_422；test_nul_middleware_covers_all_routes；test_lone_surrogate_in_body_rejected_422；test_invalid_utf8_body_rejected_4xx；test_deeply_nested_asr_over_depth_limit_422；test_absurdly_deep_body_recursion_guard_422；test_huge_int_inputs_422；test_extreme_datetime_inputs_422；test_aware_datetime_boundary_rejected_before_extraction_no_500；test_llm_boundary_fire_at_overflow_discarded；test_llm_output_unsafe_control_chars_stripped；test_parse_datetime_huge_relative_returns_none；test_mockllm_huge_relative_quantity_no_reminder_no_500；test_parse_datetime_overlong_digit_quantity_returns_none；test_mockllm_overlong_digit_quantity_no_reminder_no_500 | 双后端 |
 | INV-8 | test_login_device_bound_to_other_user_403；test_concurrent_login_same_device_all_returned_tokens_refreshable；test_concurrent_first_login_same_device_no_integrity_error；test_refresh_token_cap_evicts_oldest_keeps_current；test_refresh_rotation_revokes_only_rotated_token；test_logout_revokes_all_device_refresh_tokens；test_refresh_expired_token_rejected_401；test_refresh_race_row_deleted_while_waiting_device_lock_401_no_revoke；test_refresh_prunes_expired_rows_keeps_revoked_until_expiry；test_refresh_reuse_row_deleted_under_lock_401_no_revoke；test_refresh_reuse_revoked_but_expired_401_no_revoke | 并发项 PG 真并发；threads6/threads7 竞态项钩子注入两后端可跑 |
 | INV-9 | test_init_db_concurrent_no_error_pg；test_lifespan_skips_create_all_on_postgres；test_init_db_sqlite_creates_tables；test_compose_services_pass_startup_validation；test_compose_migrate_would_reject_full_settings_layering_is_real；test_init_db_does_not_load_full_settings | 并发项 PG；compose 项双后端（PyYAML 解析，无需 Docker） |
 | INV-10 | test_openai_missing_api_key_rejected、test_openai_missing_base_url_rejected、test_openai_missing_model_rejected；test_openai_all_three_configured_ok；test_default_timezone_invalid_rejected；test_default_timezone_valid_ok；test_worker_refuses_inmemory_with_postgres；test_get_memory_store_unknown_backend_raises；test_memory_backend_only_accepts_known_values、test_production_inmemory_rejection_mentions_mem0_backend_pr、test_production_disabled_memory_backend_ok；test_disabled_store_empty_contract、test_factory_returns_disabled_store、test_disabled_memory_sync_marks_synced、test_disabled_search_and_ask_return_empty_not_500；test_non_positive_numeric_settings_rejected | 纯配置，无 DB（disabled 三条走 client 夹具但只断言空结果）；mem0 相关用例随生产后端移至 feat/mem0-backend |
 | INV-11 | test_patch_unchanged_text_with_stale_rev_409 | 双后端 |
 | INV-12 | test_refresh_race_row_deleted_while_waiting_device_lock_401_no_revoke；test_concurrent_sixth_login_eviction_vs_refresh_no_device_revoke_pg；正面样例回归 test_concurrent_patch_same_rev_exactly_one_success、test_login_device_bound_to_other_user_403 | 竞态项 PG 真并发；钩子注入项双后端 |
-| INV-13 | test_refresh_token_expires_while_waiting_device_lock_401；正面样例回归 test_refresh_reuse_revoked_but_expired_401_no_revoke | 可控时钟 + `_lock_device` 钩子注入等锁窗口，双后端 |
-| INV-14 | test_safe_error_summary_type_and_code_only；test_job_exception_not_logged_nor_persisted_raw；test_worker_loop_exception_logged_sanitized_no_traceback；test_validation_error_response_does_not_echo_input；test_500_response_body_contains_no_exception_text；既有 test_first_llm_failure_leaves_no_side_effects 的 last_error 断言改为「含类型名且不含原文」 | 双后端；500 体断言用 `raise_app_exceptions=False` 的 ASGITransport |
+| INV-13 | test_refresh_token_expires_while_waiting_device_lock_401；test_invite_expires_while_loser_waiting_claim_403；test_login_mints_tokens_after_device_row_lock；正面样例回归 test_refresh_reuse_revoked_but_expired_401_no_revoke | 可控时钟 + 钩子注入等锁窗口（`_lock_device`/抢占输方重读/`_device_upsert`→`_token_pair` 顺序），双后端；PG 真并发版不做（定时窗口必抖动，钩子注入等价复现） |
+| INV-14 | test_safe_error_summary_type_and_code_only；test_job_exception_not_logged_nor_persisted_raw；test_worker_loop_exception_logged_sanitized_no_traceback；test_validation_error_response_does_not_echo_input；test_500_response_body_contains_no_exception_text；test_500_no_sentinel_in_any_logger_record；test_500_real_uvicorn_no_raw_traceback_in_logs；test_uvicorn_commands_disable_access_log；test_access_log_records_template_only_no_query_or_path_values；test_dockerignore_excludes_secrets_and_local_data；test_database_url_echo_query_rejected；test_third_party_http_loggers_pinned_to_warning；既有 test_first_llm_failure_leaves_no_side_effects 的 last_error 断言改为「含类型名且不含原文」 | 双后端；500 体断言用 `raise_app_exceptions=False` 的 ASGITransport；真实 uvicorn 项按 uvicorn 默认日志配置起本地 server（127.0.0.1:0）；compose/Dockerfile/config 项纯解析无需 Docker |
 | INV-15 | test_patch_clears_stale_extraction_fields；test_patch_unchanged_text_keeps_extraction_fields | 双后端 |
 
 既有测试的适配（第二步）：`organize_note`→`extract`、`cleanup_memory`→`memory_sync`、`memory_synced`→`memory_status` 断言改写；test_memory_failure_retries_backfill_only、test_cleanup_memory_job_skips_live_note、test_delete_during_memory_sync_does_not_resurrect 等旧测试按新模型语义迁移（收敛目标不变，断言落点改为 memory_sync）。

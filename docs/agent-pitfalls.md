@@ -1,6 +1,6 @@
 # Agent 反复踩的坑（server）
 
-> **事实来源**：服务端不变量以 [docs/server-invariants.md](server-invariants.md)（INV-1..INV-12，随 PR #2 落地，#2 head `a220dd4` 起已有）为准。与本文冲突时以它为准，并回来改本文。本文只收集“同一类问题被 Codex 反复提出”的模式和正反例，**不另立新的不变量**。
+> **事实来源**：服务端不变量以 [docs/server-invariants.md](server-invariants.md)（全部 INV，当前 INV-1..INV-15，随 PR #2 起逐轮扩写）为准。与本文冲突时以它为准，并回来改本文。本文只收集“同一类问题被 Codex 反复提出”的模式和正反例，**不另立新的不变量**。
 >
 > `scripts/check-invariants.py` 是 **best-effort 启发式，精确优先于召回**：只标少数高置信度的写法，不证明代码满足不变量。CI 里的 check 名是 **`Invariant Check (non-required)`**（独立的 `Invariants` workflow，不是必需检查）。
 > - 漏检按 `P2: defer — heuristic checker; PG concurrency tests + human/Codex review are the backstop` Resolve。
@@ -125,3 +125,49 @@ await s.execute(update(Note).where(Note.id == nid).values(change_seq=seq))
 ## 10. 并发相关的改动必须在 PG 上测（server-invariants.md §5 测试计划） <a id="pg"></a>
 
 SQLite 是单写者，行锁、SKIP LOCKED、快照隔离在 SQLite 上都“自动正确”。PR #2 里 sync 快照、回收卡死 job、收尾 rev 这三个 P1 都只在 PG 上成立。并发敏感的改动必须有能在 `PG Tests` job 中真正并发跑的测试，缺失按 P1 报。
+
+## 11. 异常原文与用户内容不落**任何**日志面（INV-14；机检 INV-NO-RAW-EXC） <a id="no-raw-exc"></a>
+
+应用代码里 `str(exc)` / f-string 插值 / `exc_info=True` 不进日志、DB 错误字段、错误响应——只记类型名 + 错误码（`app/errors.py::safe_error_text`）。**框架层同样会替你打日志**，这些口子应用代码看不见，必须专门收口（threads9 三个 P1 都出在这里）：
+
+```python
+# 错：消息文本可能内嵌 SQL 绑定参数（StatementError 的 str() 带笔记正文）或用户输入
+logger.error("organize failed: %s", exc)                    # str(exc) 整段进日志
+last_error = f"job failed: {exc}"                            # 原文落 jobs.last_error
+# 对：类型名 + 粗粒度错误码
+logger.error("organize failed: %s", safe_error_text(exc))
+job.last_error = safe_error_text(exc)
+```
+
+框架层的口子与收口：
+
+- **uvicorn access log**（默认开）：请求行含完整 query——`GET /v1/search?q=<笔记正文>` 整行进 stdout。收口：compose 与 Dockerfile 的 uvicorn 命令一律 `--no-access-log`；请求级日志用 `app/middleware.py::AccessLogMiddleware`，只记 method、路由模板、status、耗时，不记 query 与路径参数原值。
+- **ServerErrorMiddleware 必 re-raise**：注册 `Exception` handler 只消毒响应体，Starlette 调完 handler 后总是 re-raise，原始 traceback 进 uvicorn.error 日志。收口：最外层 `SafeErrorFallbackMiddleware` 吞掉异常——记 `safe_error_text`、回固定 500、**永不 re-raise**。
+- **SQLAlchemy echo / 第三方 logger**：`DATABASE_URL` 的 URL query 带 `echo=true` 会让引擎把 SQL+绑定参数打进 sqlalchemy.engine 日志（config 启动即拒）；httpx/httpcore/openai 的 logger 钉 >= WARNING（`app/logs.py::harden_third_party_loggers`，create_app 与 worker main 都要调）。
+- **构建上下文也是泄漏面**：无 `.dockerignore` 时 `server/.env`（密钥）与本地 SQLite 笔记库会整体发给 builder——Dockerfile 不 COPY 也拦不住上下文传输。
+
+机检 `INV-NO-RAW-EXC`：`except ... as e` 绑定的名字裸流进 logger 调用（含 `str(e)`/`repr(e)`/f-string 插值/`'%s' % e`/切片）、`logger.exception(...)`、`exc_info=<真值>`、或赋给 *error* 命名的属性（`last_error` 等）。`safe_error_text(e)` 这类 sanitizer 包装放行。
+
+## 12. 等锁之后重算派生值（INV-13） <a id="recompute-after-lock"></a>
+
+拿到锁才做的判定，不能用等锁**之前**算好的值。两个被 Codex 抓到的真实形态（threads9 P1，都在 auth.py 的 login）：
+
+```python
+# 错 1：邀请码抢占输方 rollback 重读后，仍拿等锁前的 now 判过期
+#       → 等待期间跨过 expires_at 的邀请被接受、登录赢家账号
+invite = await session.get(InviteCode, code)     # rollback 后重读，行值是新的
+if invite.expires_at <= now:                     # 错：now 是等锁前取的
+    raise ApiError(403, ...)
+# 对：重读之后重取
+now = utcnow()
+if invite.expires_at <= now: ...
+
+# 错 2：_token_pair 在 device upsert（行锁等待窗口）之前调用
+#       → 短 ACCESS_TOKEN_TTL + 长等锁，返回的 access token 到手即过期
+result = _token_pair(user_id, device_id)         # iat/exp 在锁前定下
+await session.execute(_device_upsert(...))       # 在这里等锁
+# 对：先 upsert（锁落定 + rowcount 复查），再 now = utcnow()、再 _token_pair、
+#     再 _append_refresh_token（refresh 路径一直是这个顺序）
+```
+
+排查手法：`rg "with_for_update|pg_advisory|on_conflict|rowcount" server/app` 列出全部等待窗口，逐点问「锁后用于决策的 now / 计数 / 过期判定 / iat·exp，是锁内取的还是等锁前的？」纯展示时间戳与方向保守的判定可以豁免但必须注释论证；全仓锁点表见 server-invariants.md INV-13。

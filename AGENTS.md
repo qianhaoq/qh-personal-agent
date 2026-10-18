@@ -35,7 +35,7 @@
 ## 改 server 前必读 / 自检清单
 
 改 `server/` 之前（含修 review 意见），先读完以下两份：
-- [docs/server-invariants.md](docs/server-invariants.md)：服务端不变量 INV-1..INV-12，事实来源（随 PR #2 落地）；冲突时以它为准。
+- [docs/server-invariants.md](docs/server-invariants.md)：服务端不变量（全部 INV，当前 INV-1..INV-15，随 PR #2 起逐轮扩写）；冲突时以它为准。
 - [docs/agent-pitfalls.md](docs/agent-pitfalls.md)：反复踩的坑和正反例。
 
 关键不变量速记（只是索引，细节与例外以 docs/server-invariants.md 对应条目为准）：
@@ -47,8 +47,8 @@
 - **INV-10 配置校验**：启动即校验，缺配置直接报错；数值配置（TTL/超时/批量/重试/上限）必须为正；生产（postgresql）不得隐式退化到 mock，`MEMORY_BACKEND ∈ {inmemory, disabled}`，生产后端 mem0 随 feat/mem0-backend（#6）落地。
 - **INV-11 乐观锁 / rev**：rev 比较在任何提前返回之前、在锁或条件更新里原子完成；内容不变的快路径也要先校验 rev，过期 rev 一律 409。
 - **INV-12 0 行归因**：条件 UPDATE/DELETE 匹配 0 行后必须重读当前状态再定原因（或在注释里写因果封闭论证），不得猜成重放 / 冲突 / 已删除。
-- **INV-13 锁内重算**：等锁之前算好的派生值（now、状态、计数、rev、expires_at）不得在拿到锁之后沿用；锁内重取、条件 UPDATE 对行当前值原子判定、或版本栅栏守护。
-- **INV-14 异常不落原文**：日志 / `jobs.last_error` / 错误响应只记异常类型名 + 错误码（`app/errors.py::safe_error_summary`），不记消息文本与 traceback；422 不回显 input/ctx；静态检查 INV-NO-RAW-EXC。
+- **INV-13 锁内重算**：等锁之前算好的派生值（now、状态、计数、rev、expires_at）不得在拿到锁之后沿用；锁内重取、条件 UPDATE 对行当前值原子判定、或版本栅栏守护；凭证签发（iat/exp）与 0 行复查后的时间判定都在行锁落定之后（全仓锁点表见文档）。
+- **INV-14 异常不落原文**：日志 / `jobs.last_error` / 错误响应只记异常类型名 + 错误码（`app/errors.py::safe_error_summary`），不记消息文本与 traceback；422 不回显 input/ctx；**框架层同禁**——uvicorn 命令一律 `--no-access-log`（query 不落日志）、未处理异常由最外层兜底中间件吞掉不 re-raise 给 uvicorn、`DATABASE_URL` 不得经 URL query 开 SQLAlchemy echo、httpx/httpcore/openai logger 钉 >= WARNING、构建上下文不含 `.env`/本地库（`server/.dockerignore`）；静态检查 INV-NO-RAW-EXC。
 - **INV-15 源字段变更失效派生**：改 `note.text` 必须同事务清 title/tags/todos、置 `status='uploaded'`、作废 suggested reminders、入队 extract + memory_sync；源→派生映射表见文档。
 
 提交前逐条自检：
@@ -63,7 +63,7 @@
 
 Codex / 评审 bot 评审本仓 PR 时：
 
-- 以 docs/server-invariants.md（INV-1..INV-12，随 #2 落地）为准检查 server 改动。发现违反时注明 INV 编号，并检查同一类模式在 diff 之外是否还有。
+- 以 docs/server-invariants.md（全部 INV，当前 INV-1..INV-15，随 #2 起逐轮扩写）为准检查 server 改动。发现违反时注明 INV 编号，并检查同一类模式在 diff 之外是否还有。
 - 重点看 docs/agent-pitfalls.md 的高发类别。
 - 分级口径与 .github/copilot-instructions.md 一致：
   - CI 红灯为 P1（造成生产事故时才算 P0）；
