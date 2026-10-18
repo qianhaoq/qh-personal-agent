@@ -86,6 +86,7 @@ docker compose exec api python -m app.cli create-invite
 | `JWT_SECRET` | HS256 签名密钥：>=32 字节随机值的编码。生成任选其一：`python -c "import secrets;print(secrets.token_urlsafe(48))"`、`openssl rand -hex 32`。生产（postgresql）启动时校验：hex 需 >=64 字符，或 base64/base64url（允许无 padding）解码 >=32 字节且解码后 >=16 种字节取值；占位值与人类可读口令（含 secret/password 字样、无法解码的字符串）会被拒绝 |
 | `LLM_PROVIDER` | `mock`（默认，确定性规则）或 `openai`（OpenAI 兼容接口）。只接受这两个值，拼错启动即报错；生产（postgresql）配 `mock` 或 `openai` 缺 `LLM_API_KEY` 都拒绝启动（不静默回落 MockLLM），跑 PG 测试套件可设 `ALLOW_MOCK_LLM_IN_PROD=true` 放行 |
 | `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | DeepSeek 示例 `https://api.deepseek.com`；腾讯混元 OpenAI 兼容地址示例见 `.env.example`。**地址与型号需按官网核实** |
+| `LLM_RESPONSE_FORMAT` | 结构化输出的 response_format 协商：`auto`（默认：先发 `json_schema`，供应商以 400 拒绝时自动回落 `json_object` 并在进程内记住）/ `json_schema`（只发 `json_schema`，不支持即报错、不回落）/ `json_object`（只发 `json_object`，JSON Schema 说明写进 system 消息）。DeepSeek 只支持 `json_object`——用 `auto` 或显式 `json_object` |
 | `MEMORY_BACKEND` | `inmemory`（默认，仅单进程开发/测试）/`disabled`（显式关闭记忆）/`mem0`（生产，pgvector）。只接受这三个值，未知值启动即报错。`mem0` 需先 `pip install -r requirements-mem0.txt`（Docker 已装），否则启动拒绝（INV-10.3）。生产（postgresql）配 `inmemory` 会拒绝启动；仅单进程 PG 测试可设 `ALLOW_INMEMORY_IN_TESTS=true`（**独立 worker 无论该标志都拒绝 inmemory+PG**）。embedding 可用 `MEM0_EMBEDDING_*`（API_KEY 缺省回落 `LLM_API_KEY`） |
 | `ENABLE_DOCS` | 默认 `false`：`/docs`、`/redoc`、`/openapi.json` 不暴露；本地开发设 `true` |
 | `LOG_LEVEL` | 默认 `info`（worker 进程的 basicConfig） |
@@ -116,7 +117,7 @@ docker compose exec api python -m app.cli create-invite
 - **删除笔记后重放同一 `client_note_id`**：返回已软删笔记的 id 与状态（幂等语义优先），不会新建。
 - **生产记忆**：`MEMORY_BACKEND=mem0`；检索打分（时间衰减、类型权重）可后续增强，当前为 mem0 默认语义检索。
 - **spec 第 5 节的 reminders/memories/profile/me 等端点**未包含在本任务范围内，S1 骨架只实现列出的接口。
-- **`json_schema` 响应格式**：OpenAI 兼容客户端发送 `response_format=json_schema`，个别供应商可能只支持 `json_object`，需要按所选供应商调整（`app/llm/openai_compat.py`）。
+- **`response_format` 供应商兼容**：结构化抽取默认发 `response_format=json_schema`；个别供应商（如 DeepSeek）只支持 `json_object`——`LLM_RESPONSE_FORMAT=auto`（默认）会在收到 400「不支持该 response_format」时自动回落 `json_object`（JSON Schema 说明写进 system 消息）并把决定缓存在进程内，也可用 `LLM_RESPONSE_FORMAT=json_object` 显式固定。
 
 ## 安全说明
 

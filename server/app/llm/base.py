@@ -61,6 +61,7 @@ async def get_llm_client() -> LLMClient:
             api_key=settings.llm_api_key,
             model=settings.llm_model,
             timeout=settings.llm_timeout_seconds,
+            response_format_mode=settings.llm_response_format,
         )
     # mock：生产下 config 已在启动时拒绝；这里再挡一层绕过启动校验的场景
     if settings.database_url.startswith("postgresql") and not settings.allow_mock_llm_in_prod:

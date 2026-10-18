@@ -133,6 +133,13 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_model: str = ""
     llm_timeout_seconds: float = 15.0
+    # 结构化输出的 response_format 协商方式（只接受这三个值，拼错启动即报错）：
+    # - auto（默认）：先发 json_schema；供应商以 400 明确拒绝该类型时改用
+    #   json_object 重试一次，并把决定缓存在进程内（之后直接 json_object）
+    # - json_schema：只发 json_schema，供应商不支持时直接报错（不回落）
+    # - json_object：只发 json_object，JSON Schema 说明写进 system 消息
+    #   （DeepSeek 等只支持 json_object 的供应商用它，或直接用 auto）
+    llm_response_format: Literal["auto", "json_schema", "json_object"] = "auto"
     # 仅测试用：生产（postgresql）+ mock 默认拒绝启动（假整理/假问答），
     # 跑 PG 测试套件的 CI/本地环境显式置 true 放行（生产环境不要设置）
     allow_mock_llm_in_prod: bool = False
