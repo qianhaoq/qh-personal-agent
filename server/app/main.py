@@ -41,6 +41,9 @@ def create_app() -> FastAPI:
       全部接口面（含鉴权细节）公开给扫描器）；本地开发设 true 查看；
     - CORS_ALLOW_ORIGINS 为空时不挂 CORS 中间件：原生 App 不走浏览器
       跨域，默认多开一个来源就多一分配置出错的面。
+
+    一切注册（路由含 /healthz 探针、中间件、exception handler、lifespan）
+    都在本工厂内完成（INV-17，threads13）；模块级只保留 `app = create_app()`。
     """
     settings = get_settings()
     docs_enabled = settings.enable_docs
@@ -97,30 +100,34 @@ def create_app() -> FastAPI:
     # 第三方 HTTP 客户端库的 logger 钉 >= WARNING（INV-14 框架层，threads9）；
     # worker 进程在 app/jobs/worker.py 的 basicConfig 之后另行调用
     harden_third_party_loggers()
+
+    # 探针（threads13 P1 / INV-17，main.py:106）：/healthz 必须在工厂内注册
+    # ——此前挂在模块级 singleton 上（`app = create_app()` 之后的装饰器），
+    # create_app() 返回时装饰器尚未执行，uvicorn --factory 或测试用工厂
+    # 另建的 app 只有 404，而其余路由齐全
+    @app.get("/healthz", tags=["health"])
+    async def healthz():
+        from fastapi.responses import JSONResponse
+        from sqlalchemy import text
+
+        from app.db import get_engine
+
+        db_ok = True
+        try:
+            async with get_engine().connect() as conn:
+                await conn.execute(text("SELECT 1"))
+        except Exception:  # noqa: BLE001 健康检查必须兜住一切异常，返回降级状态而不是 500
+            db_ok = False
+        body = {"ok": db_ok, "db": db_ok, "llm": _llm_status()}
+        if not db_ok:
+            # 依赖数据库健康检查的负载均衡器据此摘除实例
+            return JSONResponse(status_code=503, content=body)
+        return body
+
     return app
 
 
 app = create_app()
-
-
-@app.get("/healthz", tags=["health"])
-async def healthz():
-    from fastapi.responses import JSONResponse
-    from sqlalchemy import text
-
-    from app.db import get_engine
-
-    db_ok = True
-    try:
-        async with get_engine().connect() as conn:
-            await conn.execute(text("SELECT 1"))
-    except Exception:  # noqa: BLE001 健康检查必须兜住一切异常，返回降级状态而不是 500
-        db_ok = False
-    body = {"ok": db_ok, "db": db_ok, "llm": _llm_status()}
-    if not db_ok:
-        # 依赖数据库健康检查的负载均衡器据此摘除实例
-        return JSONResponse(status_code=503, content=body)
-    return body
 
 
 def _llm_status() -> str:

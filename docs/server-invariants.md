@@ -545,6 +545,16 @@ fence 模型（`credential_generation` 整型代际，两表各一列、默认 0
 - `test_settings_builds_pg_url_from_pg_env_vars`（PG* 进构造 kwargs / 环境变量 → `database_url` 为拼出的 PG URL；显式 DATABASE_URL 设置时 PG* 被忽略）
 - `test_compose_pg_env_password_encoded_in_database_url`（PyYAML 解析 compose + 含分隔符的假密码走真实 `DbSettings`/`Settings` 构造，`make_url` 取回 userinfo 正确、host/port/db 符合 compose 拓扑；全程不打印密码）
 
+### INV-17 应用工厂完整性：一切注册都在 create_app 内（threads13 P1，main.py:106）
+
+**陈述**：所有路由（含 `/healthz` 这类探针）、中间件、exception handler、lifespan 钩子必须注册在 `create_app()` 工厂**内部**；模块级只保留 `app = create_app()` 这一行。挂在模块级 singleton 上的路由（`@app.get(...)` 写在模块顶层、位于 `app = create_app()` **之后**）只存在于那一个实例：`create_app()` 返回时装饰器尚未执行，`uvicorn app.main:create_app --factory`、测试或任何二次构建用工厂另建的 app 对该路由是 404——而其余路由齐全。探针缺失的失败形态尤其隐蔽：负载均衡器摘除一切「健康」实例，或滚动发布时新实例被误判死亡。
+
+**保证代码**：`app/main.py::create_app`（/healthz 探针、全部 APIRouter、中间件、exception handler、lifespan 的唯一注册点；模块级仅 `app = create_app()`）。
+
+**验证测试**：
+- `test_healthz_registered_on_factory_created_app`（threads13：工厂另建 app GET /healthz → 200；此前 404）
+- `test_factory_and_module_apps_expose_identical_routes`（类扫：模块级 app 与 `create_app()` 另建 app 的 (path, methods) 路由面完全一致，且模块级 app 含 /healthz——未来任何「挂在模块级 singleton」上的路由在这里掉出来）
+
 ---
 
 ## 2. 为什么选这个模型 / 替代方案
@@ -636,6 +646,7 @@ fence 模型（`credential_generation` 整型代际，两表各一列、默认 0
 21. 新增校验失败出口（INV-14）：schemas 校验器与 HTTP 错误的 msg 一律固定文案，不插值用户输入原值（`input`/`ctx` 之外 msg 本身也要干净）；启动校验异常只经 `app/config.py::ConfigError` 边界出口（只含字段位置与校验文案），不直接上抛 pydantic ValidationError——其 `input_value` repr 可含密钥明文，且发生在中间件挂载之前。
 22. 新增把密钥/密码拼进 URL 的代码（compose 插值、脚本、文档启动示例、未来 REDIS_URL/DSN 类）：对照 INV-16——优先分项环境变量 + 应用侧 `postgres_url_from_env` 拼接；必须拼时 userinfo 先 `quote(x, safe="")`；密码不进日志/错误消息。
 23. 改动设备吊销/复活/凭证签发路径：对照 INV-8 陈述 4——代只在吊销与真复活（revoked_at 非空的 upsert）时 +1；新签发的 access `gen` claim 与 refresh 行携带当前代；`get_auth`/refresh 的代校验不一致一律普通 401（不轮换、不吊销）。
+24. 新增路由/中间件/exception handler/startup-shutdown 钩子（含 `/healthz` 这类探针）：一律注册进 `create_app()` 工厂内，模块级只留 `app = create_app()`（INV-17）——挂在模块级 singleton 上的路由对 `uvicorn --factory`/另建的 app 是 404；`test_factory_and_module_apps_expose_identical_routes` 机械比对两 app 的路由面。
 
 ## 5. 测试计划汇总（INV ↔ 计划测试名 ↔ 后端要求）
 
@@ -657,5 +668,6 @@ fence 模型（`credential_generation` 整型代际，两表各一列、默认 0
 | INV-14 | test_safe_error_summary_type_and_code_only；test_job_exception_not_logged_nor_persisted_raw；test_worker_loop_exception_logged_sanitized_no_traceback；test_validation_error_response_does_not_echo_input；test_422_fixed_message_does_not_echo_timezone_value（threads10）；test_500_response_body_contains_no_exception_text；test_500_no_sentinel_in_any_logger_record；test_500_real_uvicorn_no_raw_traceback_in_logs；test_get_settings_validation_failure_does_not_leak_secret_values（threads10）；test_uvicorn_commands_disable_access_log；test_readme_documented_uvicorn_command_disables_access_log（threads10）；test_access_log_records_template_only_no_query_or_path_values；test_dockerignore_excludes_secrets_and_local_data；test_gitignore_excludes_sqlite_and_sidecar_files（threads12）；test_database_url_echo_query_rejected；test_third_party_http_loggers_pinned_to_warning；既有 test_first_llm_failure_leaves_no_side_effects 的 last_error 断言改为「含类型名且不含原文」 | 双后端；500 体断言用 `raise_app_exceptions=False` 的 ASGITransport；真实 uvicorn 项按 uvicorn 默认日志配置起本地 server（127.0.0.1:0）；compose/Dockerfile/config 项纯解析无需 Docker |
 | INV-15 | test_patch_clears_stale_extraction_fields；test_patch_unchanged_text_keeps_extraction_fields | 双后端 |
 | INV-16 | test_postgres_url_from_env_encodes_password_special_chars；test_settings_builds_pg_url_from_pg_env_vars；test_compose_pg_env_password_encoded_in_database_url | 纯配置/解析，无 DB（compose 项 PyYAML 解析，无需 Docker） |
+| INV-17 | test_healthz_registered_on_factory_created_app；test_factory_and_module_apps_expose_identical_routes | 双后端（探针 GET 走 _fresh_env 建好的库） |
 
 既有测试的适配（第二步）：`organize_note`→`extract`、`cleanup_memory`→`memory_sync`、`memory_synced`→`memory_status` 断言改写；test_memory_failure_retries_backfill_only、test_cleanup_memory_job_skips_live_note、test_delete_during_memory_sync_does_not_resurrect 等旧测试按新模型语义迁移（收敛目标不变，断言落点改为 memory_sync）。

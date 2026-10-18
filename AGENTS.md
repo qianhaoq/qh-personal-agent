@@ -35,7 +35,7 @@
 ## 改 server 前必读 / 自检清单
 
 改 `server/` 之前（含修 review 意见），先读完以下两份：
-- [docs/server-invariants.md](docs/server-invariants.md)：服务端不变量（全部 INV，当前 INV-1..INV-16，随 PR #2 起逐轮扩写）；冲突时以它为准。
+- [docs/server-invariants.md](docs/server-invariants.md)：服务端不变量（全部 INV，当前 INV-1..INV-17，随 PR #2 起逐轮扩写）；冲突时以它为准。
 - [docs/agent-pitfalls.md](docs/agent-pitfalls.md)：反复踩的坑和正反例。
 
 关键不变量速记（只是索引，细节与例外以 docs/server-invariants.md 对应条目为准）：
@@ -51,6 +51,7 @@
 - **INV-14 异常不落原文**：日志 / `jobs.last_error` / 错误响应只记异常类型名 + 错误码（`app/errors.py::safe_error_summary`），不记消息文本与 traceback；422 不回显 input/ctx，**msg 本身也不得插值用户输入原值**（校验器固定文案）；启动校验失败只经 `app/config.py::ConfigError` 边界出口（只含字段位置与校验文案，不含配置原值——pydantic ValidationError 的 `input_value` repr 会带密钥明文）；**框架层同禁**——uvicorn 命令一律 `--no-access-log`（compose/Dockerfile/**README 文档示例**同口径）、未处理异常由最外层兜底中间件吞掉不 re-raise 给 uvicorn、`DATABASE_URL` 不得经 URL query 开 SQLAlchemy echo、httpx/httpcore/openai logger 钉 >= WARNING、构建上下文与 git 都不含 `.env`/本地库（`server/.dockerignore` 与 `server/.gitignore` 的 sqlite/db 模式**对齐**，含 `*.sqlite3-*` 等 sidecar）；静态检查 INV-NO-RAW-EXC。
 - **INV-15 源字段变更失效派生**：改 `note.text` 必须同事务清 title/tags/todos、置 `status='uploaded'`、作废 suggested reminders、入队 extract + memory_sync；源→派生映射表见文档。
 - **INV-16 密钥进 URL 必 encode**：密码/密钥拼进任何连接 URL（DATABASE_URL/REDIS_URL/DSN，含 compose 插值、脚本、文档示例）前必须 `quote(x, safe="")`（勿用 `quote_plus`：其 `+` 不被 make_url 解回空格）；优先分项环境变量（PGHOST/PGUSER/PGPASSWORD/…）+ 应用侧 `app/config.py::postgres_url_from_env` 拼接（唯一拼接点）；显式 `DATABASE_URL` 永远优先；密码不进日志/错误消息。
+- **INV-17 工厂完整注册**：一切路由（含 `/healthz` 探针）、中间件、exception handler、lifespan 都注册在 `create_app()` 内，模块级只留 `app = create_app()`——挂在模块级 singleton 上的路由对 `uvicorn --factory`/另建的 app 是 404。
 
 提交前逐条自检：
 
@@ -64,7 +65,7 @@
 
 Codex / 评审 bot 评审本仓 PR 时：
 
-- 以 docs/server-invariants.md（全部 INV，当前 INV-1..INV-16，随 #2 起逐轮扩写）为准检查 server 改动。发现违反时注明 INV 编号，并检查同一类模式在 diff 之外是否还有。
+- 以 docs/server-invariants.md（全部 INV，当前 INV-1..INV-17，随 #2 起逐轮扩写）为准检查 server 改动。发现违反时注明 INV 编号，并检查同一类模式在 diff 之外是否还有。
 - 重点看 docs/agent-pitfalls.md 的高发类别。
 - 分级口径与 .github/copilot-instructions.md 一致：
   - CI 红灯为 P1（造成生产事故时才算 P0）；
