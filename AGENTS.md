@@ -40,15 +40,15 @@
 
 关键不变量速记（只是索引，细节与例外以 docs/server-invariants.md 对应条目为准）：
 
-- **INV-1 锁序**：invite → user → device → refresh_tokens → note → reminders → jobs；业务行（含 job INSERT）显式 flush 后，`allocate_seq` 必须是提交前最后一把锁；事务内不调 LLM / mem0 / 外部网络。
+- **INV-1 锁序**：invite → user → device → refresh_tokens → note → reminders → jobs；业务行（含 job INSERT）显式 flush 后，`allocate_seq` 必须是提交前最后一把锁；claim 循环判死（`_fail_expired` 锁 note + sequences）后**先提交再找下一个候选**；事务内不调 LLM / mem0 / 外部网络。
 - **INV-6 租约收尾**：收尾带租约条件（`status='running' AND locked_by AND locked_at`）；丢租约的 worker 只删自己写的 memory id 并补偿再入队 memory_sync，**不得静默 return**（INV-5 第 3 步）。
-- **INV-7 输入硬化**：外部输入含 `\x00` 一律 422；病态输入（surrogate、超深 JSON、超大整数、越界时间）一律 4xx 不 500；时间（含 LLM 输出的 fire_at）统一用 `utc_safe_datetime` 的 ±14h 安全界。
-- **INV-8 登录/refresh**：device 单条原子 upsert；refresh token 存 `refresh_tokens` 表、每设备 ≤5 枚；轮换只作废被轮换的那一枚，重放已作废的 token 才吊销整台设备。
+- **INV-7 输入硬化**：外部输入含 `\x00` 一律 422；病态输入（surrogate、超深 JSON、超大整数、越界时间）一律 4xx 不 500；时间（含 LLM 输出的 fire_at）统一用 `utc_safe_datetime` 的 ±14h 安全界；MockLLM 解析的时钟时分秒必须落在时 0–23 / 分秒 0–59，越界不出提醒、不上抛。
+- **INV-8 登录/refresh**：device 单条原子 upsert；refresh token 存 `refresh_tokens` 表、每设备 ≤5 枚；轮换只作废被轮换的那一枚，重放已作废的 token 才吊销整台设备；logout 删 token 前必须先 `_lock_device`（device → refresh_tokens 锁序，DELETE 才能看到并发登录未提交的新行）。
 - **INV-10 配置校验**：启动即校验，缺配置直接报错；数值配置（TTL/超时/批量/重试/上限）必须为正；生产（postgresql）不得隐式退化到 mock，`MEMORY_BACKEND ∈ {inmemory, disabled}`，生产后端 mem0 随 feat/mem0-backend（#6）落地。
 - **INV-11 乐观锁 / rev**：rev 比较在任何提前返回之前、在锁或条件更新里原子完成；内容不变的快路径也要先校验 rev，过期 rev 一律 409。
 - **INV-12 0 行归因**：条件 UPDATE/DELETE 匹配 0 行后必须重读当前状态再定原因（或在注释里写因果封闭论证），不得猜成重放 / 冲突 / 已删除。
 - **INV-13 锁内重算**：等锁之前算好的派生值（now、状态、计数、rev、expires_at）不得在拿到锁之后沿用；锁内重取、条件 UPDATE 对行当前值原子判定、或版本栅栏守护；条件更新/claim **成功之后**仍须用成功时刻的 now 复验过期（rowcount=1 不代表谓词里的旧时间参数仍成立）；签发类时间戳（凭证 iat/exp、租约 locked_at）取写入时刻而非请求/循环起点（全仓锁点表见文档）。
-- **INV-14 异常不落原文**：日志 / `jobs.last_error` / 错误响应只记异常类型名 + 错误码（`app/errors.py::safe_error_summary`），不记消息文本与 traceback；422 不回显 input/ctx，**msg 本身也不得插值用户输入原值**（校验器固定文案）；启动校验失败只经 `app/config.py::ConfigError` 边界出口（只含字段位置与校验文案，不含配置原值——pydantic ValidationError 的 `input_value` repr 会带密钥明文）；**框架层同禁**——uvicorn 命令一律 `--no-access-log`（compose/Dockerfile/**README 文档示例**同口径）、未处理异常由最外层兜底中间件吞掉不 re-raise 给 uvicorn、`DATABASE_URL` 不得经 URL query 开 SQLAlchemy echo、httpx/httpcore/openai logger 钉 >= WARNING、构建上下文不含 `.env`/本地库（`server/.dockerignore`）；静态检查 INV-NO-RAW-EXC。
+- **INV-14 异常不落原文**：日志 / `jobs.last_error` / 错误响应只记异常类型名 + 错误码（`app/errors.py::safe_error_summary`），不记消息文本与 traceback；422 不回显 input/ctx，**msg 本身也不得插值用户输入原值**（校验器固定文案）；启动校验失败只经 `app/config.py::ConfigError` 边界出口（只含字段位置与校验文案，不含配置原值——pydantic ValidationError 的 `input_value` repr 会带密钥明文）；**框架层同禁**——uvicorn 命令一律 `--no-access-log`（compose/Dockerfile/**README 文档示例**同口径）、未处理异常由最外层兜底中间件吞掉不 re-raise 给 uvicorn、`DATABASE_URL` 不得经 URL query 开 SQLAlchemy echo、httpx/httpcore/openai logger 钉 >= WARNING、构建上下文不含 `.env`/本地库（`server/.dockerignore`，含 `*.sqlite3` 及其 sidecar）；静态检查 INV-NO-RAW-EXC。
 - **INV-15 源字段变更失效派生**：改 `note.text` 必须同事务清 title/tags/todos、置 `status='uploaded'`、作废 suggested reminders、入队 extract + memory_sync；源→派生映射表见文档。
 
 提交前逐条自检：

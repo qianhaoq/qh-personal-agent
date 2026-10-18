@@ -49,6 +49,17 @@ res = await session.execute(update(InviteCode)
 
 怎么被发现的：Codex 第 1、3、4、5 轮在 notes、auth 的不同函数里各提了一次。**修一个就把同类全修**：`rg "session.get\(|scalar_one_or_none" server/app` 逐个看有没有“读后写”。
 
+「读到行」不等于「锁到行」的子类（threads11 P1，auth.py:394 logout）：无锁普通读（`session.get(Device)`）只建立**快照**，不与并发写串行化——随后的 `DELETE FROM refresh_tokens` 沿用读时刻快照，看不到同设备并发 login/refresh **已插入未提交**的新 token 行，204 返回后新签发的 token 仍有效。删除/作废一批从属行之前，先按锁序取父行锁（`_lock_device`，device → refresh_tokens，INV-1/8），DELETE 才必然看到先行事务已提交的全部行。
+
+```python
+# 错：无锁读 + 快照内 DELETE，漏掉并发登录未提交的新行
+device = await session.get(Device, auth.device_id)
+await session.execute(delete(RefreshToken).where(RefreshToken.device_id == auth.device_id))
+# 对：先锁父行（PG FOR UPDATE），与同设备 login/refresh 串行化后再删
+device = await _lock_device(session, auth.device_id)
+await session.execute(delete(RefreshToken).where(RefreshToken.device_id == auth.device_id))
+```
+
 ## 2. Job 收尾带租约（INV-2、INV-6） <a id="jobs"></a>
 
 收尾必须带租约条件 `status='running' AND locked_by=:me AND locked_at=:claimed`，被换主的旧 worker 一律放弃收尾。判死条件是 `attempts >= max_attempts`（attempts 是已经用掉的次数），`max_attempts` 从配置读取。extract 与 memory_sync 两种 job 的收尾差异见 INV-6，本文不另作规定。
@@ -58,6 +69,8 @@ res = await session.execute(update(InviteCode)
 ## 3. 外部输入在边界校验（INV-7、INV-10；机检 INV-NUL） <a id="inv-nul"></a>
 
 所有外部字符串（body、query、path、header 派生值）都拒绝 `\x00`，在 schema 层返回 422。时区用 `ZoneInfo` 校验并限制长度。配置项（DEFAULT_TIMEZONE、LLM 配置、JWT 密钥）在启动时校验，不对就拒绝启动。
+
+确定性实现的内部解析面同一原则（threads8 数量上界、threads9 位数上界、threads11 时分秒范围）：MockLLM 这类**确定性**实现里，任何「解析外部自然语言」的分支（数量、位数、时钟时分秒）遇病态值一律返回 None（不出提醒/派生物），绝不让异常上抛——重试是确定性的，每次都炸，最后把本来有效的笔记标 failed。越界判定写在 `replace(hour=/minute=/second=)` 之前，而不是靠钳位把垃圾值圆成一条错误提醒（`min(hour, 23)` 会把「99点」当 23:00）。
 
 ```python
 # 错：/v1/notes/n%00x 触发 PG 编码错误，返回 500
@@ -113,6 +126,8 @@ await s.execute(update(Note).where(Note.id == nid).values(change_seq=seq))
 本规则只报**警告**，不会让 CI 失败（名字解析和顺序判断都是启发式）：
 - `allocate_seq` 嵌在 `update(...).values()` 里，且这个 `.values()` 还写了其他业务列。
 - 只按源码顺序判断、不做控制流分析：在调用 `allocate_seq(sess)` 的同一事务里，之后又出现同一 session 的 `sess.add/add_all/merge/delete/execute(DML)`（只写 change_seq/updated_at 的 UPDATE 除外）或 `enqueue(sess, …)`。遇到 `sess.commit()/rollback()` 或离开 `with … begin()` 块就停止检查。
+
+「之后又出现 DML」在循环里的形态（threads11 P1，queue.py:182）：claim 循环判死一个过期 job（`_fail_expired`：job → note → **allocate_seq**）后不提交、继续找下一个候选——同一事务里拿着 sequences 锁再去锁下一个 job/note，与并发 PATCH（先持 note 锁、正等 sequences）构成 AB-BA。**拿了 sequences 锁的事务就该去提交了**；循环里每完成一次「判死转移」立即 commit 再进下一轮。
 
 ## 8. sync：单快照 + 前缀 cursor（依赖 INV-1；无单独 INV） <a id="sync"></a>
 
