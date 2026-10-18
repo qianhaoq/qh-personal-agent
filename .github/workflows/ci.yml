@@ -31,7 +31,7 @@ jobs:
     uses: qianhaoq/devflow-gates/.github/workflows/ci.yml@88a9af464d5bcb9620231cf3be952b119c17b0e3  # devflow-gates main @ 88a9af4 (pinned; bump deliberately)
     with:
       runs_on: '["self-hosted", "linux", "x64"]'
-      python_version: '3.12'
+      python_version: ''  # self-hosted Debian: skip setup-python; python3.12 on PATH via uv
       setup_command: ''
       test_command: 'bash scripts/ci-test.sh'
       working_directory: '.'
