@@ -761,6 +761,140 @@ async def test_invite_claim_revalidates_expiry_after_claim_success_403(client, m
     assert device is None, "不签发凭证：无设备行"
 
 
+async def test_invite_expires_while_waiting_device_lock_403_no_token(
+    client, monkeypatch
+):
+    """threads14 P1 / INV-13（auth.py:334）：device upsert 等锁落定后、
+    `_token_pair` 签发前必须用**新 now** 复验 invite 过期——首用的 claim
+    后复验发生在随后的 device 等锁**之前**，等锁期间跨过 expires_at 的
+    邀请码旧实现照样发证。可控时钟在 upsert 执行处推过 expires_at（等待
+    窗口的等价注入），断言 403、claim/user/device 全部回滚、无凭证；
+    同样等待但时钟仍在有效期内的对照登录照常 200。"""
+    from datetime import UTC, datetime, timedelta
+
+    from app.api import auth as auth_api
+    from app.db import get_sessionmaker
+    from app.models import Device, InviteCode, RefreshToken, User
+
+    t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    expires = t0 + timedelta(seconds=5)
+    clock = {"now": t0}
+    monkeypatch.setattr(auth_api, "utcnow", lambda: clock["now"])
+
+    code = "inv_devlock_expiry"
+    async with get_sessionmaker()() as session:
+        session.add(
+            InviteCode(code=code, owner_user_id=None, used=0, max_uses=10, expires_at=expires)
+        )
+        await session.commit()
+
+    real_upsert = auth_api._device_upsert
+    # upsert 的 execute 是等待窗口本身：语句构造点把时钟推到「醒来时刻」
+    advance_to = {"now": expires + timedelta(seconds=1)}
+
+    def upsert_advances_clock(*args, **kwargs):
+        clock["now"] = advance_to["now"]
+        return real_upsert(*args, **kwargs)
+
+    monkeypatch.setattr(auth_api, "_device_upsert", upsert_advances_clock)
+
+    resp = await client.post(
+        "/v1/auth/login", json={"invite_code": code, "device_id": "dev_lock_expiry"}
+    )
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["error"]["code"] == "invalid_invite"
+
+    async with get_sessionmaker()() as session:
+        invite = await session.get(InviteCode, code)
+        users = (await session.execute(select(User))).scalars().all()
+        device = await session.get(Device, "dev_lock_expiry")
+        tokens = (
+            await session.execute(
+                select(RefreshToken).where(RefreshToken.device_id == "dev_lock_expiry")
+            )
+        ).scalars().all()
+    assert invite.owner_user_id is None, "回滚撤销本次 claim（owner 复位）"
+    assert invite.used == 0, "回滚撤销本次 claim（used 复位）"
+    assert users == [], "不得创建账号"
+    assert device is None, "回滚撤销 device upsert：无设备行"
+    assert tokens == [], "不签发任何凭证"
+
+    # 对照：同样的「等待消耗时间」但仍在有效期内 → 照常 200、凭证可用
+    clock["now"] = t0
+    advance_to["now"] = t0 + timedelta(seconds=2)
+    ok = await client.post(
+        "/v1/auth/login", json={"invite_code": code, "device_id": "dev_lock_ok"}
+    )
+    assert ok.status_code == 200, ok.text
+    refreshed = await client.post(
+        "/v1/auth/refresh", json={"refresh_token": ok.json()["refresh_token"]}
+    )
+    assert refreshed.status_code == 200, refreshed.text
+
+
+async def test_invite_expires_while_waiting_device_lock_existing_owner_403(
+    client, monkeypatch
+):
+    """threads14 P1 / INV-13（auth.py:334）既有 owner 路径：owner 已落定的
+    邀请码再登录（同设备再登——device 行锁真实存在的等待窗口），等锁期间
+    跨过 expires_at → 签发前复验 403，本次 upsert（last_seen/复活写）整体
+    回滚；已提交的首登凭证不受影响。"""
+    from datetime import timedelta
+
+    from app.api import auth as auth_api
+    from app.db import get_sessionmaker
+    from app.models import InviteCode, RefreshToken
+    from app.timeutil import utcnow
+
+    # 首登在真实时钟下完成：锚定到真实未来，保证预检时邀请码未过期
+    t0 = utcnow() + timedelta(hours=1)
+    expires = t0 + timedelta(hours=1)
+    clock = {"now": t0}
+
+    code = "inv_devlock_owner_expiry"
+    async with get_sessionmaker()() as session:
+        session.add(
+            InviteCode(code=code, owner_user_id=None, used=0, max_uses=10, expires_at=expires)
+        )
+        await session.commit()
+    # 真实时钟下先完成首登（owner 落定、设备行存在）
+    first = await client.post(
+        "/v1/auth/login", json={"invite_code": code, "device_id": "dev_owner_lock"}
+    )
+    assert first.status_code == 200, first.text
+    user_id = first.json()["user_id"]
+
+    monkeypatch.setattr(auth_api, "utcnow", lambda: clock["now"])
+    real_upsert = auth_api._device_upsert
+
+    def upsert_advances_clock(*args, **kwargs):
+        clock["now"] = expires + timedelta(seconds=1)
+        return real_upsert(*args, **kwargs)
+
+    monkeypatch.setattr(auth_api, "_device_upsert", upsert_advances_clock)
+
+    resp = await client.post(
+        "/v1/auth/login", json={"invite_code": code, "device_id": "dev_owner_lock"}
+    )
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["error"]["code"] == "invalid_invite"
+
+    async with get_sessionmaker()() as session:
+        rows = (
+            await session.execute(
+                select(RefreshToken).where(RefreshToken.device_id == "dev_owner_lock")
+            )
+        ).scalars().all()
+        invite = await session.get(InviteCode, code)
+    assert len(rows) == 1, "等锁跨过期的再登录不得追加 refresh 行"
+    assert invite.owner_user_id == user_id, "既有 owner 不受回滚影响"
+    # 首登提交的凭证不受本次回滚影响
+    refreshed = await client.post(
+        "/v1/auth/refresh", json={"refresh_token": first.json()["refresh_token"]}
+    )
+    assert refreshed.status_code == 200, refreshed.text
+
+
 async def test_login_mints_tokens_after_device_row_lock(client, invite_code, monkeypatch):
     """threads9 P1 / INV-13（auth.py:248）：_token_pair 必须在 device
     upsert 落定之后调用——upsert 的行/PK 锁是 login 最长的等待窗口

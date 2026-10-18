@@ -323,6 +323,22 @@ async def login(body: LoginRequest, session: AsyncSession = Depends(get_db_sessi
     # 追加行的 created_at/修剪判定；upsert 的 last_seen 用旧 now 是
     # 纯展示边界（无任何决策读它）
     now = utcnow()
+    # INV-13（threads14 P1，auth.py:334）：上面的全部 invite 过期判定——
+    # 入口预检、首用 claim 后复验、输方重读归因——用的都可能是等 device
+    # 行锁**之前**的时间；upsert 的行/PK 锁是签发前最后一个（也是最长的）
+    # 等待窗口，等待期间跨过 expires_at 的邀请码不得发证。锁落定后用新
+    # now 复验（标量列重读绕过 identity map，INV-12；与 claim 成功后复验、
+    # 输方重读后重取 now 同口径）：已过期 → 回滚本次登录事务（device
+    # upsert、首用 claim 连同账号创建一并撤销）并 403。首用与既有 owner
+    # 登录两条路径都走这里
+    invite_expires_at = (
+        await session.execute(
+            select(InviteCode.expires_at).where(InviteCode.code == body.invite_code)
+        )
+    ).scalar()
+    if invite_expires_at is not None and as_utc(invite_expires_at) <= now:
+        await session.rollback()
+        raise ApiError(403, "invalid_invite", "邀请码不存在或已过期")
     # upsert 落定后标量列重读当前代（同事务、同连接，读到的是本事务刚
     # 写入的值；标量列不走 identity map）。真复活时 upsert 已 +1——
     # 吊销前签发的旧凭证（gen 落后）从此被 fence 挡在外面
