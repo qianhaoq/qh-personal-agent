@@ -4,6 +4,7 @@ import logging
 
 from app.config import Settings, get_settings
 from app.db import startup_create_all
+from app.errors import safe_error_text
 from app.pipeline.runner import run_pending_jobs
 
 logging.basicConfig(
@@ -40,8 +41,11 @@ async def main() -> None:
             n = await run_pending_jobs(limit=settings.worker_batch_size)
             if n == 0:
                 await asyncio.sleep(settings.worker_poll_interval_seconds)
-        except Exception:  # 常驻进程不能退出：任何异常只记日志
-            logger.exception("worker loop error")
+        except Exception as exc:  # 常驻进程不能退出：任何异常只记日志
+            # INV-14（threads8 P1）：不用 logger.exception/exc_info=True——
+            # traceback 会带异常消息原文（可能内嵌笔记正文等用户内容），
+            # 只记类型名+错误码
+            logger.error("worker loop error: %s", safe_error_text(exc))
             await asyncio.sleep(settings.worker_poll_interval_seconds)
 
 

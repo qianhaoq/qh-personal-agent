@@ -7,6 +7,7 @@ from datetime import datetime
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.db import get_sessionmaker
+from app.errors import safe_error_text
 from app.jobs.queue import claim_next, finalize_claim, new_worker_id
 from app.timeutil import as_utc
 
@@ -67,8 +68,12 @@ async def run_pending_jobs(
         try:
             await execute_job(claimed.kind, claimed.payload, claim=claimed)
         except Exception as exc:  # noqa: BLE001 队列要兜住所有错误
-            logger.warning("job %s (%s) failed: %s", claimed.id, claimed.kind, exc)
-            await _finalize(maker, claimed, str(exc), retry_delay_seconds, me)
+            # INV-14（threads8 P1，runner.py:71）：异常消息可能内嵌用户内容
+            # （SQLAlchemy StatementError 的 str 默认带 SQL 绑定参数=笔记
+            # 正文），日志与 jobs.last_error 只记类型名+错误码
+            summary = safe_error_text(exc)
+            logger.warning("job %s (%s) failed: %s", claimed.id, claimed.kind, summary)
+            await _finalize(maker, claimed, summary, retry_delay_seconds, me)
             continue
 
         await _finalize(maker, claimed, None, retry_delay_seconds, me)

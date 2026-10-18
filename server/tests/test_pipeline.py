@@ -170,7 +170,9 @@ async def test_first_llm_failure_leaves_no_side_effects(client, user, monkeypatc
         assert job.status == "pending"
         assert job.attempts == 1
         assert job.note_rev == 1
-        assert "transient llm failure" in (job.last_error or "")
+        # INV-14（threads8 P1）：last_error 只记类型名+错误码，不落异常原文
+        assert "RuntimeError" in (job.last_error or "")
+        assert "transient llm failure" not in (job.last_error or "")
         # 抽取未成功：没有 memory_sync 被入队，也没有任何记忆
         memsync = (
             await session.execute(
