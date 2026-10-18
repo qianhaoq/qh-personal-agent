@@ -350,6 +350,68 @@ async def test_logout_revokes_all_device_refresh_tokens(client, invite_code):
         assert resp.json()["error"]["code"] == "unauthorized"
 
 
+@requires_postgres
+async def test_logout_waits_for_device_lock_then_deletes_concurrent_login_token(
+    client, user
+):
+    """threads11 P1 / INV-1/8（auth.py:394）：logout 删 refresh_tokens 前必须
+    先 _lock_device。模拟并发 login 的事务形态——持 device 行锁 + 已插入
+    **未提交**的新 token 行：无锁实现里 logout 的 DELETE 沿用读时刻快照，
+    看不到这枚新 token，204 返回后它仍有效；锁序实现下 logout 阻塞在
+    device 行锁上，login 提交后新 token 行被一并删除。"""
+    import asyncio
+
+    from app.auth.tokens import hash_refresh_token, new_refresh_token, refresh_expiry
+    from app.common import new_id
+    from app.db import get_sessionmaker
+    from app.models import Device, RefreshToken
+    from app.timeutil import utcnow
+
+    new_refresh = new_refresh_token()
+    device_id, user_id = user["device_id"], user["user_id"]
+    maker = get_sessionmaker()
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def login_txn_holds_device_lock():
+        # 并发 login 的等价事务：先锁 device 行（upsert 的行锁），随后
+        # 追加一枚新 refresh token 行，提交前挂起
+        async with maker() as session, session.begin():
+            await session.execute(
+                select(Device).where(Device.id == device_id).with_for_update()
+            )
+            session.add(
+                RefreshToken(
+                    id=new_id("rtk"),
+                    device_id=device_id,
+                    user_id=user_id,
+                    token_hash=hash_refresh_token(new_refresh),
+                    created_at=utcnow(),
+                    expires_at=refresh_expiry(),
+                )
+            )
+            entered.set()
+            await release.wait()
+        # 上下文退出即提交：新 token 行落库
+
+    holder = asyncio.create_task(login_txn_holds_device_lock())
+    await asyncio.wait_for(entered.wait(), timeout=5)
+
+    logout_task = asyncio.create_task(
+        client.post("/v1/auth/logout", headers=auth_headers(user))
+    )
+    await asyncio.sleep(0.3)
+    assert not logout_task.done(), "logout 应阻塞在并发 login 持有的 device 行锁上"
+
+    release.set()
+    await asyncio.wait_for(holder, timeout=5)
+    logged_out = await asyncio.wait_for(logout_task, timeout=5)
+    assert logged_out.status_code == 204, logged_out.text
+
+    # 并发 login 提交的新 token 必须也在 logout 的删除范围内：普通 401
+    resp = await client.post("/v1/auth/refresh", json={"refresh_token": new_refresh})
+    assert resp.status_code == 401, resp.text
+
+
 async def test_refresh_expired_token_rejected_401(client, invite_code):
     """INV-8：30 天 TTL 落库强制——过期的 refresh 得 401，不再无限可用。"""
     from datetime import timedelta

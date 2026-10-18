@@ -78,7 +78,7 @@ memory_sync(note_id)     不带 rev。短读事务取 note 当前状态 →（�
 - 新增 `test_extract_finalize_concurrent_patch_no_deadlock`（PG，真并发：extract 耗尽_attempts 收尾 与 PATCH 同 note 并行，独立会话）
 - `test_claim_commits_dead_job_transition_before_next_candidate`（threads11 P1，双后端：claim 循环判死一个过期 job 后领取下一个候选时，判死转移必须已提交——独立会话可见）
 - `test_claim_dead_jobs_commit_between_candidates_no_deadlock`（threads11 P1，PG 真并发：判死 job A（持 note A + sequences）后扫到 job B 时，并发 PATCH 已持 note B 行锁、正等 sequences——正确实现下 PATCH 只等 note 行锁即放行，无 DeadlockDetected/500）
-- `test_logout_waits_for_device_lock_then_deletes_concurrent_login_token`（threads11 P1，PG 真并发：login 事务持 device 行锁且新 token 行未提交时，logout 阻塞等锁；login 提交后 logout 的 DELETE 必须把新 token 行一并删掉——无锁实现会凭旧快照返回 204、留下有效 token）
+- `test_logout_waits_for_device_lock_then_deletes_concurrent_login_token`（threads11 P1，PG 真并发：login 事务持 device 行锁且新 token 行未提交时，logout 阻塞等锁；login 提交后 logout 的 DELETE 必须把新 token 行一并删掉——锁定「logout 204 ⇒ 该设备无存活 token」的可观察契约；旧实现靠 last_seen UPDATE 隐式满足它，显式 `_lock_device` 后不再依赖该偶然写）
 - `test_business_paths_never_update_existing_job_rows`（静态断言：grep/AST 检查 app/api 与 app/pipeline/extract.py 中对 Job 的写仅为 INSERT）
 
 ### INV-2 任务模型：extract 与 memory_sync 两种 job
@@ -273,7 +273,7 @@ memory_sync(note_id)     不带 rev。短读事务取 note 当前状态 →（�
   - 行已过期（`expires_at <= now`，无论是否作废）→ 401 `unauthorized`（过期），**不吊销设备**——先判过期再判作废；
   - 行存在、未过期、`revoked_at` 非空 → 确系重放 → 401 `refresh_reused` + 吊销**整台设备**（`devices.revoked_at` + 作废其全部 token；原语义保留）。
   被 5 枚上限挤出（行已删除）的 token 重放得到普通 401——包括「读行时还在、等锁期间被挤掉」的竞态窗口（重读归因保证它不会被误判成重放）。上限本身是显式作废策略的一种，写入已知取舍。
-- **logout** → **先 `_lock_device`（PG FOR UPDATE，threads11 P1，auth.py:394）**再清除（DELETE）该设备全部 token 行（不吊销设备行，access 到期自然失效；登出后的重放按既有语义得普通 401，不触发复用吊销——包括等锁期间被登出删除的竞态，同上由重读归因兜住）。为什么必须锁：不锁 device 的普通读不与同设备并发 login/refresh 串行化——PG READ COMMITTED 下随后的 DELETE 沿用读时刻的快照，**看不到对方已插入未提交的新 token 行**（至多等它早先的行），204 返回后新签发的 refresh token 仍有效；先取 device 行锁则 logout 排在对方事务之后，DELETE 必然看到其已提交的全部 token 行。
+- **logout** → **先 `_lock_device`（PG FOR UPDATE，threads11 P1，auth.py:394）**再清除（DELETE）该设备全部 token 行（不吊销设备行，access 到期自然失效；登出后的重放按既有语义得普通 401，不触发复用吊销——包括等锁期间被登出删除的竞态，同上由重读归因兜住）。为什么必须显式锁：无锁的 `session.get` 只是读快照、不与同设备并发 login/refresh 串行化，PG READ COMMITTED 下随后的 DELETE 用语句开始时的快照，落在对方事务提交前就拿不到它新插入的 token 行——旧实现实际靠随后的 `last_seen` UPDATE（device 行锁）**隐式**挡住了这个窗口，该写一旦被移除/重排，204 就会漏删并发签发的 token；显式先取 device 行锁使「device → refresh_tokens」的文档锁序成立，logout 必然排在同设备先行事务之后，DELETE 一定看到其已提交的全部 token 行。
 - 过期 token（`expires_at<=now`，未作废）→ 401 unauthorized（TTL 首次真正强制；不吊销设备）。
 - **过期行清理策略（threads6 P2）**：登录/刷新追加新 token 的同一事务顺手 DELETE 该设备 `expires_at <= now` 的行——**已吊销（revoked_at 非空）但未过期的行保留到过期为止**（重放识别窗口：被轮换后 30 天内重放仍能关联到设备并触发吊销），过期后即无任何价值、随下一次该设备的登录/刷新清掉。活跃设备的表体积由此有界（≤5 枚活行 + 未过期的已吊销行）；完全失联设备的历史行不主动清理（可选的全局定期 GC 记为后续项， MVP 量级接受）。
 

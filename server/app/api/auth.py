@@ -391,7 +391,16 @@ async def logout(
     # 登出：清除这台设备的全部 refresh 行（access 到期自然失效，不吊销
     # 设备行）。DELETE 而不是标 revoked：登出后的 token 重放按原有语义
     # 得普通 401（无法关联设备），不触发复用吊销
-    device = await session.get(Device, auth.device_id)
+    #
+    # 锁序（INV-1/8，threads11 P1，auth.py:394）：删 refresh_tokens 前先
+    # _lock_device（PG FOR UPDATE）。无锁的 session.get 只是读快照、不与
+    # 同设备并发 login/refresh 串行化：PG READ COMMITTED 下 DELETE 用语句
+    # 开始时的快照，落在对方事务提交前就拿不到它新插入的 token 行——旧
+    # 实现实际靠随后的 last_seen UPDATE（device 行锁）隐式挡住了这个窗口，
+    # 该写一旦被移除/重排，204 就会漏删并发签发的 token。显式先取 device
+    # 行锁使「device → refresh_tokens」的文档锁序成立：logout 必然排在
+    # 同设备先行事务之后，DELETE 一定看到其已提交的全部 token 行
+    device = await _lock_device(session, auth.device_id)
     if device is not None:
         device.last_seen = utcnow()
         await session.execute(
