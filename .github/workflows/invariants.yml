@@ -20,7 +20,7 @@ permissions:
 jobs:
   invariants:
     name: Invariant Check (non-required)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 5
     permissions:
       contents: read
