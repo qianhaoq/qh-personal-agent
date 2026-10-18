@@ -1,5 +1,5 @@
 """jwt_secret 与记忆后端的生产校验：postgresql 下 secret 必须是 >=32
-字节随机值的编码、MEMORY_BACKEND 不能是 inmemory（只能是 disabled），
+字节随机值的编码、MEMORY_BACKEND 不能是 inmemory（用 mem0 或 disabled），
 SQLite 不受影响。"""
 import base64
 import pathlib
@@ -127,17 +127,18 @@ def test_sqlite_default_secret_ok():
     assert settings.jwt_secret == DEFAULT_JWT_SECRET
 
 
-def test_memory_backend_only_accepts_known_values():
-    """P2：MEMORY_BACKEND 只接受 inmemory|disabled，未知值（含已拆分的
-    mem0——生产后端在 feat/mem0-backend 分支）启动即校验失败。"""
+def test_memory_backend_only_accepts_known_values(monkeypatch):
+    """MEMORY_BACKEND 只接受 inmemory|disabled|mem0；未知值启动即拒。"""
     assert Settings(memory_backend="inmemory").memory_backend == "inmemory"
     assert Settings(memory_backend="disabled").memory_backend == "disabled"
     with pytest.raises(ValidationError, match="memory_backend"):
         Settings(memory_backend="redis")
-    # threads7 拆分：mem0 已随生产后端移出本仓，配置它必须报错而不是
-    # 静默当别的后端跑
-    with pytest.raises(ValidationError, match="memory_backend"):
-        Settings(memory_backend="mem0")
+    # mem0 需已安装 + PG + embedding 凭据；这里只验枚举（安装探测 mock）
+    monkeypatch.setattr("app.config._mem0ai_installed", lambda: True)
+    assert (
+        _pg_settings(memory_backend="mem0", llm_api_key="sk-test-only").memory_backend
+        == "mem0"
+    )
 
 
 def test_production_inmemory_memory_backend_rejected():
@@ -150,11 +151,70 @@ def test_production_inmemory_memory_backend_rejected():
         _pg_settings(memory_backend="inmemory", allow_inmemory_in_tests=False)
 
 
-def test_production_inmemory_rejection_mentions_mem0_backend_pr():
-    """threads7 拆分：拒绝信息必须指出两条出路——生产后端在
-    feat/mem0-backend，过渡期可显式 disabled（部署者按错误信息即可
-    恢复部署，而不是对着报错猜）。"""
-    with pytest.raises(ValidationError, match=r"feat/mem0-backend.*MEMORY_BACKEND=disabled"):
+def test_mem0_backend_missing_mem0ai_rejected_at_startup(monkeypatch):
+    """INV-10.3：MEMORY_BACKEND=mem0 但未装 mem0ai → 启动 ValueError，
+    提示 pip install -r requirements-mem0.txt（不静默退化）。"""
+    monkeypatch.setattr("app.config._mem0ai_installed", lambda: False)
+    with pytest.raises(ValidationError, match=r"mem0ai|requirements-mem0"):
+        # 用 PG + 凭据基线，避免被「需 postgresql / 缺 embedding 凭据」顶掉
+        _pg_settings(memory_backend="mem0", llm_api_key="sk-test-only")
+
+
+def test_mem0_requires_postgres_database_url(monkeypatch):
+    """P2：mem0 的 pgvector 后端要求 PostgreSQL——sqlite + mem0 启动即拒。"""
+    monkeypatch.setattr("app.config._mem0ai_installed", lambda: True)
+    # 显式传 sqlite：PG 套件下 conftest 会把 DATABASE_URL 环境变量设为 PG，
+    # 不压住的话本用例会误过
+    with pytest.raises(ValidationError, match="postgresql"):
+        Settings(
+            database_url="sqlite+aiosqlite:///./app.sqlite3",
+            memory_backend="mem0",
+            llm_api_key="sk-test-only",
+        )
+
+
+def test_mem0_without_embedding_credentials_rejected(monkeypatch):
+    """P2：MEMORY_BACKEND=mem0 时 embedding key（回落 LLM_API_KEY）必须
+    非空——mock + 空/纯空白 LLM 不得启动成功；错误文案不含密钥原值。"""
+    monkeypatch.setattr("app.config._mem0ai_installed", lambda: True)
+    for blank in ("", "   "):
+        with pytest.raises(ValidationError, match="MEM0_EMBEDDING_API_KEY"):
+            _pg_settings(memory_backend="mem0", llm_api_key=blank)
+    assert (
+        _pg_settings(memory_backend="mem0", llm_api_key="sk-test-only").memory_backend
+        == "mem0"
+    )
+    assert (
+        _pg_settings(
+            memory_backend="mem0", mem0_embedding_api_key="sk-embed"
+        ).memory_backend
+        == "mem0"
+    )
+
+
+def test_mem0_embedding_dims_positive_and_bounded(monkeypatch):
+    """P1：MEM0_EMBEDDING_DIMS 必须为正且 ≤2000（pgvector HNSW opclass
+    上限），与既有数值配置同口径。"""
+    monkeypatch.setattr("app.config._mem0ai_installed", lambda: True)
+    for bad in (0, -1, 2001, 3072, 16001, 10**9):
+        with pytest.raises(ValidationError, match="有限上界|必须为正"):
+            _pg_settings(
+                memory_backend="mem0",
+                llm_api_key="sk-test-only",
+                mem0_embedding_dims=bad,
+            )
+    # 边界合法值仍接受
+    ok = _pg_settings(
+        memory_backend="mem0",
+        llm_api_key="sk-test-only",
+        mem0_embedding_dims=2000,
+    )
+    assert ok.mem0_embedding_dims == 2000
+
+
+def test_production_inmemory_rejection_mentions_mem0():
+    """拒绝信息必须指出两条出路：MEMORY_BACKEND=mem0 或 disabled。"""
+    with pytest.raises(ValidationError, match=r"MEMORY_BACKEND=mem0.*MEMORY_BACKEND=disabled"):
         _pg_settings(memory_backend="inmemory", allow_inmemory_in_tests=False)
 
 
@@ -179,21 +239,18 @@ def test_sqlite_inmemory_memory_backend_ok():
 
 
 def test_env_example_documents_memory_backend_choices():
-    """threads7 拆分后：模板本地默认 inmemory（单进程局限写明）；
-    disabled 以注释行给出；生产后端去向（feat/mem0-backend）与 disabled
-    的过渡期语义写明；不再出现 MEM0_* 配置项（已随后端移出）。"""
+    """模板本地默认 inmemory（单进程局限写明）；mem0/disabled 以注释给出；
+    MEM0_EMBEDDING_* 与 requirements-mem0.txt 安装说明齐全。"""
     env_example = (
         pathlib.Path(__file__).resolve().parent.parent / ".env.example"
     ).read_text(encoding="utf-8")
     lines = [ln.strip() for ln in env_example.splitlines()]
     assert "MEMORY_BACKEND=inmemory" in lines
+    assert "# MEMORY_BACKEND=mem0" in lines
     assert "# MEMORY_BACKEND=disabled" in lines
-    # 单进程局限与生产后端去向必须写明
     assert any("单进程" in ln for ln in lines)
-    assert any("feat/mem0-backend" in ln for ln in lines)
-    # MEM0_* 配置已随生产后端移出本仓
-    assert not [ln for ln in lines if ln.startswith("MEM0_")], "MEM0_* 已拆分至 feat/mem0-backend"
-    assert not [ln for ln in lines if "requirements-mem0.txt" in ln]
+    assert any("requirements-mem0.txt" in ln for ln in lines)
+    assert any(ln.startswith("# MEM0_EMBEDDING_") for ln in lines)
 
 
 def test_worker_refuses_inmemory_with_postgres():
@@ -817,6 +874,7 @@ def test_numeric_upper_bounds_table_covers_all_checked_fields():
         "WORKER_POLL_INTERVAL_SECONDS": settings.worker_poll_interval_seconds,
         "WORKER_BATCH_SIZE": settings.worker_batch_size,
         "ASK_TOP_K": settings.ask_top_k,
+        "MEM0_EMBEDDING_DIMS": settings.mem0_embedding_dims,
     }
     assert set(_NUMERIC_UPPER_BOUNDS) == set(checked), "两张表必须覆盖同一组字段"
     # 上界必须有限且为正（float("inf") 当上界等于没设）

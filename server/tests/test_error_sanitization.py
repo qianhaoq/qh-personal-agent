@@ -319,9 +319,10 @@ async def test_500_real_uvicorn_no_raw_traceback_in_logs(user, monkeypatch):
 
 
 def test_third_party_http_loggers_pinned_to_warning():
-    """threads9 / INV-14：create_app 把 httpx/httpcore/openai 的 logger 钉
-    到 >= WARNING——环境/库默认级别漂移、未来版本把请求细节（LLM 请求体
-    含笔记正文）打进 INFO 日志时，应用层不设防就会把用户内容漏进日志。"""
+    """threads9 / INV-14：create_app 把 httpx/httpcore/openai/mem0 的 logger
+    钉到 >= WARNING——环境/库默认级别漂移、未来版本把请求细节（LLM 请求体
+    含笔记正文；mem0 DEBUG 打完整 memory 明文）打进日志时，应用层不设防
+    就会把用户内容漏进日志。"""
     from app.logs import _PINNED_LOGGERS
     from app.main import create_app
 

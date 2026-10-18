@@ -1,6 +1,7 @@
 """应用配置：全部来自环境变量（.env 亦可）。"""
 import base64
 import binascii
+import importlib.util
 import os
 import string
 from collections.abc import Mapping
@@ -52,6 +53,9 @@ _NUMERIC_UPPER_BOUNDS = {
     "WORKER_BATCH_SIZE": 1000,
     # /v1/ask 检索条数：100 封顶（更大无意义且拖慢问答）
     "ASK_TOP_K": 100,
+    # pgvector vector 类型的 HNSW opclass 最多 2000 维（超界建 HNSW 即失败）；
+    # 缺省 1536。pgvector 单列 vector 理论上限更高，但本项目建 HNSW，故封顶 2000。
+    "MEM0_EMBEDDING_DIMS": 2000,
 }
 
 
@@ -92,6 +96,16 @@ def _has_usable_http_authority(url) -> bool:
     return bool(url.hostname) and (port is None or 1 <= port <= 65535)
 
 
+def _mem0ai_installed() -> bool:
+    """探测 mem0ai 是否可 import（INV-10.3）。find_spec 对损坏安装/命名空
+    包可能抛错，一律按未安装处理——启动报错好过运行期 ModuleNotFoundError。"""
+    try:
+        return importlib.util.find_spec("mem0") is not None
+    except (ImportError, ValueError):  # pragma: no cover - 损坏安装路径
+        return False
+
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
@@ -123,14 +137,21 @@ class Settings(BaseSettings):
     # 跑 PG 测试套件的 CI/本地环境显式置 true 放行（生产环境不要设置）
     allow_mock_llm_in_prod: bool = False
 
-    # 记忆层：只接受这两个值，未知值（含 mem0——生产后端已拆分至
-    # feat/mem0-backend 分支，见 docs/server-invariants.md INV-3/INV-10）
-    # 启动即报错（而不是静默退化丢记忆）
-    memory_backend: Literal["inmemory", "disabled"] = "inmemory"
+    # 记忆层：inmemory（单进程开发）/ disabled（显式空）/ mem0（生产 pgvector）
+    memory_backend: Literal["inmemory", "disabled", "mem0"] = "inmemory"
     # 仅测试用：生产（postgresql）+ inmemory 默认拒绝启动，跑 PG 测试套件
     # 的 CI/本地环境显式置 true 放行（生产环境不要设置；独立 worker 进程
     # 无论该标志都拒绝，见 app.jobs.worker.check_memory_backend_shareable）
     allow_inmemory_in_tests: bool = False
+    # mem0 的 embedding 单独配置（可以和 LLM 不同源）
+    mem0_embedding_base_url: str = ""
+    mem0_embedding_model: str = ""
+    # 缺省回落 LLM_API_KEY（共用 OpenAI 兼容源时不用重复填）
+    mem0_embedding_api_key: str = ""
+    # mem0 的 embedding 维度（pgvector 列维度 / embedding 请求 dimensions）；
+    # 缺省 1536 = mem0ai 2.2.1 默认，也与 init-db 建的 vector(1536) 一致。
+    # 上界 2000：pgvector HNSW opclass 上限（见 _NUMERIC_UPPER_BOUNDS）。
+    mem0_embedding_dims: int = 1536
 
     # 流水线
     default_timezone: str = "Asia/Shanghai"
@@ -194,7 +215,7 @@ class Settings(BaseSettings):
         不可见且重启即失忆。启动即拒绝；仅在单进程跑 PG 测试套件的
         CI/本地环境可用 ALLOW_INMEMORY_IN_TESTS=true 显式放行（独立
         worker 进程不放行，见 app.jobs.worker）。disabled（显式空后端）
-        在任何环境都允许；生产记忆后端由后续 PR（feat/mem0-backend）提供。
+        在任何环境都允许；生产请设 MEMORY_BACKEND=mem0。
         """
         if (
             self.database_url.startswith("postgresql")
@@ -204,10 +225,70 @@ class Settings(BaseSettings):
             raise ValueError(
                 "生产环境（DATABASE_URL 以 postgresql 开头）不允许 "
                 "MEMORY_BACKEND=inmemory：inmemory 不能跨 api/worker 进程共享，"
-                "多进程/重启即丢记忆。生产记忆后端将由后续 PR（feat/mem0-backend）"
-                "提供，过渡期可显式设 MEMORY_BACKEND=disabled（关闭记忆功能，"
-                "任何环境允许）。仅在单进程跑 PG 测试套件的 CI/本地环境可设 "
-                "ALLOW_INMEMORY_IN_TESTS=true 放行（独立 worker 进程无论该标志都拒绝）"
+                "多进程/重启即丢记忆。生产请设 MEMORY_BACKEND=mem0（与业务库"
+                "同一 PostgreSQL/pgvector）；也可显式设 MEMORY_BACKEND=disabled"
+                "（关闭记忆功能，任何环境允许）。仅在单进程跑 PG 测试套件的 "
+                "CI/本地环境可设 ALLOW_INMEMORY_IN_TESTS=true 放行（独立 worker "
+                "进程无论该标志都拒绝）"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _require_memory_backend_installed(self) -> "Settings":
+        """INV-10.3：MEMORY_BACKEND=mem0 时 mem0ai 必须已安装。记忆 store
+        是懒构造——不查的话 api 照常起，首个 /search 或 memory_sync 才
+        ModuleNotFoundError。"""
+        if self.memory_backend == "mem0" and not _mem0ai_installed():
+            raise ValueError(
+                "MEMORY_BACKEND=mem0 但未安装 mem0ai：请执行 "
+                "pip install -r requirements-mem0.txt（Docker 镜像已装），"
+                "然后重启"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _require_mem0_postgres_database(self) -> "Settings":
+        """P2：mem0 的向量存 pgvector（与业务库同实例）——DATABASE_URL 非
+        postgresql 时启动即拒，而不是运行期连不上/建不出表。本地开发请用
+        inmemory（单进程）或 disabled。"""
+        if self.memory_backend == "mem0" and not self.database_url.startswith(
+            "postgresql"
+        ):
+            raise ValueError(
+                "MEMORY_BACKEND=mem0 需要 PostgreSQL（DATABASE_URL 以 postgresql "
+                "开头）：向量存 pgvector、与业务库同实例。本地开发请用 "
+                "MEMORY_BACKEND=inmemory（单进程）或 disabled"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _require_mem0_embedding_credentials(self) -> "Settings":
+        """P2：MEMORY_BACKEND=mem0 时解析出的 embedding key
+        （MEM0_EMBEDDING_API_KEY，缺省回落 LLM_API_KEY）必须非空——mock +
+        空白 LLM 不得启动成功，否则首个 add/search 才 401。错误文案不含
+        密钥原值（INV-14）。"""
+        if self.memory_backend != "mem0":
+            return self
+        if not (self.mem0_embedding_api_key or self.llm_api_key).strip():
+            raise ValueError(
+                "MEMORY_BACKEND=mem0 缺少 embedding 凭据：请设置 "
+                "MEM0_EMBEDDING_API_KEY，或与 LLM 共源（不设置 "
+                "MEM0_EMBEDDING_* 即回落 LLM_API_KEY）"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _require_embedding_key_when_customized(self) -> "Settings":
+        """INV-10.5：自定义 embedding 源（MEM0_EMBEDDING_BASE_URL /
+        MEM0_EMBEDDING_API_KEY 任一设置）时，解析出的凭据
+        （MEM0_EMBEDDING_API_KEY，缺省回落 LLM_API_KEY）必须非空。"""
+        if not (self.mem0_embedding_base_url or self.mem0_embedding_api_key):
+            return self
+        if not (self.mem0_embedding_api_key or self.llm_api_key):
+            raise ValueError(
+                "MEM0_EMBEDDING_BASE_URL/MEM0_EMBEDDING_API_KEY 已设置但缺少"
+                " embedding 凭据：请设置 MEM0_EMBEDDING_API_KEY，或与 LLM 共源"
+                "（不设置 MEM0_EMBEDDING_* 即回落 LLM_API_KEY）"
             )
         return self
 
@@ -329,6 +410,7 @@ class Settings(BaseSettings):
             "WORKER_POLL_INTERVAL_SECONDS": self.worker_poll_interval_seconds,
             "WORKER_BATCH_SIZE": self.worker_batch_size,
             "ASK_TOP_K": self.ask_top_k,
+            "MEM0_EMBEDDING_DIMS": self.mem0_embedding_dims,
         }
         # not (v > 0) 连 NaN 也拦下（NaN <= 0 为 False）
         bad = {name: value for name, value in checks.items() if not (value > 0)}
@@ -531,3 +613,29 @@ def get_db_settings() -> DbSettings:
         return DbSettings()
     except ValidationError as exc:
         raise _sanitized_config_error(exc) from None
+
+
+class Mem0MigrateSettings(BaseSettings):
+    """init-db 专用：从 .env / 环境变量读 MEMORY_BACKEND 与 MEM0_EMBEDDING_DIMS。
+
+    不触发完整 Settings 的 LLM/JWT/mem0ai/生产拓扑校验（INV-9 分层）。
+    pydantic-settings 默认：进程环境变量优先于 .env，故 compose 注入的
+    MEMORY_BACKEND=mem0 仍生效；直接 `python -m app.cli init-db` 时也能
+    读到仓库 .env 里的值（不再依赖 os.environ 是否已被灌入）。
+    """
+
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+    # 用 str 而非 Literal：非法值只让 bootstrap 条件不成立，不挡建表
+    memory_backend: str = "inmemory"
+    mem0_embedding_dims: int = 1536
+
+
+def get_mem0_migrate_settings() -> Mem0MigrateSettings:
+    """加载 migrate 侧 mem0 引导配置；校验失败回落缺省（不挡业务表建表）。"""
+    try:
+        return Mem0MigrateSettings()
+    except ValidationError:
+        return Mem0MigrateSettings.model_construct(
+            memory_backend="inmemory", mem0_embedding_dims=1536
+        )

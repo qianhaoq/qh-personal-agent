@@ -9,9 +9,8 @@ delete_by_note / delete_all）必须完整——一页取满又无法推进时�
 MemoryEnumerationIncomplete 让 job 失败重试，绝不当成已取全/已同步
 （固定大 top_k 当全量会在超限用户身上留下删不净的记忆且 job 报成功）。
 
-生产记忆后端（mem0 + pgvector）在 feat/mem0-backend 分支（threads7 拆分，
-后续 PR）；本仓实现为 inmemory（单进程开发/测试）与 disabled（显式空后端），
-两者都必须满足 INV-3 的后端契约。
+实现三选一：mem0（生产，pgvector）/ inmemory（单进程开发测试）/
+disabled（显式空后端）。三者都必须满足 INV-3 的后端契约。
 """
 from __future__ import annotations
 
@@ -37,7 +36,7 @@ class MemoryItem:
 
 
 class MemoryStore(ABC):
-    """add 返回本次写入的全部记忆（后端一次 add 可能产生多条）；
+    """add 返回本次写入的全部记忆（mem0 一次 add 可能产生多条）；
     delete 按 memory id 列表精确删（复查不一致时只删本次新增，修 C9）。"""
 
     @abstractmethod
@@ -70,7 +69,14 @@ def get_memory_store() -> MemoryStore:
         from app.config import get_settings
 
         backend = get_settings().memory_backend
-        if backend == "inmemory":
+        if backend == "mem0":
+            # mem0ai 未安装时这里直接抛 ImportError：配置成 mem0 的环境静默
+            # 退化成 inmemory 会让记忆悄悄丢失，错误必须暴露出来（启动期
+            # 另有 INV-10.3 安装探测）
+            from app.memory.mem0_store import Mem0Store
+
+            _store = Mem0Store()
+        elif backend == "inmemory":
             from app.memory.inmemory import InMemoryStore
 
             _store = InMemoryStore()
@@ -81,7 +87,9 @@ def get_memory_store() -> MemoryStore:
         else:
             # config 已用 Literal 限制取值，正常到不了这里；防止未来新增后端
             # 或绕过校验直接改配置时静默退化成错误实现
-            raise ValueError(f"未知 MEMORY_BACKEND：{backend}（只支持 inmemory | disabled；生产后端由 feat/mem0-backend 提供）")
+            raise ValueError(
+                f"未知 MEMORY_BACKEND：{backend}（只支持 inmemory | disabled | mem0）"
+            )
     return _store
 
 

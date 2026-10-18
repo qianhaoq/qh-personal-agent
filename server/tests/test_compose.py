@@ -5,9 +5,9 @@
 代入后，按每个服务的 command 跑它真实会跑的启动校验：
 
 - migrate（`python -m app.cli init-db`）只过 **DbSettings**（数据库层）
-  ——沿用 .env 本地默认（MEMORY_BACKEND=inmemory）也不被生产校验挡住；
+  ——只过 DbSettings，不加载完整 Settings（MEMORY_BACKEND 仅作 schema 引导信号）；
 - api（uvicorn）过完整 **Settings**（其 compose environment 已把
-  MEMORY_BACKEND 覆盖为 disabled）；
+  MEMORY_BACKEND 覆盖为 mem0）；
 - worker 过完整 Settings **+ worker 拓扑检查**（check_memory_backend_shareable）。
 """
 import pathlib
@@ -84,34 +84,36 @@ def _settings_kwargs(env: dict[str, str]) -> dict:
     return {key.lower(): value for key, value in env.items()}
 
 
-def test_compose_services_pass_startup_validation():
+def test_compose_services_pass_startup_validation(monkeypatch):
+    """compose api/worker 默认 MEMORY_BACKEND=mem0；构造 Settings 时 mock
+    安装探测（本测试不依赖本机装 mem0ai，只验接线与拓扑）。"""
+    monkeypatch.setattr("app.config._mem0ai_installed", lambda: True)
+
     compose = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))
     services = compose["services"]
     assert {"migrate", "api", "worker"} <= set(services), "compose 拆分后三服务仍在"
 
     base = _production_env()
 
-    # migrate：init-db 只做数据库层校验——.env 沿用本地默认
-    # （MEMORY_BACKEND=inmemory）也不能在建表一步被生产校验挡住
+    # migrate：init-db 只做数据库层校验；MEMORY_BACKEND=mem0 仅 schema 引导
     migrate_env = _service_env(services["migrate"], base)
     db_url = DbSettings(**_settings_kwargs(migrate_env)).database_url
     assert db_url.startswith("postgresql"), "migrate 的 DATABASE_URL 指向 compose 的 PG"
 
-    # api：完整 Settings（environment 已覆盖 MEMORY_BACKEND=disabled，
-    # 否则 .env 的 inmemory 默认 + PG 会被生产拓扑校验拒绝）
+    # api：完整 Settings（environment 覆盖 MEMORY_BACKEND=mem0）
     api_env = _service_env(services["api"], base)
-    assert api_env["MEMORY_BACKEND"] == "disabled"
+    assert api_env["MEMORY_BACKEND"] == "mem0"
     Settings(**_settings_kwargs(api_env))  # 不抛即通过
 
-    # worker：完整 Settings + worker 拓扑检查（disabled 不受限）
+    # worker：完整 Settings + worker 拓扑检查（mem0 跨进程安全）
     from app.jobs.worker import check_memory_backend_shareable
 
     worker_env = _service_env(services["worker"], base)
-    assert worker_env["MEMORY_BACKEND"] == "disabled"
+    assert worker_env["MEMORY_BACKEND"] == "mem0"
     check_memory_backend_shareable(Settings(**_settings_kwargs(worker_env)))
 
 
-def test_compose_pg_env_password_encoded_in_database_url():
+def test_compose_pg_env_password_encoded_in_database_url(monkeypatch):
     """threads12 P1（docker-compose.yml:24）/ INV-16：compose 不再把
     ${POSTGRES_PASSWORD} 原样拼进 DATABASE_URL（密码含 @:/# 时 SQLAlchemy
     拆错组件、migrate 连不上而 api/worker 永不启动），而是注入分项 PG*
@@ -119,6 +121,7 @@ def test_compose_pg_env_password_encoded_in_database_url():
     机械复现 compose 变量代入后走真实 Settings/DbSettings 构造：含分隔符
     的假密码必须经 make_url 无损取回、host/port/db 符合 compose 拓扑。
     全程不打印密码。"""
+    monkeypatch.setattr("app.config._mem0ai_installed", lambda: True)
     from sqlalchemy.engine import make_url
 
     compose = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))
@@ -150,15 +153,24 @@ def test_compose_pg_env_password_encoded_in_database_url():
 
 
 def test_compose_migrate_would_reject_full_settings_layering_is_real():
-    """反证分层是必要的：若 migrate 走完整 Settings，沿用 .env 本地默认
-    （inmemory）+ PG 的组合会被生产校验拒绝——这正是 threads7 P1 要修的
-    「全新部署停在建表一步」。"""
+    """反证分层是必要的：若 migrate 走完整 Settings，全新部署的 .env
+    （LLM_PROVIDER=mock 本地默认）叠加 PG + MEMORY_BACKEND=mem0 会被生产/
+    凭据校验挡住——migrate 只覆盖数据库层与 schema 引导信号，LLM 凭据没
+    配齐也要能先把表建好。"""
     migrate_env = _service_env(
         yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))["services"]["migrate"],
-        _production_env(),
+        {
+            **_env_example_values(),
+            "JWT_SECRET": secrets.token_urlsafe(48),
+            "POSTGRES_PASSWORD": "pg-local-test-only",
+            "ALLOW_MOCK_LLM_IN_PROD": "false",
+        },
     )
     kwargs = _settings_kwargs(migrate_env)
-    with pytest.raises(ValidationError, match="MEMORY_BACKEND"):
+    assert migrate_env.get("MEMORY_BACKEND") == "mem0"
+    with pytest.raises(
+        ValidationError, match=r"MEM0_EMBEDDING|LLM_PROVIDER|mock|mem0ai"
+    ):
         Settings(**kwargs)
     # 而数据库层校验对同一环境照常通过
     assert DbSettings(**kwargs).database_url.startswith("postgresql")

@@ -993,7 +993,7 @@ async def test_memory_sync_status_updates_do_not_touch_updated_at_or_change_seq(
 async def test_inmemory_list_page_cap_raises_when_full():
     """INV-3（后端契约第 1 条）：InMemoryStore 的 list() 页上限取满即抛
     MemoryEnumerationIncomplete（进程内字典本不截断，上限让"取不全即报错"
-    的契约可测；生产后端在 feat/mem0-backend 分支实现同一语义）。"""
+    的契约可测；mem0 后端实现同一语义）。"""
     capped = InMemoryStore(list_page_size=2)
     for text, note in (("甲", "n1"), ("乙", "n1"), ("丙", "n2")):
         await capped.add("usr_1", text, note_id=note)
@@ -1124,3 +1124,107 @@ async def test_memory_sync_rev_change_delete_failure_still_requeues(
     assert note.memory_status == "synced"
     items = await _items(store, user["user_id"], note_id)
     assert items and all(m.source_rev == note.rev for m in items)
+
+
+class FailingAfterWriteStore(DelayedAddStore):
+    """add 写入成功后再抛异常：模拟 mem0 已写 PG vector、随后 history.db
+    /网络失败等「部分成功」场景（P1-4 / INV-5）。"""
+
+    def __init__(self):
+        super().__init__()
+        self.exploded = False
+
+    async def add(self, user_id, text, *, note_id=None, source_rev=None):
+        if self._is_target(note_id, source_rev) and not self.entered.is_set():
+            self.entered.set()
+            await self.release.wait()
+            self.in_window.append("add")
+            items = await InMemoryStore.add(
+                self, user_id, text, note_id=note_id, source_rev=source_rev
+            )
+            self.added_in_window.extend(items)
+            self.exploded = True
+            raise RuntimeError("add exploded")
+        return await InMemoryStore.add(
+            self, user_id, text, note_id=note_id, source_rev=source_rev
+        )
+
+
+async def test_memory_sync_add_failure_after_lost_lease_requeues_and_raises(
+    client, user, run_jobs
+):
+    """P1-4 / INV-5：外部写（add）部分成功后抛异常时，仍须检查租约；
+    租约已丢则补偿 enqueue 再 re-raise——否则 finalize_claim 拒旧租约且
+    不排队，留下陈旧/重复记忆。"""
+    from datetime import timedelta
+
+    from app.config import get_settings
+    from app.db import get_sessionmaker
+    from app.jobs.queue import claim_next, enqueue
+    from app.pipeline.memory_sync import sync_note_memory
+    from app.pipeline.runner import run_pending_jobs
+    from app.timeutil import as_utc, utcnow
+
+    note_id = await _create_note(client, user, "add 会在写后炸掉的笔记")
+    await run_jobs()  # organized，初次收敛完成
+
+    store = FailingAfterWriteStore()
+    store.target_note_id = note_id
+    set_memory_store(store)
+
+    maker = get_sessionmaker()
+    async with maker() as session, session.begin():
+        await enqueue(session, "memory_sync", {"note_id": note_id}, note_id=note_id)
+    async with maker() as session, session.begin(), claim_next(
+        session, worker_id="wkr_old"
+    ) as job:
+        assert job is not None and job.kind == "memory_sync"
+        job_id, locked_at = job.id, as_utc(job.locked_at)
+
+    task = asyncio.create_task(
+        sync_note_memory(
+            note_id, job_id=job_id, worker_id="wkr_old", locked_at=locked_at
+        )
+    )
+    await asyncio.wait_for(store.entered.wait(), timeout=5)
+
+    # 租约过期 → 新 worker 回收换主把同一 job 跑完（正主记忆 + synced）
+    async with maker() as session, session.begin():
+        await session.execute(
+            update(Job)
+            .where(Job.id == job_id)
+            .values(
+                locked_at=utcnow()
+                - timedelta(seconds=get_settings().job_lock_timeout_seconds + 60)
+            )
+        )
+    assert await run_pending_jobs(limit=1, worker_id="wkr_new") == 1
+    winner_ids = [m.id for m in await store.list(user["user_id"])]
+    assert winner_ids, "前置失败：新持有者应已写下一组记忆"
+
+    # 慢 worker 的 add 写入落地后抛异常：租约已丢 → 补偿再入队 + re-raise
+    store.release.set()
+    with pytest.raises(RuntimeError, match="add exploded"):
+        await asyncio.wait_for(task, timeout=10)
+    assert store.exploded
+
+    leftover = [m.id for m in store.added_in_window]
+    assert leftover and set(leftover) <= {m.id for m in await store.list(user["user_id"])}, (
+        "前置失败：慢 worker 抛错前的写入应已落地"
+    )
+    jobs = await _memsync_jobs(note_id)
+    compensating = [j for j in jobs if j.status == "pending"]
+    assert len(compensating) == 1, (
+        f"add 抛异常也必须留下补偿 pending：{[j.status for j in jobs]}"
+    )
+    note = await _note(note_id)
+    assert note.memory_status == "synced", "丢租约的异常执行不得改写 memory_status"
+
+    # 排空：补偿任务 delete_by_note 清掉两批写入，收敛为恰好一组
+    await run_jobs()
+    note = await _note(note_id)
+    assert note.memory_status == "synced"
+    items = await _items(store, user["user_id"], note_id)
+    assert items and all(m.source_rev == note.rev for m in items)
+    assert len({m.id for m in items}) == len(items), "终态恰好一组记忆"
+    assert not set(leftover) & {m.id for m in items}, "慢 worker 的残留最终被收敛清掉"

@@ -1,6 +1,6 @@
 """disabled 记忆后端（threads7 拆分，INV-10.5/INV-5）。
 
-生产记忆后端（mem0 + pgvector）已拆分至 feat/mem0-backend 分支；`disabled`
+生产记忆后端为 mem0；`disabled`
 是拆分后到该 PR 落地前的显式空后端。这里锁定它的三件事：
 
 1. 后端契约（INV-3）的空实现：所有接口返回空/0、绝不做任何外部写；

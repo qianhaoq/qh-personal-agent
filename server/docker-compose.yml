@@ -35,8 +35,11 @@ services:
       PGPASSWORD: ${POSTGRES_PASSWORD}
       PGDATABASE: personal_agent
       # init-db 只加载 DbSettings（数据库层校验，threads7 P1 / INV-9）：
-      # 建表不依赖 LLM/记忆后端/JWT 配置，沿用 .env 本地默认即可通过；
-      # api/worker 按各自 command 过完整 Settings 启动校验
+      # 建表不依赖 LLM/JWT 配置，沿用 .env 本地默认即可通过；
+      # api/worker 按各自 command 过完整 Settings 启动校验。
+      # MEMORY_BACKEND=mem0 仅作 init-db 的 schema 引导信号（P1-3）：
+      # 幂等建 vector 扩展与 mem0 集合表/索引；DbSettings 忽略该键
+      MEMORY_BACKEND: mem0
     command: python -m app.cli init-db
     depends_on:
       postgres:
@@ -56,9 +59,9 @@ services:
       PGDATABASE: personal_agent
       # inmemory 仅单进程开发/测试：api 是多 worker、worker 是独立进程，
       # 各自一份内存会静默丢记忆（config 校验会拒绝 inmemory+PG）。生产
-      # 记忆后端由后续 PR（feat/mem0-backend）提供，过渡期显式关闭记忆
-      # 功能（disabled 在任何环境允许，memory_sync 平凡收敛标 synced）
-      MEMORY_BACKEND: disabled
+      # 生产记忆后端：mem0 + pgvector（与业务库同一 PostgreSQL）
+      # 镜像已装 requirements-mem0.txt；本地开发可用 inmemory/disabled
+      MEMORY_BACKEND: mem0
     # --no-access-log（INV-14，threads9）：uvicorn 默认 access log 的请求行
     # 含完整 query（/v1/search?q=<笔记正文> 整行进 stdout/compose 日志收集）；
     # 进程内的请求级日志由 app/middleware.py::AccessLogMiddleware 承担
@@ -87,9 +90,8 @@ services:
       PGUSER: personal
       PGPASSWORD: ${POSTGRES_PASSWORD}
       PGDATABASE: personal_agent
-      # 同 api：独立进程不能用进程内记忆（worker 拓扑校验拒绝 inmemory+PG），
-      # 过渡期显式 disabled，生产后端见 feat/mem0-backend
-      MEMORY_BACKEND: disabled
+      # 同 api：独立进程不能用进程内记忆（worker 拓扑校验拒绝 inmemory+PG）
+      MEMORY_BACKEND: mem0
     command: python -m app.jobs.worker
     depends_on:
       postgres:
@@ -98,9 +100,8 @@ services:
         condition: service_completed_successfully
 
   postgres:
-    # pgvector 镜像同时是业务库：vector 扩展当前未使用，保留该镜像是为了
-    # 与 feat/mem0-backend 落地后的数据卷/镜像形态保持一致，避免合并时
-    # 二次迁移
+    # pgvector 镜像同时是业务库：vector 扩展与 mem0 集合表/索引由
+    # migrate（init-db，MEMORY_BACKEND=mem0）幂等引导；与业务库同实例
     image: pgvector/pgvector:pg16
     restart: unless-stopped
     environment:
