@@ -153,7 +153,7 @@ job.last_error = safe_error_text(exc)
   raise ValueError("timezone 必须是合法 IANA 时区名")
   ```
 
-- **启动校验异常带密钥明文**（threads10 P1）：`get_settings()` 在模块 import 期跑（api/worker），中间件还没挂上；pydantic ValidationError 的 `input_value` 截断 repr 会露出**尾部**字段的值（实测 `'jwt_secret': '...7766554433221100secret'`），traceback 整段落 uvicorn/进程日志。收口：`get_settings`/`get_db_settings` 边界捕获 ValidationError → 转只含 loc/msg/type 的 `ConfigError`，`from None` 抑制隐式 `__context__` 链（否则原 ValidationError 仍随链式 traceback 打出）。SecretStr 只护 repr、不覆盖 `database_url` 的 password 部分，不采用（决策见 server-invariants.md「为什么」表）。
+- **启动校验异常带密钥明文**（threads10 P1）：`get_settings()` 在模块 import 期跑（api/worker），中间件还没挂上；pydantic ValidationError 的 `input_value` 截断 repr 会露出**尾部**字段的值（实测消息末尾原样出现 `'jwt_secret': '<密钥尾部明文>'` 形态的片段——不要把任何类密钥形态的示例串写进文档/代码/输出，哪怕是编造的），traceback 整段落 uvicorn/进程日志。收口：`get_settings`/`get_db_settings` 边界捕获 ValidationError → 转只含 loc/msg/type 的 `ConfigError`，`from None` 抑制隐式 `__context__` 链（否则原 ValidationError 仍随链式 traceback 打出）。SecretStr 只护 repr、不覆盖 `database_url` 的 password 部分，不采用（决策见 server-invariants.md「为什么」表）。
 - **构建上下文也是泄漏面**：无 `.dockerignore` 时 `server/.env`（密钥）与本地 SQLite 笔记库会整体发给 builder——Dockerfile 不 COPY 也拦不住上下文传输。
 
 机检 `INV-NO-RAW-EXC`：`except ... as e` 绑定的名字裸流进 logger 调用（含 `str(e)`/`repr(e)`/f-string 插值/`'%s' % e`/切片）、`logger.exception(...)`、`exc_info=<真值>`、或赋给 *error* 命名的属性（`last_error` 等）。`safe_error_text(e)` 这类 sanitizer 包装放行。
