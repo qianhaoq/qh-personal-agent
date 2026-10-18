@@ -57,10 +57,13 @@ jobs:
     # Caller-level filter (saves Actions minutes): a submitted review can
     # only enable a merge when it is an approval (or Copilot's review).
     # Codex reviews re-evaluate via the Codex gate's workflow_run anyway.
+    # A gate run whose jobs were all caller-skipped (irrelevant label) has
+    # conclusion 'skipped' and changed nothing — don't start a sweep.
     if: >-
-      github.event_name != 'pull_request_review' ||
+      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion != 'skipped') &&
+      (github.event_name != 'pull_request_review' ||
       github.event.review.state == 'approved' ||
-      github.event.review.user.login == 'copilot-pull-request-reviewer[bot]'
+      github.event.review.user.login == 'copilot-pull-request-reviewer[bot]')
     uses: qianhaoq/devflow-gates/.github/workflows/auto-merge.yml@3853cc9dedbf1ffd8b10def841ed4c822dae7906  # devflow-gates main @ 3853cc9 (pinned; bump deliberately)
     with:
       # Exact check-run names = "<caller job name> / <called job name>"
