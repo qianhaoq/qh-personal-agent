@@ -668,6 +668,34 @@ def test_openai_absolute_http_base_url_ok():
         assert settings.llm_base_url == ok
 
 
+def test_openai_base_url_without_usable_authority_rejected():
+    """threads14 P2（config.py:236）/ INV-10.1：netloc 非空 ≠ 有可用的
+    HTTP authority——无 hostname（http://user@:80）或端口非法/越界
+    （:notaport / :99999）的值此前能过「绝对 http(s) URL」检查，
+    /healthz 照常报 provider，而每次 extract/ask 都在 OpenAICompatClient
+    构造/发送请求时才失败。端口合法性在 url.port 属性访问时才求值
+    （非法/越界抛 ValueError），必须强制求值再放行。"""
+    for bad in (
+        "http://user@:80",  # 有 userinfo 无 hostname
+        "http://:8080",  # 空 hostname
+        "https://example.com:notaport",  # 端口非数字（.port 访问时抛 ValueError）
+        "https://example.com:99999",  # 端口越界（.port 访问时抛 ValueError）
+    ):
+        kwargs = dict(_OPENAI_COMPLETE, llm_base_url=bad)
+        with pytest.raises(ValidationError, match="LLM_BASE_URL"):
+            Settings(database_url="sqlite+aiosqlite:///./app.sqlite3", **kwargs)
+        with pytest.raises(ValidationError, match="LLM_BASE_URL"):
+            _pg_settings(**kwargs)
+
+    # 显式合法端口照常放行（不被误伤）
+    for ok in ("http://llm.internal:8000/v1", "https://10.0.0.5"):
+        settings = Settings(
+            database_url="sqlite+aiosqlite:///./app.sqlite3",
+            **dict(_OPENAI_COMPLETE, llm_base_url=ok),
+        )
+        assert settings.llm_base_url == ok
+
+
 def test_mock_provider_skips_base_url_shape_check():
     """LLM_PROVIDER=mock 时 base_url 不参与任何调用，形态不校验（空串
     默认值必须照常通过，否则本地开发起不来）。"""

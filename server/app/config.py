@@ -76,6 +76,21 @@ def _decode_secret(secret: str) -> bytes | None:
     return None
 
 
+def _has_usable_http_authority(url) -> bool:
+    """threads14 P2（config.py:236）/ INV-10.1：urlsplit 结果有非空 netloc
+    不代表有**可用的 HTTP authority**——`http://user@:80`（无 hostname）、
+    `https://example.com:notaport`（端口非数字）/`:99999`（越界）都能过
+    「netloc 非空」检查，/healthz 照常报 provider，而每次 extract/ask 都在
+    OpenAICompatClient 构造/发送请求时才失败。url.port 的属性访问会完成
+    端口校验（非法/越界端口在此抛 ValueError，不求值就放过了它），
+    hostname 单独判空。"""
+    try:
+        port = url.port
+    except ValueError:
+        return False
+    return bool(url.hostname) and (port is None or 0 <= port <= 65535)
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
@@ -225,7 +240,11 @@ class Settings(BaseSettings):
         只查非空——裸主机名（llm.internal）、含空白的值、ftp:// 这类非
         http(s) scheme 都能过启动校验，/healthz 照常报 provider，而每次
         extract/ask 都在 httpx 构造请求时才失败（确定性部署错误耗尽全部
-        抽取任务才暴露）。任何环境生效；错误文案不含配置原值（INV-14）。"""
+        抽取任务才暴露）。任何环境生效；错误文案不含配置原值（INV-14）。
+        threads14 P2 补：netloc 非空不等于有可用的 HTTP authority——
+        无 hostname（http://user@:80）或端口非法（:notaport）的值同样
+        要到 OpenAICompatClient 构造/发送请求时才失败，见
+        _has_usable_http_authority。"""
         if self.llm_provider != "openai":
             return self
         raw = self.llm_base_url
@@ -234,12 +253,15 @@ class Settings(BaseSettings):
             any(ch.isspace() for ch in raw)
             or url.scheme not in ("http", "https")
             or not url.netloc
+            or not _has_usable_http_authority(url)
         ):
             raise ValueError(
                 "LLM_BASE_URL 必须是绝对的 http/https URL（如 "
                 "https://llm.example.com/v1）：当前值是裸主机名/相对路径、"
-                "含空白字符，或 scheme 不是 http(s)——这类值要到运行期 "
-                "httpx 构造请求时才失败，不会在启动时报出来"
+                "含空白字符、scheme 不是 http(s)、缺 hostname（如 "
+                "http://user@:80），或端口非法/越界（如 :notaport）——"
+                "这类值要到运行期 httpx 构造/发送请求时才失败，不会在"
+                "启动时报出来"
             )
         return self
 
