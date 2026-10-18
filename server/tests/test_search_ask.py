@@ -214,3 +214,30 @@ async def test_ask_slow_llm_does_not_block_other_requests(client, user, run_jobs
     resp = await asyncio.wait_for(ask_task, timeout=5)
     assert resp.status_code == 200, resp.text
     assert resp.json()["answer"]
+
+
+async def test_ask_answer_sanitized_unsafe_chars_stripped(client, user, run_jobs, monkeypatch):
+    """threads12 P2（ask.py:70）/ INV-7：/v1/ask 的 answer 是 LLM 文本唯一
+    「原样出站」的字段——lone surrogate 会让 Starlette 的 json.dumps 直接
+    编码失败变 500（extract 的入库字段早已过同一条清洗，出站面在此补齐）。
+    出站前过 app/schemas.py::clean_llm_str：剥 NUL/控制符/孤立代理对，
+    保留 \\t\\n。"""
+    await _add_note(client, user, "我对花生过敏，吃饭要注意")
+    await run_jobs()
+
+    class SpyLLM:
+        async def chat(self, messages, response_format=None):
+            return "答案\x01含控制符、\ud800孤立代理、NUL\x00、制表\t换行\n保留"
+
+    async def fake_get_llm():
+        return SpyLLM()
+
+    monkeypatch.setattr("app.api.ask.get_llm_client", fake_get_llm)
+    resp = await client.post(
+        "/v1/ask",
+        json={"text": "我吃东西要注意什么"},
+        headers=auth_headers(user),
+    )
+    assert resp.status_code == 200, resp.text
+    answer = resp.json()["answer"]
+    assert answer == "答案含控制符、孤立代理、NUL、制表\t换行\n保留"

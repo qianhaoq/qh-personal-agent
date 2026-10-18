@@ -1,5 +1,6 @@
 """请求/响应模型与序列化。"""
 import json
+import re
 from datetime import UTC, datetime
 from typing import Annotated
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -36,6 +37,23 @@ def reject_nul(value: str) -> str:
 
 
 NoNulStr = Annotated[str, AfterValidator(reject_nul)]
+
+# LLM 产出字符串里必须剥掉的不安全字符（threads8 P2 / INV-7）：NUL、
+# C0 控制符（保留 \t\n）、DEL、孤立 UTF-16 代理对——json.loads 会接受
+# 它们，但写 PostgreSQL text/JSON 列、或作为 HTTP 响应出站（Starlette
+# 的 json.dumps 遇 lone surrogate 直接编码失败变 500）时失败是**确定性**
+# 的；重试耗尽还会把一条完全有效的笔记标成 failed
+_UNSAFE_LLM_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\ud800-\udfff]")
+
+
+def clean_llm_str(value, limit: int | None = None) -> str:
+    """LLM 产出字符串的统一收口（INV-7，threads12 公共化）：转 str、剥
+    不安全字符、可选截断。任何「LLM 文本要离开进程」的点（入库列、
+    HTTP 响应）都必须过它——pipeline/extract 的结构化字段与 /v1/ask 的
+    answer 共用这一条路径；citations/search 的 text 来自已过入参校验的
+    笔记原文（clean-by-source），不在此重复清洗。"""
+    cleaned = _UNSAFE_LLM_CHARS.sub("", str(value or ""))
+    return cleaned if limit is None else cleaned[:limit]
 
 
 def _reject_surrogate(value: str) -> None:

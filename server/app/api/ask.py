@@ -12,7 +12,7 @@ from app.config import get_settings
 from app.deps import get_current_user_id
 from app.llm.base import get_llm_client
 from app.memory.base import get_memory_store
-from app.schemas import AskRequest, NoNulStr
+from app.schemas import AskRequest, NoNulStr, clean_llm_str
 from app.timeutil import to_utc, utcnow
 
 router = APIRouter(prefix="/v1", tags=["ask"])
@@ -67,7 +67,11 @@ async def ask(
         },
     ]
     llm = await get_llm_client()
-    answer = await llm.chat(messages)
+    # INV-7（threads12 P2，ask.py:70）：answer 是唯一「LLM 文本原样出站」
+    # 的字段——lone surrogate/控制字符会让 Starlette 的 json.dumps 编码
+    # 失败变 500（extract 的入库字段早已过同一条清洗，这里补齐出站面）；
+    # 不截断（对话回答无固定上限）
+    answer = clean_llm_str(await llm.chat(messages))
     return {
         "answer": answer,
         "citations": [
