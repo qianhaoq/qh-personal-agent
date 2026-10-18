@@ -657,6 +657,7 @@ def test_postgres_url_from_env_missing_password_is_config_error(monkeypatch):
     assert make_url(url).host == "db.internal"
 
 
+
 # ---------------------------------------------------------------------------
 # threads13 P2（config.py:188）/ INV-10.1：LLM_BASE_URL 必须是绝对的
 # http/https URL——非空但畸形的值此前能过「三元组齐备」检查，/healthz
@@ -702,12 +703,14 @@ def test_openai_base_url_without_usable_authority_rejected():
     （:notaport / :99999）的值此前能过「绝对 http(s) URL」检查，
     /healthz 照常报 provider，而每次 extract/ask 都在 OpenAICompatClient
     构造/发送请求时才失败。端口合法性在 url.port 属性访问时才求值
-    （非法/越界抛 ValueError），必须强制求值再放行。"""
+    （非法/越界抛 ValueError），必须强制求值再放行。threads15 P2 补：
+    显式 :0 是保留端口，urlsplit 对它放行——同样拒（端口须 ∈ 1..65535）。"""
     for bad in (
         "http://user@:80",  # 有 userinfo 无 hostname
         "http://:8080",  # 空 hostname
         "https://example.com:notaport",  # 端口非数字（.port 访问时抛 ValueError）
         "https://example.com:99999",  # 端口越界（.port 访问时抛 ValueError）
+        "https://example.com:0",  # 保留端口 0（threads15 P2：urlsplit 放行，须显式拒）
     ):
         kwargs = dict(_OPENAI_COMPLETE, llm_base_url=bad)
         with pytest.raises(ValidationError, match="LLM_BASE_URL"):
@@ -819,3 +822,63 @@ def test_numeric_upper_bounds_table_covers_all_checked_fields():
     # 上界必须有限且为正（float("inf") 当上界等于没设）
     for name, bound in _NUMERIC_UPPER_BOUNDS.items():
         assert 0 < bound < float("inf"), name
+
+
+def test_openai_whitespace_only_values_rejected():
+    """threads15 P2（config.py:228）/ INV-10.1：纯空白值不算「已设置」——
+    `"   "` 能过非空检查（bootstrap 报 provider ready），落到请求里才是
+    空 key/空 model。三个字段一律 strip 后判空，报「缺项」固定文案。"""
+    for field in ("llm_api_key", "llm_base_url", "llm_model"):
+        name = {"llm_api_key": "LLM_API_KEY", "llm_base_url": "LLM_BASE_URL", "llm_model": "LLM_MODEL"}[field]
+        for blank in ("   ", "\t\n "):
+            kwargs = dict(_OPENAI_COMPLETE, **{field: blank})
+            with pytest.raises(ValidationError, match=name):
+                Settings(database_url="sqlite+aiosqlite:///./app.sqlite3", **kwargs)
+        with pytest.raises(ValidationError, match=name):
+            _pg_settings(**kwargs)
+
+
+def test_openai_api_key_control_chars_rejected():
+    """threads15 P2（config.py:228）/ INV-10.1：LLM_API_KEY 原样进
+    Authorization 头，含 C0 控制字符（换行=头拆分/注入面）或 DEL 的值
+    要到每次请求发送时才失败。启动期拒绝；错误文案只报问题不报值
+    （INV-14——断言消息里不出现 key 原文）。"""
+    for bad in ("sk-test\nX-Extra: 1", "sk\x00test", "sk-test\x7f", "sk\ttest"):
+        kwargs = dict(_OPENAI_COMPLETE, llm_api_key=bad)
+        with pytest.raises(ValidationError, match="LLM_API_KEY 含 HTTP header 非法控制字符") as ei:
+            Settings(database_url="sqlite+aiosqlite:///./app.sqlite3", **kwargs)
+        assert "sk" not in str(ei.value), "错误消息不得回显 key 原文（INV-14）"
+    # 合法可见 ASCII/非 ASCII 不受影响
+    ok = dict(_OPENAI_COMPLETE, llm_api_key="sk-test-π München")
+    assert Settings(database_url="sqlite+aiosqlite:///./app.sqlite3", **ok).llm_api_key
+
+
+def test_postgres_url_from_env_brackets_ipv6_host():
+    """threads15 P2（config.py:395）/ INV-16：PGHOST 是 IPv6 字面量时必须
+    加方括号再拼 URL——不加括号 make_url 把地址里的冒号当 host:port
+    分隔符，解析直接 ValueError（部署错误拖到建连才炸）。已带括号的
+    不重复加；普通主机名不变。"""
+    from sqlalchemy.engine import make_url
+
+    from app.config import postgres_url_from_env
+
+    url = postgres_url_from_env(
+        {
+            "PGHOST": "2001:db8::10",
+            "PGPORT": "5433",
+            "PGUSER": "personal",
+            "PGPASSWORD": "pa-test-only",
+            "PGDATABASE": "agent_db",
+        }
+    )
+    assert url is not None
+    assert "@[2001:db8::10]:5433/" in url
+    assert make_url(url).host == "2001:db8::10"  # 未加括号时这里就 ValueError
+
+    already = postgres_url_from_env(
+        {"PGHOST": "[2001:db8::10]", "PGPASSWORD": "pa", "PGPORT": "5432"}
+    )
+    assert already == "postgresql+asyncpg://personal:pa@[2001:db8::10]:5432/personal_agent"
+
+    plain = postgres_url_from_env({"PGHOST": "db.internal", "PGPASSWORD": "pa"})
+    assert plain == "postgresql+asyncpg://personal:pa@db.internal:5432/personal_agent"

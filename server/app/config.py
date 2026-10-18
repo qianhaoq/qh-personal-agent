@@ -83,12 +83,13 @@ def _has_usable_http_authority(url) -> bool:
     「netloc 非空」检查，/healthz 照常报 provider，而每次 extract/ask 都在
     OpenAICompatClient 构造/发送请求时才失败。url.port 的属性访问会完成
     端口校验（非法/越界端口在此抛 ValueError，不求值就放过了它），
-    hostname 单独判空。"""
+    hostname 单独判空。threads15 P2 补：显式端口还须 ∈ 1..65535——
+    `:0` 是保留端口（urlsplit 对 0 放行），显式写它同属部署错误。"""
     try:
         port = url.port
     except ValueError:
         return False
-    return bool(url.hostname) and (port is None or 0 <= port <= 65535)
+    return bool(url.hostname) and (port is None or 1 <= port <= 65535)
 
 
 class Settings(BaseSettings):
@@ -215,7 +216,11 @@ class Settings(BaseSettings):
         """INV-10.1（修 C3，任何环境）：LLM_PROVIDER=openai 时
         LLM_API_KEY / LLM_BASE_URL / LLM_MODEL 三者必须齐备——缺任何一项
         启动即 ValueError，而不是运行期拼出相对 /chat/completions URL 或
-        空 model，让每次 extract/ask 都失败。"""
+        空 model，让每次 extract/ask 都失败。threads15 P2 补：**纯空白值
+        同样算缺**（`"   "` 能过非空检查，落到 httpx/请求体里才暴露），
+        且 LLM_API_KEY 拒绝 HTTP header 非法控制字符（C0 0x00-0x1F 与
+        DEL 0x7F——该值原样进 Authorization 头，含控制字符的每次请求
+        才失败）。错误文案只报名不报值（INV-14）。"""
         if self.llm_provider != "openai":
             return self
         missing = [
@@ -225,11 +230,17 @@ class Settings(BaseSettings):
                 ("LLM_BASE_URL", self.llm_base_url),
                 ("LLM_MODEL", self.llm_model),
             )
-            if not value
+            if not value.strip()
         ]
         if missing:
             raise ValueError(
                 "LLM_PROVIDER=openai 必须同时设置 " + "、".join(missing) + "（缺任一项启动即失败，不会静默回落）"
+            )
+        if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in self.llm_api_key):
+            raise ValueError(
+                "LLM_API_KEY 含 HTTP header 非法控制字符（C0/DEL）——该值"
+                "会原样进 Authorization 头，要到每次请求发送时才失败，"
+                "不会在启动时报出来"
             )
         return self
 
@@ -259,9 +270,9 @@ class Settings(BaseSettings):
                 "LLM_BASE_URL 必须是绝对的 http/https URL（如 "
                 "https://llm.example.com/v1）：当前值是裸主机名/相对路径、"
                 "含空白字符、scheme 不是 http(s)、缺 hostname（如 "
-                "http://user@:80），或端口非法/越界（如 :notaport）——"
-                "这类值要到运行期 httpx 构造/发送请求时才失败，不会在"
-                "启动时报出来"
+                "http://user@:80），或端口非法/越界/保留端口（如 "
+                ":notaport、:99999、:0）——这类值要到运行期 httpx 构造/"
+                "发送请求时才失败，不会在启动时报出来"
             )
         return self
 
@@ -379,6 +390,12 @@ def postgres_url_from_env(env: Mapping[str, str]) -> str | None:
     默认空密码：静默把「忘配密码」当 trust 放行会掩盖部署错误（与
     INV-16「密钥不静默进错位置」同向）；确需无密码的 trust 连接时显式
     设 PGPASSWORD=""（空串合法，编码后 userinfo 密码段为空）。
+
+    threads15 P2（config.py:395）：PGHOST 是 IPv6 字面量时必须加方括号
+    再进 URL authority——`2001:db8::10` 不加括号，make_url 会把地址里
+    的冒号当 host:port 分隔符拆组件，解析直接 ValueError（部署错误拖
+    到建连/启动校验才炸且报错不知所云）。主机名不可能含冒号，含冒号
+    即按 IPv6 处理；用户已带括号（`[2001:db8::10]`）不重复加。
     """
     if not any(key in env for key in _PG_TRIGGER_KEYS):
         return None
@@ -392,7 +409,12 @@ def postgres_url_from_env(env: Mapping[str, str]) -> str | None:
         )
     merged = {**_PG_DEFAULTS, **{k: str(v) for k, v in env.items() if k in _PG_ENV_KEYS}}
     userinfo = f"{quote(merged['PGUSER'], safe='')}:{quote(merged['PGPASSWORD'], safe='')}"
-    return f"postgresql+asyncpg://{userinfo}@{merged['PGHOST']}:{merged['PGPORT']}/{merged['PGDATABASE']}"
+    # IPv6 字面量加方括号（threads15 P2，见上）；主机名不含冒号，
+    # 含冒号即 IPv6，已带括号不重复加
+    host = merged["PGHOST"]
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"postgresql+asyncpg://{userinfo}@{host}:{merged['PGPORT']}/{merged['PGDATABASE']}"
 
 
 def _apply_pg_env_database_url(data: object) -> object:
