@@ -1305,3 +1305,100 @@ async def test_concurrent_revive_logins_bump_generation_once_all_tokens_valid(
             "/v1/auth/refresh", json={"refresh_token": pair["refresh_token"]}
         )
         assert refreshed.status_code == 200, refreshed.text
+
+
+async def test_logout_revalidates_generation_under_device_lock(
+    client, invite_code, monkeypatch
+):
+    """threads15 P1 / INV-8 陈述 4 + INV-13（auth.py:465）：get_auth 在独立
+    短会话里验过 gen=N 之后，logout 在等 device 行锁期间被插队——refresh
+    复用吊销该设备（gen N→N+1）、随后同设备再登录复活（gen N+1→N+2）。
+    持锁后不复查代际/吊销态的话，logout 会删掉**新代会话**的全部 refresh
+    行。锁内复验：代已变 → 不删任何行、按幂等语义 204，新会话照常可刷新。"""
+    import asyncio
+
+    from sqlalchemy import func
+
+    from app.api import auth as auth_api
+
+    device_id = "dev_logout_fence"
+
+    async def login() -> dict:
+        resp = await client.post(
+            "/v1/auth/login",
+            json={"invite_code": invite_code, "device_id": device_id, "device_name": "d"},
+        )
+        assert resp.status_code == 200, resp.text
+        return resp.json()
+
+    first = await login()
+    old_access, old_refresh = first["access_token"], first["refresh_token"]
+
+    # 制造一枚已轮换作废的 token（复用吊销的证据行）
+    rotated = await client.post("/v1/auth/refresh", json={"refresh_token": old_refresh})
+    assert rotated.status_code == 200, rotated.text
+
+    # 注入等锁窗口：logout 的 get_auth 已过（gen=N），_lock_device 执行前
+    # 插队完成「reuse 吊销 + 再登录复活换代」（真实并发的等价形态——这些
+    # 写各自独立会话提交，logout 的锁内重读必然可见）
+    real_lock_device = auth_api._lock_device
+    interleaved = asyncio.Event()
+
+    async def lock_device_with_interleaving(session, device_id_arg):
+        if not interleaved.is_set():
+            interleaved.set()
+            # a) 重放已轮换的 token：复用吊销整台设备（gen 0→1）
+            reuse = await client.post(
+                "/v1/auth/refresh", json={"refresh_token": old_refresh}
+            )
+            assert reuse.status_code == 401, reuse.text
+            assert reuse.json()["error"]["code"] == "refresh_reused"
+            # b) 同设备再登录：复活 + 换代（gen 1→2），签发全新会话凭证
+            await login()
+            assert await _device_generation(device_id) == 2
+        return await real_lock_device(session, device_id_arg)
+
+    monkeypatch.setattr(auth_api, "_lock_device", lock_device_with_interleaving)
+
+    # 旧代 access 发起 logout（get_auth 时 gen=0 尚与设备一致）
+    logged_out = await client.post(
+        "/v1/auth/logout", headers={"authorization": f"Bearer {old_access}"}
+    )
+    assert logged_out.status_code == 204, logged_out.text
+    assert interleaved.is_set(), "等锁窗口注入必须真的发生"
+
+    # 锁内复验生效：新代（gen=2）会话的 refresh 行未被旧代 logout 删除
+    revived = await login()
+    fresh_refresh = revived["refresh_token"]
+    refreshed = await client.post("/v1/auth/refresh", json={"refresh_token": fresh_refresh})
+    assert refreshed.status_code == 200, refreshed.text
+
+    # 库内对照：设备上仍有存活的 refresh 行（新代的），没有被清空
+    from app.db import get_sessionmaker
+    from app.models import RefreshToken as RT
+
+    async with get_sessionmaker()() as session:
+        live = (
+            await session.execute(
+                select(func.count())
+                .select_from(RT)
+                .where(RT.device_id == device_id, RT.revoked_at.is_(None))
+            )
+        ).scalar_one()
+    assert live >= 1, "旧代 logout 不得删掉新代 refresh 行"
+
+    # 旧代凭证本身照常被代际 fence 挡住（与 logout 无关的既有语义）
+    stale = await client.get(
+        "/v1/notes", headers={"authorization": f"Bearer {old_access}"}
+    )
+    assert stale.status_code == 401
+
+    # 同代正常 logout 不受影响：新代 access 登出后，其 refresh 全部失效
+    monkeypatch.undo()
+    normal = await client.post(
+        "/v1/auth/logout",
+        headers={"authorization": f"Bearer {revived['access_token']}"},
+    )
+    assert normal.status_code == 204, normal.text
+    after = await client.post("/v1/auth/refresh", json={"refresh_token": fresh_refresh})
+    assert after.status_code == 401

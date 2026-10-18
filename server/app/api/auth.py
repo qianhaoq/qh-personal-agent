@@ -462,8 +462,20 @@ async def logout(
     # 该写一旦被移除/重排，204 就会漏删并发签发的 token。显式先取 device
     # 行锁使「device → refresh_tokens」的文档锁序成立：logout 必然排在
     # 同设备先行事务之后，DELETE 一定看到其已提交的全部 token 行
+    #
+    # 锁内代际复验（threads15 P1 / INV-8 陈述 4 + INV-13 总原则）：get_auth
+    # 在独立短会话里验过 gen=N，但等这把 device 锁期间设备可能已被吊销
+    # （reuse）又复活换代（再登录）——不复查就会删掉**新代**会话的全部
+    # refresh 行。锁内重读 Device 的 credential_generation 与 revoked_at
+    # （_lock_device 的 SELECT 即锁内读），代已变或设备已吊销 → 本次请求
+    # 的凭证所属于的会话已整体失效，按 logout 幂等语义当作「已登出」返回
+    # 204、不删任何行——新代 token 的生死由新会话自己决定
     device = await _lock_device(session, auth.device_id)
-    if device is not None:
+    if (
+        device is not None
+        and device.revoked_at is None
+        and device.credential_generation == auth.credential_generation
+    ):
         device.last_seen = utcnow()
         await session.execute(
             delete(RefreshToken)

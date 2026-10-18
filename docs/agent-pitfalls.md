@@ -214,11 +214,21 @@ result = _token_pair(user_id, device_id, gen)     # 错：invite 没用新 now �
 # 对：锁落定、now 重取之后、_token_pair 之前，标量列重读 invite.expires_at
 #     用新 now 复验；过期 → rollback 本次登录事务（upsert/claim/建号一并
 #     撤销）+ 403——「上游验证过」不豁免「本锁点签发前」的最后一验
+
+# 错 5：鉴权在独立短会话里验过、持锁写入时不复验凭证代际/吊销态
+#       → logout 的 get_auth 过了 gen=N，等 device 行锁期间 reuse 吊销
+#         + 再登录复活换代（N→N+2），持锁后直接 DELETE 会删掉新代会话
+#         的全部 refresh 行（threads15 P1，auth.py:465）
+device = await _lock_device(session, auth.device_id)
+await session.execute(delete(RefreshToken).where(...))   # 错：代际/吊销没复验
+# 对：AuthContext 携带 JWT 的 gen claim，锁内复验
+#     device.credential_generation == auth.credential_generation 且
+#     device.revoked_at is None 才删；跨代/已吊销 → 不删、幂等 204
 ```
 
 签发类时间戳同属此类（threads10）：租约 `locked_at` 是签发时刻，取写入时刻的 `utcnow()` 而非 claim 循环起点——等锁消耗的时间等量缩短租约，活 worker 越早被误判失灵。
 
-排查手法：`rg "with_for_update|pg_advisory|on_conflict|rowcount" server/app` 列出全部等待窗口，逐点问「锁后用于决策的 now / 计数 / 过期判定 / iat·exp，是锁内取的还是等锁前的？claim **成功之后**还要不要用成功时刻的 now 再验一次过期？**先锁设备再签凭证的路径，发证前要不要用锁后新 now 再验一次上游过期（invite）**？签发的时间戳（locked_at、iat/exp）取的是写入时刻还是请求/循环起点？」纯展示时间戳与方向保守的判定可以豁免但必须注释论证；全仓锁点表见 server-invariants.md INV-13。
+排查手法：`rg "with_for_update|pg_advisory|on_conflict|rowcount" server/app` 列出全部等待窗口，逐点问「锁后用于决策的 now / 计数 / 过期判定 / iat·exp，是锁内取的还是等锁前的？claim **成功之后**还要不要用成功时刻的 now 再验一次过期？**先锁设备再签凭证的路径，发证前要不要用锁后新 now 再验一次上游过期（invite）**？**鉴权/claim 在别的会话或等锁前验过的状态（凭证代际、吊销态、租约），本锁点写入前要不要锁内重读复验**？签发的时间戳（locked_at、iat/exp）取的是写入时刻还是请求/循环起点？」纯展示时间戳与方向保守的判定可以豁免但必须注释论证；全仓锁点表见 server-invariants.md INV-13。
 
 ## 13. 密钥拼进 URL 必须先 percent-encode（INV-16） <a id="url-encode"></a>
 
