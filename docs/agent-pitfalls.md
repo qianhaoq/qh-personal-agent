@@ -141,9 +141,19 @@ job.last_error = safe_error_text(exc)
 
 框架层的口子与收口：
 
-- **uvicorn access log**（默认开）：请求行含完整 query——`GET /v1/search?q=<笔记正文>` 整行进 stdout。收口：compose 与 Dockerfile 的 uvicorn 命令一律 `--no-access-log`；请求级日志用 `app/middleware.py::AccessLogMiddleware`，只记 method、路由模板、status、耗时，不记 query 与路径参数原值。
+- **uvicorn access log**（默认开）：请求行含完整 query——`GET /v1/search?q=<笔记正文>` 整行进 stdout。收口：compose 与 Dockerfile 的 uvicorn 命令一律 `--no-access-log`，**README/docs 的文档示例命令同口径**（threads10 P1：照文档起步的本地开发照样把 query 打进终端）；请求级日志用 `app/middleware.py::AccessLogMiddleware`，只记 method、路由模板、status、耗时，不记 query 与路径参数原值。
 - **ServerErrorMiddleware 必 re-raise**：注册 `Exception` handler 只消毒响应体，Starlette 调完 handler 后总是 re-raise，原始 traceback 进 uvicorn.error 日志。收口：最外层 `SafeErrorFallbackMiddleware` 吞掉异常——记 `safe_error_text`、回固定 500、**永不 re-raise**。
 - **SQLAlchemy echo / 第三方 logger**：`DATABASE_URL` 的 URL query 带 `echo=true` 会让引擎把 SQL+绑定参数打进 sqlalchemy.engine 日志（config 启动即拒）；httpx/httpcore/openai 的 logger 钉 >= WARNING（`app/logs.py::harden_third_party_loggers`，create_app 与 worker main 都要调）。
+- **422 的 msg 本身也是回显面**（threads10 P1）：`validation_exception_handler` 剥掉 `input`/`ctx`，但返回的 `msg` 若在校验器里 f-string 插了用户输入原值，照样回显。校验器 ValueError 一律固定文案：
+
+  ```python
+  # 错：用户提交的 timezone 原值进 422 msg
+  raise ValueError(f"timezone 必须是合法 IANA 时区名：{value}")
+  # 对：固定文案，不插值
+  raise ValueError("timezone 必须是合法 IANA 时区名")
+  ```
+
+- **启动校验异常带密钥明文**（threads10 P1）：`get_settings()` 在模块 import 期跑（api/worker），中间件还没挂上；pydantic ValidationError 的 `input_value` 截断 repr 会露出**尾部**字段的值（实测 `'jwt_secret': '...7766554433221100secret'`），traceback 整段落 uvicorn/进程日志。收口：`get_settings`/`get_db_settings` 边界捕获 ValidationError → 转只含 loc/msg/type 的 `ConfigError`，`from None` 抑制隐式 `__context__` 链（否则原 ValidationError 仍随链式 traceback 打出）。SecretStr 只护 repr、不覆盖 `database_url` 的 password 部分，不采用（决策见 server-invariants.md「为什么」表）。
 - **构建上下文也是泄漏面**：无 `.dockerignore` 时 `server/.env`（密钥）与本地 SQLite 笔记库会整体发给 builder——Dockerfile 不 COPY 也拦不住上下文传输。
 
 机检 `INV-NO-RAW-EXC`：`except ... as e` 绑定的名字裸流进 logger 调用（含 `str(e)`/`repr(e)`/f-string 插值/`'%s' % e`/切片）、`logger.exception(...)`、`exc_info=<真值>`、或赋给 *error* 命名的属性（`last_error` 等）。`safe_error_text(e)` 这类 sanitizer 包装放行。
@@ -168,6 +178,18 @@ result = _token_pair(user_id, device_id)         # iat/exp 在锁前定下
 await session.execute(_device_upsert(...))       # 在这里等锁
 # 对：先 upsert（锁落定 + rowcount 复查），再 now = utcnow()、再 _token_pair、
 #     再 _append_refresh_token（refresh 路径一直是这个顺序）
+
+# 错 3：只信条件 UPDATE 的 rowcount==1 就认为时间谓词仍然成立
+#       → PG READ COMMITTED 等锁后用等待前绑定的 now 参数重评谓词，
+#         等待期间跨过 expires_at 的邀请码照样抢占成功（threads10 P1）
+claimed = await session.execute(update(InviteCode).where(...))
+if claimed.rowcount == 1:
+    return True                                   # 错：谓词里的 now 是等锁前绑定的
+# 对：rowcount==1（仍持行锁）后标量列重读 expires_at + 重取 utcnow() 复验，
+#     过期 → rollback 本次 claim + 403；行值谓词（used/owner/rev）由 UPDATE
+#     原子判定无此问题，只有墙钟绑定参数会陈旧
 ```
 
-排查手法：`rg "with_for_update|pg_advisory|on_conflict|rowcount" server/app` 列出全部等待窗口，逐点问「锁后用于决策的 now / 计数 / 过期判定 / iat·exp，是锁内取的还是等锁前的？」纯展示时间戳与方向保守的判定可以豁免但必须注释论证；全仓锁点表见 server-invariants.md INV-13。
+签发类时间戳同属此类（threads10）：租约 `locked_at` 是签发时刻，取写入时刻的 `utcnow()` 而非 claim 循环起点——等锁消耗的时间等量缩短租约，活 worker 越早被误判失灵。
+
+排查手法：`rg "with_for_update|pg_advisory|on_conflict|rowcount" server/app` 列出全部等待窗口，逐点问「锁后用于决策的 now / 计数 / 过期判定 / iat·exp，是锁内取的还是等锁前的？claim **成功之后**还要不要用成功时刻的 now 再验一次过期？签发的时间戳（locked_at、iat/exp）取的是写入时刻还是请求/循环起点？」纯展示时间戳与方向保守的判定可以豁免但必须注释论证；全仓锁点表见 server-invariants.md INV-13。

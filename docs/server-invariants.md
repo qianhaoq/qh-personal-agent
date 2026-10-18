@@ -9,6 +9,7 @@
 > 第七轮输入：threads7.txt 的 5 条 P1（2 条 C 类 auth、1 条 A 类 memory_sync、1 条 compose；mem0_store.py 的 infer 一条**不在本分支修**，随生产记忆后端整体移交 feat/mem0-backend 分支），在对应 INV 内注明：INV-12 补「条件写后的重读必须绕过 identity map」（synchronize_session=False 不更新已加载对象）；INV-8 补「所有失败分支（含吊销/重放分支）先 _lock_device、锁内重读 token 行再判定」；INV-5 补「补偿入队必须在 try/finally——store.delete 抛异常也一定入队」；INV-9/INV-10 补「init-db 只校验数据库配置（校验分层），compose 各服务按 command 通过各自的启动校验（有测试）」。同轮把 mem0 生产后端拆分出去：`MEMORY_BACKEND` 取值变为 `inmemory | disabled`（新增空后端），mem0 相关实现细节从本仓移除、由后续 PR（feat/mem0-backend）提供，本文相应标注。
 > 第八轮输入：threads8.txt 的 7 条（3 P1 + 4 P2），按类全仓排查后修：新增 INV-13（加锁后使用的派生值必须在锁内由重读数据重算，含 now；P1 auth.py:294）、INV-14（日志/数据库/错误响应不存异常原文与用户内容；P1 runner.py:71）、INV-15（改源字段必须让派生字段失效；P1 notes.py:215）；INV-5/6 补「置位 UPDATE 与租约校验原子」（P2 memory_sync.py:131）；INV-7 补「LLM 输出字符串剔除 NUL/不安全控制字符」（P2 extract.py:120）与「MockLLM 相对时间数量上界」（P2 mock.py:78）；INV-10 补「数值配置必须为正」（P2 config.py:99）。机械检查器同步新增 INV-NO-RAW-EXC（映射 INV-14）。
 > 第九轮输入：threads9.txt 的 6 条（5 P1 + 1 P2），按类全仓排查后修：INV-13 补 login 的两个锁点（P1 auth.py:240 邀请码输方重读后沿用等锁前的 now 判过期；P1 auth.py:248 `_token_pair` 在 device upsert 锁前签发 iat/exp）并附全仓锁点核查表；INV-14 扩到**框架层与构建上下文**（P1 main.py:56 ServerErrorMiddleware 必 re-raise、P1 docker-compose.yml:44 uvicorn access log 带 query、P1 docker-compose.yml:21 无 .dockerignore——.env 与本地库进构建上下文；另 SQLAlchemy echo 的 URL query 向量、httpx/httpcore/openai logger 级别钉扎）；INV-7 补「MockLLM 十进制数量位数上界」（P2 mock.py:49，CPython int() 约 4300 位上限）。
+> 第十轮输入：threads10.txt 的 4 条 P1，按类全仓排查后修：INV-13 补「条件更新/claim **成功之后**必须用成功时刻的 now 再验过期/签发」（P1 auth.py:211 邀请码 claim 的 rowcount==1 路径——PG READ COMMITTED 等锁后谓词重评仍用等待前绑定的 now 参数，等待期间过期的码照样抢占建号；同轮把租约签发 locked_at 归入签发时刻规则，queue.py `_mark_running`/`_reclaim_running` 改为写入时刻取值）；INV-14 补三条（P1 schemas.py:156「422 msg 固定文案不插值请求原值」——剥 input/ctx 不够，msg 本身就是回显面；P1 config.py:68「启动校验失败不得含密钥明文」——pydantic ValidationError 的 input_value 截断 repr 会露出尾部字段密钥，get_settings/get_db_settings 边界转 ConfigError；P1 README.md:52「文档启动示例必须 --no-access-log」——照文档起步的本地开发同样是日志收集面）。
 
 ## 0. 总览：新任务与记忆模型
 
@@ -391,18 +392,21 @@ memory_sync(note_id)     不带 rev。短读事务取 note 当前状态 →（�
 1. **锁内重取**：`now` 之类的时间基线在锁内重新取（`utcnow()`）；
 2. **锁内重读**：来自行数据的派生值由锁定行的当前值得出——显式重读（绕 identity map，见 INV-12）或由条件 UPDATE 的 WHERE 对行当前值**原子判定**；
 3. **版本栅栏**：锁前的快照值被一个锁内原子复查的版本号（如 note 的 rev）守护——快照之后任何会改它的写都必然推进版本，复查不过即放弃（extract apply 对 `timezone/recorded_at` 的用法）。
+4. **成功后复验（threads10 P1，auth.py:211）**：条件 UPDATE 的 WHERE 里以**绑定参数**表达的墙钟判定（`expires_at > :now`），在 PG READ COMMITTED 等锁重评时**不重绑参数**——等待期间跨过 expires_at 的行仍会 rowcount=1。凡条件更新/claim/拿锁**成功**之后仍依赖该时间判定的，必须用成功时刻重取的 now 再验一次；**签发类时间戳**（租约 `locked_at`、凭证 iat/exp）同理取**写入时刻**的 now，不用等锁前算好的值。
 
 违反样例：
 
 - threads8 P1（auth.py:294）：`refresh` 在请求起始取 `now`，拿到 device 行锁后的轮换条件 UPDATE 仍用 `RefreshToken.expires_at > now`（旧 now）判过期——token 首读有效、等锁期间跨过 `expires_at` 时已过期的 token 仍被轮换成新凭证（200），「等锁期间跨过期」的归因分支（INV-12）对此场景永不可达。修复：`_lock_device` 之后重取 `now`，条件 UPDATE 对行内当前 `expires_at` 原子判定。
 - threads9 P1（auth.py:240，login 邀请码输方）：并发首登同一邀请码，输方的条件 UPDATE 在 invite 行锁上等待赢家事务，输了之后 rollback 重读已提交状态，过期比较却仍用**等锁之前**取的 `now`——等待期间邀请码跨过 `expires_at` 时，输方接受已过期邀请并登录赢家账号（晚于此时刻开始的同一登录反而 403）。修复：`_resolve_lost_invite` 重读之后重取 `now = utcnow()` 再判过期。
 - threads9 P1（auth.py:248，login 锁前签发）：`_token_pair`（内部取 `datetime.now` 定 iat/exp）在 `_device_upsert` **之前**调用——device upsert 的行锁是本接口最长的等待窗口，短 `ACCESS_TOKEN_TTL_SECONDS` + 长等待下返回的 access token **到手即过期**。修复：`_token_pair` 移到 upsert（及 rowcount 复查）之后，并在锁后重取 `now` 供签发与 `_append_refresh_token`（与 refresh 路径同序）。
+- threads10 P1（auth.py:211，claim 成功后不复验）：`_claim_invite_first_use` 的 rowcount==1 路径——UPDATE 在 invite 行锁上等待赢家事务，醒来后 PG 用等待前绑定的 now 重评 `expires_at > :now`，等待期间过期的邀请码仍抢占成功并创建账号，绕过 `_resolve_lost_invite` 的过期归因。修复：抢占成功后（仍持行锁）标量列重读 `expires_at`、重取 `utcnow()` 复验；已过期则回滚本次 claim（owner/used 撤销）并按过期 403，不签发任何凭证。
+- threads10（queue.py `_mark_running`/`_reclaim_running`，租约签发时刻）：`locked_at` 写的是 claim_next 循环开头的 now——`SELECT … FOR UPDATE` 等锁消耗的时间会等量缩短租约（等待越久越早被回收，活 worker 被误判失灵）。修复：签发时刻在函数内重取 `utcnow()`；claim 循环外用于 `run_after<=now`/`locked_at<cutoff` 过滤的旧值维持既有边界论证（方向保守）。
 
 **全仓锁点核查表**（threads9 A 类全仓清扫；「锁点」= 存在等待窗口的写路径，逐点核查锁后用于决策的派生值来源）：
 
 | 锁点 | 等待窗口 | 锁后派生值 | 结论 |
 | --- | --- | --- | --- |
-| auth.login 邀请码首用条件 UPDATE（抢占） | invite 行锁 | 无（WHERE 对行当前值原子判定） | 正面样例 |
+| auth.login 邀请码首用条件 UPDATE（抢占） | invite 行锁 | 过期判定的 now 是**语句参数**（等锁重评不重绑，threads10 P1）；used/owner 为行值谓词（原子判定） | **已修（threads10）**：rowcount==1 后锁内重取 now 复验过期，过期回滚 claim + 403 |
 | auth.login 抢占输方重读（threads9 P1 修） | 同上（等待后输） | 过期判定的 `now` | **已修**：重读后重取 now |
 | auth.login device upsert → 签发/追加/修剪（threads9 P1 修） | device 行锁（PK 冲突串行化） | iat/exp、`_append_refresh_token` 的 created_at/prune 基线 | **已修**：`_token_pair` 与 now 都移到锁后；`last_seen` 陈旧为纯展示边界 |
 | auth.login device upsert rowcount==0 复查 | 同上 | 无时间判定（归属比较） | 正面样例（rollback 后重读，INV-12） |
@@ -412,18 +416,20 @@ memory_sync(note_id)     不带 rev。短读事务取 note 当前状态 →（�
 | notes.patch_note / delete_note | note 条件 UPDATE（即锁） | 0 行复查无时间判定；`updated_at=utcnow()` 语句构造时求值 | 复查正面；时间戳为 INV-13 边界（纯展示） |
 | extract._apply_extraction（PG note FOR UPDATE） | note 行锁 | 提醒窗口判定的 now、timezone/recorded_at 快照 | 正面样例：锁内 now + rev 版本栅栏 |
 | memory_sync._mark_memory_status 置位事务 | job 行 FOR UPDATE | 租约复核（等值比较锁内行值，非时间派生） | 正面样例 |
-| queue.claim（PG FOR UPDATE SKIP LOCKED / SQLite 条件 UPDATE） | job 行锁 | `_lock_cutoff` 的 cutoff（循环外取） | 边界：方向保守（晚一轮回收，不错收/不错放），注释论证 |
+| queue.claim（PG FOR UPDATE SKIP LOCKED / SQLite 条件 UPDATE） | job 行锁 | 租约签发 `locked_at`（threads10）；`_lock_cutoff` 的 cutoff 与 `run_after<=now`（循环外取） | locked_at **已修（threads10）**：`_mark_running`/`_reclaim_running` 内取写入时刻；cutoff/run_after 维持边界：方向保守（晚一轮回收，不错收/不错放），注释论证 |
 | queue.finalize_claim（PG job FOR UPDATE） | job 行锁 | `run_after = utcnow()+delay` | 正面样例：锁内取 |
 | db.init_db（pg_advisory_xact_lock） | 咨询锁 | 无业务派生值（create_all） | 不适用 |
 
 **边界（允许的例外，须注释论证）**：纯展示/时间戳用途的旧值（如 PATCH `.values(updated_at=utcnow())` 在语句构造时求值，陈旧 µs–ms 级、无决策依赖；device `last_seen` 无任何决策读它）；方向保守的判定（如 `_claim_postgres` 的 `cutoff = now - timeout` 在循环外取——陈旧只会让刚过期的租约晚一轮被回收，不会错回收/错放行）；无等待窗口的首个写（login 的 invite 条件 UPDATE 前 `now` 即取即用）。全仓各锁点的逐条核查记录见第八/九轮 sweep（`/workspace/.agent-tmp/sweep8.md` D 类、`sweep9.md` A 类）。
 
-**保证代码**：`app/api/auth.py::login`（`_resolve_lost_invite` 重读后重取 now；`_token_pair` 移到 device upsert 之后，threads9 P1）、`app/api/auth.py::refresh`（锁内重取 now；`_revoke_device_for_reuse` 的锁内 `utcnow()` 判过期为 threads7 已有正面样例）、`app/pipeline/extract.py::_apply_extraction`（版本栅栏 + 锁内 now）、`app/jobs/queue.py::finalize_claim`（锁内读值判定）、`app/pipeline/memory_sync.py::_mark_memory_status`（置位事务内原子租约复核，INV-5/6）。
+**保证代码**：`app/api/auth.py::login`（`_resolve_lost_invite` 重读后重取 now；`_token_pair` 移到 device upsert 之后，threads9 P1）、`app/api/auth.py::_claim_invite_first_use`（rowcount==1 后锁内重取 now 复验过期，threads10 P1）、`app/api/auth.py::refresh`（锁内重取 now；`_revoke_device_for_reuse` 的锁内 `utcnow()` 判过期为 threads7 已有正面样例）、`app/pipeline/extract.py::_apply_extraction`（版本栅栏 + 锁内 now）、`app/jobs/queue.py::finalize_claim`（锁内读值判定）、`app/jobs/queue.py::_mark_running/_reclaim_running`（租约 locked_at 取写入时刻，threads10）、`app/pipeline/memory_sync.py::_mark_memory_status`（置位事务内原子租约复核，INV-5/6）。
 
 **验证测试**：
 - `test_refresh_token_expires_while_waiting_device_lock_401`（threads8 P1：可控时钟 + 注入等锁窗口，token 在窗口内跨过 expires_at → 401 unauthorized、行未轮换、设备未吊销）
 - `test_invite_expires_while_loser_waiting_claim_403`（threads9 P1：可控时钟推进 + 赢家在独立会话提交抢占（跨会话提交对 rollback 后的输方可见，与真实等锁等价），邀请码在等待窗口内跨过 expires_at → 403 invalid_invite、无凭证签发）
 - `test_login_mints_tokens_after_device_row_lock`（threads9 P1：钩子记录 device upsert 语句执行与 `_token_pair` 签发的先后，断言 upsert→mint；解码 access token 断言 exp−iat==TTL 且 refresh 可用）
+- `test_invite_claim_revalidates_expiry_after_claim_success_403`（threads10 P1：可控时钟推过 expires_at 后用旧 now 执行真实抢占——rowcount=1 正是「谓词用等待前参数重评」的窗口 → 403 invalid_invite、claim 回滚（owner/used 复位）、无设备行无凭证）
+- `test_claim_lease_issued_at_update_moment_not_loop_start`（threads10：置 running 前时钟前进，locked_at=前进后时刻而非 claim 循环起点——租约不被 FOR UPDATE 等锁时间缩短）
 - 既有正面样例回归：`test_refresh_reuse_revoked_but_expired_401_no_revoke`（锁内 `utcnow()` 判过期的既有行为不变）
 
 ### INV-14 日志/数据库/错误响应不存异常原文与用户内容（threads8 P1，runner.py:71）
@@ -434,19 +440,21 @@ memory_sync(note_id)     不带 rev。短读事务取 note 当前状态 →（�
 
 **框架层（threads9 扩写）**——这些口子应用代码看不见，各自专门收口：
 
-1. **uvicorn access log（P1 docker-compose.yml:44）**：默认开启，请求行含完整 query——`GET /v1/search?q=<笔记正文>` 整行进 stdout（compose 日志收集面）。收口：compose 与 Dockerfile 的 uvicorn 命令一律 `--no-access-log`（`test_uvicorn_commands_disable_access_log` 机械锁定）；进程内保留请求级排障入口的是自有 `AccessLogMiddleware`（`app/middleware.py`）——只记 **method、路由模板（`scope["route"].path`，如 `/v1/notes/{note_id}`）、status、耗时**，不记 query、不记路径参数原值（未匹配路由记 `(unmatched)`）。
+1. **uvicorn access log（P1 docker-compose.yml:44；threads10 P1 README.md:52）**：默认开启，请求行含完整 query——`GET /v1/search?q=<笔记正文>` 整行进 stdout（compose 日志收集面）。收口：compose 与 Dockerfile 的 uvicorn 命令一律 `--no-access-log`（`test_uvicorn_commands_disable_access_log` 机械锁定）；**文档里的启动示例同口径**——README 本地开发命令也必须带 `--no-access-log`（`test_readme_documented_uvicorn_command_disables_access_log` 锁定 fenced block），照文档起步的开发环境同样是终端/开发日志收集面；进程内保留请求级排障入口的是自有 `AccessLogMiddleware`（`app/middleware.py`）——只记 **method、路由模板（`scope["route"].path`，如 `/v1/notes/{note_id}`）、status、耗时**，不记 query、不记路径参数原值（未匹配路由记 `(unmatched)`）。
 2. **ServerErrorMiddleware 必 re-raise（P1 main.py:56）**：`add_exception_handler(Exception, …)` 只消毒**响应体**；Starlette 的 `ServerErrorMiddleware` 调完 handler 后总是 re-raise，原始异常与 traceback 进 uvicorn.error 日志（SQLAlchemy StatementError 的 str 内嵌 SQL 绑定参数）。收口：最外层用户中间件 `SafeErrorFallbackMiddleware`（纯 ASGI）捕获一切 `Exception` → 记一行 `safe_error_text` → 响应未开始则回固定 500 JSON、**永不 re-raise**（uvicorn 收不到异常，traceback 无从落日志）；响应已开始（流式半途，本仓无流式端点）同样不 re-raise——re-raise 只会换回「uvicorn 打整段 traceback」这条被禁路径。**有意不给 `uvicorn.error` 配 filter**：兜底中间件永不 re-raise 后该分支不可达，无异常可滤；全局 filter 会把基础设施异常（连接错误等，不含用户内容）的 traceback 也抹掉，缩小诊断面。
 3. **SQLAlchemy echo 的 URL query 向量**：全仓未传 `echo`，但 `create_async_engine` 会把 URL query 当引擎参数——`DATABASE_URL=…?echo=true` 静默开 echo，SQL+绑定参数整体进 sqlalchemy.engine 日志。收口：`app/config.py::_reject_sqlalchemy_echo`（任何环境）对 `make_url(database_url).query` 里真值的 `echo` 启动即 ValueError；排障需要 SQL 时本地临时改代码，不开配置口。
 4. **第三方 HTTP 客户端 logger**：httpx INFO 级打每个请求行、未来版本可能打请求细节（LLM 请求体含笔记正文）。收口：`app/logs.py::harden_third_party_loggers` 把 `httpx`、`httpcore`、`openai` 钉 >= WARNING；`create_app`（api）与 worker `main()`（basicConfig 之后）统一调用。**gunicorn**：本仓无（requirements 只有 `uvicorn[standard]`，compose/Dockerfile 直接 uvicorn）；将来引入时必须同查其 access/error logger 配置。
-5. **构建上下文也是泄漏面（P1 docker-compose.yml:21）**：compose 三个服务 `build: .` 而仓库曾无 `server/.dockerignore`——按 README 生产部署创建的 `server/.env`（JWT/LLM/PG 密钥）与本地 SQLite 笔记库会**整体发给 builder**（legacy/remote builder 都拿得到全量上下文，Dockerfile 不 COPY 也拦不住传输）。收口：`server/.dockerignore` 排除 `.env`/`.env.*`、`*.db`/`*.db-*`/`*.sqlite*`、`*.log`、`.venv/`/`venv/`、`__pycache__/`/`*.py[cod]`、各缓存目录、`tests/`、`.git/`；镜像只 COPY `requirements-app.txt` 与 `app/`（tests 不进镜像，测试锁定）。
+5. **构建上下文也是泄漏面（P1 docker-compose.yml:21）**：compose 三个服务 `build: .` 而仓库曾无 `server/.dockerignore`——按 README 生产部署创建的 `server/.env`（JWT/LLM/PG 密钥）与本地 SQLite 笔记库会**整体发给 builder**（legacy/remote builder 都拿得到全量上下文，Dockerfile 不 COPY 也拦不住传输）。收口：`server/.dockerignore` 排除 `.env`/`.env.*`、`*.db`/`*.db-*`/`*.sqlite*`、`*.log`、`.venv/`/`venv/`、`__pycache__/`/`*.py[cod]`、各缓存目录、`tests/`、`.git/`；`!.env.example` 保留模板进上下文（真实 `.env` 仍被 `.env`/`.env.*` 排除）；镜像只 COPY `requirements-app.txt` 与 `app/`（tests 不进镜像，测试锁定）。
+6. **启动校验失败的 traceback 不含密钥明文（threads10 P1，config.py:68）**：`jwt_secret`/`llm_api_key` 是 plain str、`database_url` 内嵌 PG 密码——任一 `mode="after"` 校验器抛错时，pydantic ValidationError 的 `input_value` 截断 repr 会露出**尾部**字段的值（实测：仅设 `DATABASE_URL`+`JWT_SECRET` 时消息末尾出现 `'jwt_secret': '…<密钥尾部>'`）。`get_settings`/`get_db_settings` 跑在一切中间件之前（api 的模块级 `create_app()`、worker 模块级 basicConfig、cli），traceback 整段落 uvicorn/进程日志。收口：两个入口边界捕获 ValidationError → 转成只含 `loc/type/msg` 的 `ConfigError`（strip `input`/`ctx`；msg 来自本仓校验器的固定文案或 pydantic 内置模板，均不含输入值），`from None` 抑制隐式 `__context__`（否则原 ValidationError 仍随「During handling of…」链式 traceback 打出）。**有意不用 SecretStr**：只护 repr、不覆盖 `database_url` 的 password 部分、且要改所有取值点与既有测试；边界收口一次覆盖全部入口（评估见第 2 节表）。
 
 **边界（允许的回显，写明以防扩大化）**：
 
-- **422 校验错误响应**：pydantic 错误的 `type/loc/msg` 回给**同一客户端**（自定义校验消息可能含该请求自己提交的单个字段值，如 timezone 名，有长度上限）——这是客户端修正请求所需的标准行为；但 `input`/`ctx`（整段请求原值：正文、refresh_token、asr）**不回显**（`validation_exception_handler` 剔除，FastAPI 默认处理器会整段带回）。
+- **422 校验错误响应**：pydantic 错误的 `type/loc/msg` 回给**同一客户端**——这是客户端修正请求所需的标准行为；但两道边界缺一不可（threads10 P1，schemas.py:156）：`input`/`ctx`（整段请求原值：正文、refresh_token、asr）**不回显**（`validation_exception_handler` 剔除，FastAPI 默认处理器会整段带回），且 **msg 一律固定文案、不得插值请求提交的原值**（旧 timezone 文案 `…时区名：{value}` 把用户输入带回 422 体——剥参数不等于脱敏消息，msg 本身就是回显面）。
+- **启动校验消息可引用非密钥配置值**：非法 `DEFAULT_TIMEZONE` 等校验文案把配置值原样带回**操作者自己的控制台**（不是跨用户回显面、不是密钥），保留有助排障；密钥类值（JWT_SECRET/LLM_API_KEY/数据库密码）一律不进消息（框架层第 6 条）。
 - **管理员 CLI**：`python -m app.cli create-invite` 把新生成的邀请码打到 stdout——stdout 即交付渠道，不进日志/数据库/错误响应。
 - **500 响应体**：固定文案（`internal server error`），绝不回显异常文本。
 
-**保证代码**：`app/errors.py::safe_error_summary/safe_error_text`（唯一摘要出口）、`app/pipeline/runner.py`（日志与 `last_error` 只走摘要）、`app/jobs/worker.py`（常驻循环 `logger.error` + 摘要，无 traceback）、`app/errors.py::unhandled_exception_handler`（500 固定文案）、`app/errors.py::validation_exception_handler`（剔除 input/ctx）、`app/middleware.py::SafeErrorFallbackMiddleware`（最外层兜底、永不 re-raise）与 `AccessLogMiddleware`（模板级访问日志）、`app/logs.py::harden_third_party_loggers`（create_app 与 worker main 调用）、`app/config.py::_reject_sqlalchemy_echo`、`server/docker-compose.yml` 与 `server/Dockerfile`（`--no-access-log`）、`server/.dockerignore`、`app/main.py::create_app`（中间件挂载序：兜底兜在 NulReject/CORS 之外）、机械检查 `scripts/check-invariants.py::INV-NO-RAW-EXC`。
+**保证代码**：`app/errors.py::safe_error_summary/safe_error_text`（唯一摘要出口）、`app/pipeline/runner.py`（日志与 `last_error` 只走摘要）、`app/jobs/worker.py`（常驻循环 `logger.error` + 摘要，无 traceback）、`app/errors.py::unhandled_exception_handler`（500 固定文案）、`app/errors.py::validation_exception_handler`（剔除 input/ctx）、`app/schemas.py::_check_timezone`（422 msg 固定文案，threads10 P1）、`app/middleware.py::SafeErrorFallbackMiddleware`（最外层兜底、永不 re-raise）与 `AccessLogMiddleware`（模板级访问日志）、`app/logs.py::harden_third_party_loggers`（create_app 与 worker main 调用）、`app/config.py::_reject_sqlalchemy_echo` 与 `app/config.py::ConfigError/get_settings/get_db_settings`（启动校验脱敏边界，threads10 P1）、`server/docker-compose.yml`、`server/Dockerfile` 与 `server/README.md`（uvicorn 命令 `--no-access-log`，含文档示例，threads10 P1）、`server/.dockerignore`、`app/main.py::create_app`（中间件挂载序：兜底兜在 NulReject/CORS 之外）、机械检查 `scripts/check-invariants.py::INV-NO-RAW-EXC`。
 
 **验证测试**：
 - `test_safe_error_summary_type_and_code_only`（消息含伪造密钥/笔记正文时 summary 只有 type/code）
@@ -534,6 +542,11 @@ memory_sync(note_id)     不带 rev。短读事务取 note 当前状态 →（�
 | access log 形态（threads9 P1，docker-compose.yml:44） | uvicorn `--no-access-log`（compose+Dockerfile）+ 自有 `AccessLogMiddleware` 只记 method/路由模板/status/耗时 | 保留 uvicorn access log 并 redact：请求行格式不受应用控制（query 之外还有路径参数原值）；完全不要访问日志：进程内再无请求级排障入口（哪个接口慢/多少 5xx） |
 | 第三方 logger 级别（threads9） | `app/logs.py::harden_third_party_loggers` 钉 httpx/httpcore/openai >= WARNING，create_app 与 worker main 统一调用 | 不设置：级别随部署环境默认漂移，库升级把请求细节（LLM 请求体含笔记正文）打进日志时无防线 |
 | 构建上下文（threads9 P1，docker-compose.yml:21） | `server/.dockerignore` 排除 .env/本地库/venv/缓存/tests；镜像只 COPY requirements-app.txt 与 app/ | 只依赖 Dockerfile COPY 白名单：上下文在 COPY 之前整体（含 remote builder）传输，.env 与本地 SQLite 笔记库照样离机 |
+| 邀请码 claim 成功后复验（threads10 P1，auth.py:205） | 抢占成功（rowcount=1、仍持行锁）后标量列重读 expires_at + 重取 now 复验；过期 → rollback 本次 claim + 403 | 只信条件 UPDATE 的 rowcount：PG READ COMMITTED 下锁等待后用**等待前绑定**的 now 参数重评谓词，等待期间跨过 expires_at 的邀请码照样抢占成功，绕过输方归因直接创建账号；「对比数据库时钟」不可移植（SQLite 无语句级时钟语义） |
+| 租约签发时刻（threads10，queue.py:236） | `locked_at` 在置 running 的语句内取写入时刻的 utcnow（`_mark_running`/`_reclaim_running` 函数内重取） | 沿用 claim 循环开头的 now：FOR UPDATE 等锁消耗的时间等量缩短租约，等待越久活 worker 越早被误判失灵、越早被换主；回收 cutoff 维持参数（谓词边界，方向保守） |
+| 422 msg 固定文案（threads10 P1，schemas.py:156） | 校验器 ValueError 全部固定文案（`_check_timezone` 不再插值 value）；`validation_exception_handler` 剥 input/ctx 后返回 msg，msg 本身必须无原值 | 只剥 input/ctx：msg 里插值的用户输入（非法 timezone 名）原样回显，剥 input 白做；回显有排障价值不成立——合法值客户端本地就有，非法值回显只帮攻击者探测校验边界 |
+| 启动校验脱敏形态（threads10 P1，config.py:68） | `get_settings`/`get_db_settings` 边界捕获 ValidationError → 转只含 loc/msg/type 的 `ConfigError`，`from None` 抑制隐式 `__context__` 链 | SecretStr：只护 repr，不覆盖 `database_url` 的 password 部分，且要改所有取值点与既有测试；异常消息白名单脱敏：regex 挡不住 pydantic `input_value` 截断 repr 里的尾部字段值（实测 `...7766554433221100secret`）。边界收口一次覆盖全部入口（api import / worker / cli） |
+| 文档启动命令（threads10 P1，README.md:52） | README 的本地 uvicorn 示例同口径 `--no-access-log`，`test_readme_documented_uvicorn_command_disables_access_log` 解析锁定 | 只收口 compose/Dockerfile：照 README 起步的本地开发照样把 `GET /v1/search?q=<笔记正文>` 整行打进终端；文档示例与部署清单不一致本身就是漂移源 |
 
 ## 3. 数据模型与迁移
 
@@ -565,11 +578,12 @@ memory_sync(note_id)     不带 rev。短读事务取 note 当前状态 →（�
 13. AGENTS.md「写代码」含本文链接且路径有效。
 14. 记忆后端改动：对照 INV-3 后端契约（枚举完整、不越权改动其他 note、add 不做 infer 类改写/合并）与本仓 `MEMORY_BACKEND ∈ {inmemory, disabled}` 枚举；生产后端（feat/mem0-backend）落地时契约不放宽。
 15. 新增数值型配置（TTL / 超时 / 批量 / 重试 / 上限类）必须同时加进 `_require_positive_numeric_settings` 的字段清单（INV-10.7）与 `.env.example`，且「必须为正」的约束写进字段注释。
-16. 新增/修改持锁写路径（FOR UPDATE / 条件 UPDATE / advisory lock）：对照 INV-13——等锁之前算好的派生值（now、状态、计数、rev、expires_at、活跃标记）不得在锁内沿用；锁内重取、由条件 UPDATE 原子判定或版本栅栏守护；方向保守的陈旧值必须注释论证（见 INV-13 边界）。
+16. 新增/修改持锁写路径（FOR UPDATE / 条件 UPDATE / advisory lock）：对照 INV-13——等锁之前算好的派生值（now、状态、计数、rev、expires_at、活跃标记）不得在锁内沿用；锁内重取、由条件 UPDATE 原子判定或版本栅栏守护；条件更新/claim **成功之后**仍须用成功时刻的 now 复验过期（rowcount=1 不代表谓词里的旧时间参数仍然成立）；签发类时间戳（locked_at、iat/exp）取写入时刻而非循环/请求起点；方向保守的陈旧值必须注释论证（见 INV-13 边界）。
 17. 新增任何异常出口（日志、DB 错误字段、HTTP 错误响应）：只走 `app/errors.py::safe_error_summary`（类型名 + 错误码），不 `str(exc)` / `repr(exc)` / f-string 插值 / `exc_info=True` / `logger.exception`；跑 `scripts/check-invariants.py` 确认 INV-NO-RAW-EXC 0 报错 0 误报（INV-14）。
 18. 新增写源字段的接口（note text、recorded_at、timezone，含未来 sync push / 批量写）：对照 INV-15 源→派生映射表，同事务清派生 + 作废 suggested + 入队重算；改映射表本身时同步本表与验证测试。
-19. 部署/日志面改动（INV-14 框架层）：uvicorn 命令一律 `--no-access-log`（compose 与 Dockerfile 都要，`test_uvicorn_commands_disable_access_log` 锁定）；自有访问日志只记 method/路由模板/status/耗时；新增第三方客户端库时把其 logger 钉进 `app/logs.py::harden_third_party_loggers`（create_app 与 worker main 双入口）；构建上下文新增敏感/本地文件类型时同步 `server/.dockerignore`；`DATABASE_URL` 不得经 URL query 开 echo（config 启动即拒）。
+19. 部署/日志面改动（INV-14 框架层）：uvicorn 命令一律 `--no-access-log`（compose、Dockerfile **与 README/docs 文档示例**同口径，`test_uvicorn_commands_disable_access_log` + `test_readme_documented_uvicorn_command_disables_access_log` 锁定）；自有访问日志只记 method/路由模板/status/耗时；新增第三方客户端库时把其 logger 钉进 `app/logs.py::harden_third_party_loggers`（create_app 与 worker main 双入口）；构建上下文新增敏感/本地文件类型时同步 `server/.dockerignore`；`DATABASE_URL` 不得经 URL query 开 echo（config 启动即拒）。
 20. 新增等锁窗口的写路径（含把无锁路径改成条件 UPDATE/ON CONFLICT）：对照 INV-13 全仓锁点表补一行——锁后用于决策的每个派生值（now、计数、过期判定、iat/exp）标注来源（锁内重取/原子判定/版本栅栏/边界论证）。
+21. 新增校验失败出口（INV-14）：schemas 校验器与 HTTP 错误的 msg 一律固定文案，不插值用户输入原值（`input`/`ctx` 之外 msg 本身也要干净）；启动校验异常只经 `app/config.py::ConfigError` 边界出口（只含字段位置与校验文案），不直接上抛 pydantic ValidationError——其 `input_value` repr 可含密钥明文，且发生在中间件挂载之前。
 
 ## 5. 测试计划汇总（INV ↔ 计划测试名 ↔ 后端要求）
 
@@ -587,8 +601,8 @@ memory_sync(note_id)     不带 rev。短读事务取 note 当前状态 →（�
 | INV-10 | test_openai_missing_api_key_rejected、test_openai_missing_base_url_rejected、test_openai_missing_model_rejected；test_openai_all_three_configured_ok；test_default_timezone_invalid_rejected；test_default_timezone_valid_ok；test_worker_refuses_inmemory_with_postgres；test_get_memory_store_unknown_backend_raises；test_memory_backend_only_accepts_known_values、test_production_inmemory_rejection_mentions_mem0_backend_pr、test_production_disabled_memory_backend_ok；test_disabled_store_empty_contract、test_factory_returns_disabled_store、test_disabled_memory_sync_marks_synced、test_disabled_search_and_ask_return_empty_not_500；test_non_positive_numeric_settings_rejected | 纯配置，无 DB（disabled 三条走 client 夹具但只断言空结果）；mem0 相关用例随生产后端移至 feat/mem0-backend |
 | INV-11 | test_patch_unchanged_text_with_stale_rev_409 | 双后端 |
 | INV-12 | test_refresh_race_row_deleted_while_waiting_device_lock_401_no_revoke；test_concurrent_sixth_login_eviction_vs_refresh_no_device_revoke_pg；正面样例回归 test_concurrent_patch_same_rev_exactly_one_success、test_login_device_bound_to_other_user_403 | 竞态项 PG 真并发；钩子注入项双后端 |
-| INV-13 | test_refresh_token_expires_while_waiting_device_lock_401；test_invite_expires_while_loser_waiting_claim_403；test_login_mints_tokens_after_device_row_lock；正面样例回归 test_refresh_reuse_revoked_but_expired_401_no_revoke | 可控时钟 + 钩子注入等锁窗口（`_lock_device`/抢占输方重读/`_device_upsert`→`_token_pair` 顺序），双后端；PG 真并发版不做（定时窗口必抖动，钩子注入等价复现） |
-| INV-14 | test_safe_error_summary_type_and_code_only；test_job_exception_not_logged_nor_persisted_raw；test_worker_loop_exception_logged_sanitized_no_traceback；test_validation_error_response_does_not_echo_input；test_500_response_body_contains_no_exception_text；test_500_no_sentinel_in_any_logger_record；test_500_real_uvicorn_no_raw_traceback_in_logs；test_uvicorn_commands_disable_access_log；test_access_log_records_template_only_no_query_or_path_values；test_dockerignore_excludes_secrets_and_local_data；test_database_url_echo_query_rejected；test_third_party_http_loggers_pinned_to_warning；既有 test_first_llm_failure_leaves_no_side_effects 的 last_error 断言改为「含类型名且不含原文」 | 双后端；500 体断言用 `raise_app_exceptions=False` 的 ASGITransport；真实 uvicorn 项按 uvicorn 默认日志配置起本地 server（127.0.0.1:0）；compose/Dockerfile/config 项纯解析无需 Docker |
+| INV-13 | test_refresh_token_expires_while_waiting_device_lock_401；test_invite_expires_while_loser_waiting_claim_403；test_invite_claim_revalidates_expiry_after_claim_success_403（threads10）；test_login_mints_tokens_after_device_row_lock；test_claim_lease_issued_at_update_moment_not_loop_start（threads10）；正面样例回归 test_refresh_reuse_revoked_but_expired_401_no_revoke | 可控时钟 + 钩子注入等锁窗口（`_lock_device`/抢占输方重读/claim 成功后复验/`_device_upsert`→`_token_pair` 顺序/租约签发时刻），双后端；PG 真并发版不做（定时窗口必抖动，钩子注入等价复现） |
+| INV-14 | test_safe_error_summary_type_and_code_only；test_job_exception_not_logged_nor_persisted_raw；test_worker_loop_exception_logged_sanitized_no_traceback；test_validation_error_response_does_not_echo_input；test_422_fixed_message_does_not_echo_timezone_value（threads10）；test_500_response_body_contains_no_exception_text；test_500_no_sentinel_in_any_logger_record；test_500_real_uvicorn_no_raw_traceback_in_logs；test_get_settings_validation_failure_does_not_leak_secret_values（threads10）；test_uvicorn_commands_disable_access_log；test_readme_documented_uvicorn_command_disables_access_log（threads10）；test_access_log_records_template_only_no_query_or_path_values；test_dockerignore_excludes_secrets_and_local_data；test_database_url_echo_query_rejected；test_third_party_http_loggers_pinned_to_warning；既有 test_first_llm_failure_leaves_no_side_effects 的 last_error 断言改为「含类型名且不含原文」 | 双后端；500 体断言用 `raise_app_exceptions=False` 的 ASGITransport；真实 uvicorn 项按 uvicorn 默认日志配置起本地 server（127.0.0.1:0）；compose/Dockerfile/config 项纯解析无需 Docker |
 | INV-15 | test_patch_clears_stale_extraction_fields；test_patch_unchanged_text_keeps_extraction_fields | 双后端 |
 
 既有测试的适配（第二步）：`organize_note`→`extract`、`cleanup_memory`→`memory_sync`、`memory_synced`→`memory_status` 断言改写；test_memory_failure_retries_backfill_only、test_cleanup_memory_job_skips_live_note、test_delete_during_memory_sync_does_not_resurrect 等旧测试按新模型语义迁移（收敛目标不变，断言落点改为 memory_sync）。

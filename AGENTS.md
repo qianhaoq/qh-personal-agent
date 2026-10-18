@@ -47,8 +47,8 @@
 - **INV-10 配置校验**：启动即校验，缺配置直接报错；数值配置（TTL/超时/批量/重试/上限）必须为正；生产（postgresql）不得隐式退化到 mock，`MEMORY_BACKEND ∈ {inmemory, disabled}`，生产后端 mem0 随 feat/mem0-backend（#6）落地。
 - **INV-11 乐观锁 / rev**：rev 比较在任何提前返回之前、在锁或条件更新里原子完成；内容不变的快路径也要先校验 rev，过期 rev 一律 409。
 - **INV-12 0 行归因**：条件 UPDATE/DELETE 匹配 0 行后必须重读当前状态再定原因（或在注释里写因果封闭论证），不得猜成重放 / 冲突 / 已删除。
-- **INV-13 锁内重算**：等锁之前算好的派生值（now、状态、计数、rev、expires_at）不得在拿到锁之后沿用；锁内重取、条件 UPDATE 对行当前值原子判定、或版本栅栏守护；凭证签发（iat/exp）与 0 行复查后的时间判定都在行锁落定之后（全仓锁点表见文档）。
-- **INV-14 异常不落原文**：日志 / `jobs.last_error` / 错误响应只记异常类型名 + 错误码（`app/errors.py::safe_error_summary`），不记消息文本与 traceback；422 不回显 input/ctx；**框架层同禁**——uvicorn 命令一律 `--no-access-log`（query 不落日志）、未处理异常由最外层兜底中间件吞掉不 re-raise 给 uvicorn、`DATABASE_URL` 不得经 URL query 开 SQLAlchemy echo、httpx/httpcore/openai logger 钉 >= WARNING、构建上下文不含 `.env`/本地库（`server/.dockerignore`）；静态检查 INV-NO-RAW-EXC。
+- **INV-13 锁内重算**：等锁之前算好的派生值（now、状态、计数、rev、expires_at）不得在拿到锁之后沿用；锁内重取、条件 UPDATE 对行当前值原子判定、或版本栅栏守护；条件更新/claim **成功之后**仍须用成功时刻的 now 复验过期（rowcount=1 不代表谓词里的旧时间参数仍成立）；签发类时间戳（凭证 iat/exp、租约 locked_at）取写入时刻而非请求/循环起点（全仓锁点表见文档）。
+- **INV-14 异常不落原文**：日志 / `jobs.last_error` / 错误响应只记异常类型名 + 错误码（`app/errors.py::safe_error_summary`），不记消息文本与 traceback；422 不回显 input/ctx，**msg 本身也不得插值用户输入原值**（校验器固定文案）；启动校验失败只经 `app/config.py::ConfigError` 边界出口（只含字段位置与校验文案，不含配置原值——pydantic ValidationError 的 `input_value` repr 会带密钥明文）；**框架层同禁**——uvicorn 命令一律 `--no-access-log`（compose/Dockerfile/**README 文档示例**同口径）、未处理异常由最外层兜底中间件吞掉不 re-raise 给 uvicorn、`DATABASE_URL` 不得经 URL query 开 SQLAlchemy echo、httpx/httpcore/openai logger 钉 >= WARNING、构建上下文不含 `.env`/本地库（`server/.dockerignore`）；静态检查 INV-NO-RAW-EXC。
 - **INV-15 源字段变更失效派生**：改 `note.text` 必须同事务清 title/tags/todos、置 `status='uploaded'`、作废 suggested reminders、入队 extract + memory_sync；源→派生映射表见文档。
 
 提交前逐条自检：
