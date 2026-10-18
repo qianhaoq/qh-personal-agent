@@ -1,6 +1,6 @@
 # Agent 反复踩的坑（server）
 
-> **事实来源**：服务端不变量以 [docs/server-invariants.md](server-invariants.md)（全部 INV，当前 INV-1..INV-16，随 PR #2 起逐轮扩写）为准。与本文冲突时以它为准，并回来改本文。本文只收集“同一类问题被 Codex 反复提出”的模式和正反例，**不另立新的不变量**。
+> **事实来源**：服务端不变量以 [docs/server-invariants.md](server-invariants.md)（全部 INV，当前 INV-1..INV-17，随 PR #2 起逐轮扩写）为准。与本文冲突时以它为准，并回来改本文。本文只收集“同一类问题被 Codex 反复提出”的模式和正反例，**不另立新的不变量**。
 >
 > `scripts/check-invariants.py` 是 **best-effort 启发式，精确优先于召回**：只标少数高置信度的写法，不证明代码满足不变量。CI 里的 check 名是 **`Invariant Check (non-required)`**（独立的 `Invariants` workflow，不是必需检查）。
 > - 漏检按 `P2: defer — heuristic checker; PG concurrency tests + human/Codex review are the backstop` Resolve。
