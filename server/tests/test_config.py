@@ -148,6 +148,14 @@ def test_production_inmemory_memory_backend_rejected():
         _pg_settings(memory_backend="inmemory", allow_inmemory_in_tests=False)
 
 
+def test_mem0_backend_missing_mem0ai_rejected_at_startup(monkeypatch):
+    """INV-10.3：MEMORY_BACKEND=mem0 但未装 mem0ai → 启动 ValueError，
+    提示 pip install -r requirements-mem0.txt（不静默退化）。"""
+    monkeypatch.setattr("app.config._mem0ai_installed", lambda: False)
+    with pytest.raises(ValidationError, match=r"mem0ai|requirements-mem0"):
+        Settings(memory_backend="mem0")
+
+
 def test_production_inmemory_rejection_mentions_mem0():
     """拒绝信息必须指出两条出路：MEMORY_BACKEND=mem0 或 disabled。"""
     with pytest.raises(ValidationError, match=r"MEMORY_BACKEND=mem0.*MEMORY_BACKEND=disabled"):

@@ -1,7 +1,7 @@
 """应用配置：全部来自环境变量（.env 亦可）。"""
 import base64
-import importlib.util
 import binascii
+import importlib.util
 import os
 import string
 from collections.abc import Mapping
