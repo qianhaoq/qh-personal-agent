@@ -1,6 +1,6 @@
 # Agent 反复踩的坑（server）
 
-> **事实来源**：服务端不变量以 [docs/server-invariants.md](server-invariants.md)（全部 INV，当前 INV-1..INV-15，随 PR #2 起逐轮扩写）为准。与本文冲突时以它为准，并回来改本文。本文只收集“同一类问题被 Codex 反复提出”的模式和正反例，**不另立新的不变量**。
+> **事实来源**：服务端不变量以 [docs/server-invariants.md](server-invariants.md)（全部 INV，当前 INV-1..INV-16，随 PR #2 起逐轮扩写）为准。与本文冲突时以它为准，并回来改本文。本文只收集“同一类问题被 Codex 反复提出”的模式和正反例，**不另立新的不变量**。
 >
 > `scripts/check-invariants.py` 是 **best-effort 启发式，精确优先于召回**：只标少数高置信度的写法，不证明代码满足不变量。CI 里的 check 名是 **`Invariant Check (non-required)`**（独立的 `Invariants` workflow，不是必需检查）。
 > - 漏检按 `P2: defer — heuristic checker; PG concurrency tests + human/Codex review are the backstop` Resolve。
@@ -208,3 +208,56 @@ if claimed.rowcount == 1:
 签发类时间戳同属此类（threads10）：租约 `locked_at` 是签发时刻，取写入时刻的 `utcnow()` 而非 claim 循环起点——等锁消耗的时间等量缩短租约，活 worker 越早被误判失灵。
 
 排查手法：`rg "with_for_update|pg_advisory|on_conflict|rowcount" server/app` 列出全部等待窗口，逐点问「锁后用于决策的 now / 计数 / 过期判定 / iat·exp，是锁内取的还是等锁前的？claim **成功之后**还要不要用成功时刻的 now 再验一次过期？签发的时间戳（locked_at、iat/exp）取的是写入时刻还是请求/循环起点？」纯展示时间戳与方向保守的判定可以豁免但必须注释论证；全仓锁点表见 server-invariants.md INV-13。
+
+## 13. 密钥拼进 URL 必须先 percent-encode（INV-16） <a id="url-encode"></a>
+
+密码不是合法的 URL 字符。`@ : / # % ?` 与空格在 URL 里都是分隔符/保留字——原样插值后解析器拆错组件，认证用错凭据，连接失败且报错不指向真实原因（threads12 P1：compose 三个服务 `${POSTGRES_PASSWORD}` 原样进 DATABASE_URL，密码含 `@` 时 migrate 连不上、api/worker 永不启动）。
+
+```yaml
+# 错：密码含 @ : / # 时，SQLAlchemy 把主机/库名拆进密码、密码拆错位置
+environment:
+  DATABASE_URL: postgresql+asyncpg://personal:${POSTGRES_PASSWORD}@postgres:5432/personal_agent
+```
+
+```yaml
+# 对（本仓形态）：compose 只透传分项变量，应用侧统一 quote_plus 拼接
+environment:
+  PGUSER: personal
+  PGPASSWORD: ${POSTGRES_PASSWORD}   # 原值，不进 URL
+  PGHOST: postgres
+  PGPORT: "5432"
+  PGDATABASE: personal_agent
+```
+
+```python
+# 对：唯一拼接点（app/config.py::postgres_url_from_env），可单测
+from urllib.parse import quote_plus
+url = f"postgresql+asyncpg://{quote_plus(user)}:{quote_plus(password)}@{host}:{port}/{db}"
+```
+
+规则（INV-16）：任何把密钥拼进 DATABASE_URL/REDIS_URL/DSN/connection string 的代码（compose、脚本、文档示例）都适用——优先分项环境变量 + 应用侧拼接；必须拼时 userinfo 先 `quote_plus`。反过来写的对照测试用 `make_url(url).password == 原值` 断言往返。密码永远不进日志/错误消息（INV-14）。
+
+## 14. 吊销/复活的凭证要有代际 fence（INV-8 陈述 4） <a id="generation-fence"></a>
+
+「吊销」一旦可以被后续登录**复活**，只清 revoked 位是不够的：吊销前签发的凭证会整体回魂，而被吊销的旧凭证重放还会把新会话再吊销一遍（threads12 P1，auth.py:82）。
+
+```python
+# 错：复活 = 无条件清吊销位
+set_={"revoked_at": None, ...}
+# 后果 1：吊销前签发、未过期的 access JWT 重新通过 get_auth（只看 revoked_at）
+# 后果 2：保留作重放证据的旧 refresh 行被重放 → 复用吊销分支 → 新会话又被吊销，
+#         连环发生直到旧行自然过期——被盗 token 可以无限 DoS 该设备的每次重新登录
+```
+
+```python
+# 对：整型代际（credential_generation），只在吊销与真复活时 +1
+set_={"revoked_at": None,
+      "credential_generation": case(
+          (Device.revoked_at.is_not(None), Device.credential_generation + 1),  # 真复活才换代
+          else_=Device.credential_generation), ...}   # 普通再登录不动代（并发 200 的 token 不得互相失效）
+# access JWT 带 gen claim；refresh 行带签发时的代（创建后不可变）
+# get_auth / refresh 校验 token 的代 == 设备当前代：
+#   不一致 → 普通 401，不轮换、不吊销 —— 旧代凭证不复活、也不能连环吊销新会话
+```
+
+要点：+1 的位置必须**原子**（在 upsert 的 DO UPDATE / 持 device 锁的事务里判定 `revoked_at` 非空），否则并发复活登录会多次换代或漏换；签发要绑的代在锁内重读（INV-13）。logout 不动代（登出本就删全部行、access 自然过期，是既有语义不是漏修）。
