@@ -207,6 +207,10 @@ def test_dockerignore_excludes_secrets_and_local_data():
         "*.db",
         "*.sqlite",  # 本地 SQLite 笔记库（含 tests/_test.sqlite3）
         "*.sqlite-*",
+        # threads11 C 类（INV-14）：README 本地库形态是 app.sqlite3 ——
+        # 只有 *.sqlite / *.db 挡不住它及其 -wal/-shm/-journal sidecar
+        "*.sqlite3",
+        "*.sqlite3-*",
         ".venv/",
         "__pycache__/",
         "tests/",
