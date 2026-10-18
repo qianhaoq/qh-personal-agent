@@ -1,9 +1,12 @@
 """应用配置：全部来自环境变量（.env 亦可）。"""
 import base64
 import binascii
+import os
 import string
+from collections.abc import Mapping
 from functools import lru_cache
 from typing import Literal
+from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import ValidationError, model_validator
@@ -100,6 +103,13 @@ class Settings(BaseSettings):
 
     # /v1/ask 检索条数
     ask_top_k: int = 5
+
+    @model_validator(mode="before")
+    @classmethod
+    def _compose_pg_url_from_env(cls, data):
+        # INV-16（threads12 P1）：分项 PG* 变量 → quote(safe="") 拼接（见
+        # _apply_pg_env_database_url）；显式 database_url 永远优先
+        return _apply_pg_env_database_url(data)
 
     @model_validator(mode="after")
     def _reject_insecure_jwt_secret_in_production(self) -> "Settings":
@@ -250,6 +260,58 @@ class Settings(BaseSettings):
         return self
 
 
+# libpq 惯例的分项连接变量（INV-16，threads12 P1）：compose 注入这些而
+# 不是把密码原样拼进 DATABASE_URL——密码含 URI 分隔符（@ : / # % 空格等）
+# 时原样拼接会让 URL 解析器拆错组件（主机/库名被吃进密码），连接失败且
+# 报错不指向真实原因
+_PG_ENV_KEYS = ("PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE")
+# 触发拼接的最小意图信号：PGPASSWORD 或 PGHOST 才表明「真的要连 PG」，
+# 其余变量单独出现（PGPORT 之类）不劫持本地 SQLite 默认
+_PG_TRIGGER_KEYS = ("PGPASSWORD", "PGHOST")
+_PG_DEFAULTS = {"PGUSER": "personal", "PGHOST": "postgres", "PGPORT": "5432", "PGDATABASE": "personal_agent"}
+
+
+def postgres_url_from_env(env: Mapping[str, str]) -> str | None:
+    """从分项变量拼 PG 连接 URL（INV-16，threads12 P1；全仓唯一拼接点）。
+
+    用户名/密码必须 percent-encode 后才能进 URL userinfo——SQLAlchemy 的
+    make_url 会按 URI 规则拆组件并百分号解码，密码含 @:/#% 等字符时
+    原样拼接会拆错位置、认证用错凭据。有意用 ``quote(safe="")`` 而不是
+    ``quote_plus``：后者把空格编成 ``+``，而 make_url 不把 ``+`` 还原成
+    空格（userinfo 里 ``+`` 就是字面加号），含空格的密码会轮换失败。
+    无 PGPASSWORD/PGHOST 时返回 None（调用方沿用 DATABASE_URL /
+    默认值）。密码绝不进日志/错误消息（INV-14）。
+    """
+    if not any(key in env for key in _PG_TRIGGER_KEYS):
+        return None
+    merged = {**_PG_DEFAULTS, **{k: str(v) for k, v in env.items() if k in _PG_ENV_KEYS}}
+    userinfo = f"{quote(merged['PGUSER'], safe='')}:{quote(merged['PGPASSWORD'], safe='')}"
+    return f"postgresql+asyncpg://{userinfo}@{merged['PGHOST']}:{merged['PGPORT']}/{merged['PGDATABASE']}"
+
+
+def _apply_pg_env_database_url(data: object) -> object:
+    """Settings/DbSettings 的 mode="before" 钩子：database_url 未提供且存在
+    分项 PG* 变量时拼出 PG URL（INV-16）。
+
+    变量两路来源、构造 kwargs 优先：init kwargs（测试 / compose 解析路径
+    注入，键大小写不敏感——pydantic 字段名是小写、extra=ignore 不妨碍
+    before-validator 读到原始键）与真实环境变量（compose 的 environment
+    注入）。显式 database_url（含 env_file .env 的本地默认）永远优先——
+    compose 因此把 DATABASE_URL 置空串压过 .env 的 SQLite 默认值，空串
+    在这里视为「未显式配置」。
+    """
+    if not isinstance(data, dict) or data.get("database_url"):
+        return data
+    env = {
+        **{k: v for k, v in os.environ.items() if k in _PG_ENV_KEYS},
+        **{k.upper(): v for k, v in data.items() if k.upper() in _PG_ENV_KEYS},
+    }
+    url = postgres_url_from_env(env)
+    if url:
+        data["database_url"] = url
+    return data
+
+
 class ConfigError(RuntimeError):
     """配置校验失败（INV-14，threads10 P1，config.py:68）：消息只含字段
     位置（loc）与校验文案（msg/type），不含任何配置原值——pydantic
@@ -320,6 +382,12 @@ class DbSettings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     database_url: str = "sqlite+aiosqlite:///./app.sqlite3"
+
+    @model_validator(mode="before")
+    @classmethod
+    def _compose_pg_url_from_env(cls, data):
+        # 同 Settings（INV-16，threads12）：migrate 服务同样注入分项 PG* 变量
+        return _apply_pg_env_database_url(data)
 
     @model_validator(mode="after")
     def _reject_sqlalchemy_echo(self) -> "DbSettings":

@@ -220,7 +220,7 @@ environment:
 ```
 
 ```yaml
-# 对（本仓形态）：compose 只透传分项变量，应用侧统一 quote_plus 拼接
+# 对（本仓形态）：compose 只透传分项变量，应用侧统一 quote(safe="") 拼接
 environment:
   PGUSER: personal
   PGPASSWORD: ${POSTGRES_PASSWORD}   # 原值，不进 URL
@@ -231,11 +231,13 @@ environment:
 
 ```python
 # 对：唯一拼接点（app/config.py::postgres_url_from_env），可单测
-from urllib.parse import quote_plus
-url = f"postgresql+asyncpg://{quote_plus(user)}:{quote_plus(password)}@{host}:{port}/{db}"
+from urllib.parse import quote
+url = f"postgresql+asyncpg://{quote(user, safe='')}:{quote(password, safe='')}@{host}:{port}/{db}"
+# 注意用 quote(safe="") 而不是 quote_plus：quote_plus 把空格编成 "+"，
+# 而 SQLAlchemy make_url 只按百分号解码、不把 "+" 还原成空格——含空格的密码往返就错
 ```
 
-规则（INV-16）：任何把密钥拼进 DATABASE_URL/REDIS_URL/DSN/connection string 的代码（compose、脚本、文档示例）都适用——优先分项环境变量 + 应用侧拼接；必须拼时 userinfo 先 `quote_plus`。反过来写的对照测试用 `make_url(url).password == 原值` 断言往返。密码永远不进日志/错误消息（INV-14）。
+规则（INV-16）：任何把密钥拼进 DATABASE_URL/REDIS_URL/DSN/connection string 的代码（compose、脚本、文档示例）都适用——优先分项环境变量 + 应用侧拼接；必须拼时 userinfo 先 `quote(x, safe="")`（不是 `quote_plus`：`+` 与空格的往返差异见上）。反过来写的对照测试用 `make_url(url).password == 原值` 断言往返。密码永远不进日志/错误消息（INV-14）。
 
 ## 14. 吊销/复活的凭证要有代际 fence（INV-8 陈述 4） <a id="generation-fence"></a>
 

@@ -532,3 +532,98 @@ def test_get_db_settings_validation_failure_does_not_leak_database_url(monkeypat
         assert "echo" in str(exc_info.value), "校验文案保留"
     finally:
         get_db_settings.cache_clear()
+
+
+# ---------------------------------------------------------------------------
+# INV-16（threads12 P1）：密钥拼进 URL 前必须 percent-encode。compose 注入
+# 分项 PG* 变量，应用侧 postgres_url_from_env 统一 quote(safe="") 拼接。
+# 测试一律用明显假值，且不打印任何「密码」。
+# ---------------------------------------------------------------------------
+
+
+def test_postgres_url_from_env_encodes_password_special_chars():
+    """单元：密码/用户名含 URI 分隔符（@ : / # % 空格）时，拼出的 URL 经
+    make_url 解析必须还原出原值（SQLAlchemy 按百分号解码 userinfo）。"""
+    from sqlalchemy.engine import make_url
+
+    from app.config import postgres_url_from_env
+
+    # 明显假值：全部 URI 保留字符各来一份
+    fake_password = "p@ss:word/#frag%2 0"
+    fake_user = "us@er"
+    url = postgres_url_from_env(
+        {
+            "PGHOST": "db.internal",
+            "PGPORT": "5433",
+            "PGUSER": fake_user,
+            "PGPASSWORD": fake_password,
+            "PGDATABASE": "agent_db",
+        }
+    )
+    assert url is not None
+    parsed = make_url(url)
+    assert parsed.drivername == "postgresql+asyncpg"
+    assert parsed.username == fake_user, "用户名必须编码后可还原"
+    assert parsed.password == fake_password, "密码必须编码后可还原"
+    assert parsed.host == "db.internal"
+    assert parsed.port == 5433
+    assert parsed.database == "agent_db"
+    # URL 文本里不出现原始密码（只出现其编码形态）
+    assert fake_password not in url
+
+    # 无 PGPASSWORD/PGHOST（触发键）→ None：调用方沿用 DATABASE_URL/默认值
+    assert postgres_url_from_env({"PGPORT": "5432"}) is None
+    assert postgres_url_from_env({}) is None
+    # 缺省项回落到 compose 拓扑默认（personal/postgres:5432/personal_agent）
+    default_url = postgres_url_from_env({"PGPASSWORD": "plain"})
+    assert default_url == "postgresql+asyncpg://personal:plain@postgres:5432/personal_agent"
+
+
+def test_settings_builds_pg_url_from_pg_env_vars(monkeypatch):
+    """PG* 分项变量（构造 kwargs 或真实环境变量）→ database_url 为拼出的
+    PG URL；显式 DATABASE_URL 永远优先（本地 SQLite 开发不受影响）。"""
+    from sqlalchemy.engine import make_url
+
+    from app.config import DbSettings, Settings
+
+    # compose 形态下 DATABASE_URL 不设（或由 environment 置空压过 .env 的
+    # SQLite 默认）；conftest 给测试进程设置的 DATABASE_URL 需先摘掉
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    for key in ("PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE"):
+        monkeypatch.delenv(key, raising=False)
+
+    fake_password = "p%40ss-with:delims/#"
+    # 1) 构造 kwargs（键大小写不敏感——pydantic 字段名是小写）
+    kwargs = {k.lower(): v for k, v in {
+        "PGHOST": "pg1",
+        "PGUSER": "personal",
+        "PGPASSWORD": fake_password,
+        "PGPORT": "5432",
+        "PGDATABASE": "agent",
+    }.items()}
+    db = DbSettings(**kwargs)
+    assert db.database_url.startswith("postgresql+asyncpg://")
+    assert make_url(db.database_url).password == fake_password
+
+    # 2) 真实环境变量（compose 的 environment 注入路径）
+    monkeypatch.setenv("PGHOST", "pg2")
+    monkeypatch.setenv("PGPASSWORD", fake_password)
+    db2 = DbSettings()
+    assert make_url(db2.database_url).password == fake_password
+    assert make_url(db2.database_url).host == "pg2"
+
+    # 3) 显式 database_url 优先：PG* 被忽略（含空串以外的一切显式值）
+    db3 = DbSettings(database_url="sqlite+aiosqlite:///./x.db", pghost="ignored", pgpassword="ignored")
+    assert db3.database_url == "sqlite+aiosqlite:///./x.db"
+
+    # 4) 完整 Settings 同路径（生产形态校验按拼出的 PG URL 生效）
+    settings = Settings(
+        **kwargs,
+        jwt_secret=GOOD_HEX,
+        memory_backend="disabled",
+        llm_provider="openai",
+        llm_api_key="sk-test-only",
+        llm_base_url="https://llm.example.com/v1",
+        llm_model="test-model",
+    )
+    assert make_url(settings.database_url).password == fake_password

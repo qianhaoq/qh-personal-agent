@@ -73,6 +73,7 @@ docker compose exec api python -m app.cli create-invite
 ```
 
 - PostgreSQL 用 `pgvector/pgvector:pg16` 镜像，数据卷持久化，healthcheck 就绪后再起 api/worker。
+- `POSTGRES_PASSWORD` 由 compose 以分项变量（`PGHOST/PGUSER/PGPASSWORD/…`）注入各服务，应用侧拼接 `DATABASE_URL` 时对密码做百分号编码——密码含 `@`、`:`、`/`、`#` 等字符也能正确连接（不要手工把密码写进 URL）。
 - 公网只开放 80/443，由 Caddy 自动签 TLS；域名对外服务前需完成 ICP 备案。
 
 ## 配置
@@ -81,7 +82,7 @@ docker compose exec api python -m app.cli create-invite
 
 | 变量 | 说明 |
 |---|---|
-| `DATABASE_URL` | 生产 `postgresql+asyncpg://...`；本地/测试 `sqlite+aiosqlite:///...` |
+| `DATABASE_URL` | 生产 `postgresql+asyncpg://...`；本地/测试 `sqlite+aiosqlite:///...`。compose 部署不设此项：应用按分项 `PGHOST/PGUSER/PGPASSWORD/PGPORT/PGDATABASE` 拼接并对用户名/密码百分号编码（密码含 `@:/#` 等字符也正确；显式 `DATABASE_URL` 永远优先） |
 | `JWT_SECRET` | HS256 签名密钥：>=32 字节随机值的编码。生成任选其一：`python -c "import secrets;print(secrets.token_urlsafe(48))"`、`openssl rand -hex 32`。生产（postgresql）启动时校验：hex 需 >=64 字符，或 base64/base64url（允许无 padding）解码 >=32 字节且解码后 >=16 种字节取值；占位值与人类可读口令（含 secret/password 字样、无法解码的字符串）会被拒绝 |
 | `LLM_PROVIDER` | `mock`（默认，确定性规则）或 `openai`（OpenAI 兼容接口）。只接受这两个值，拼错启动即报错；生产（postgresql）配 `mock` 或 `openai` 缺 `LLM_API_KEY` 都拒绝启动（不静默回落 MockLLM），跑 PG 测试套件可设 `ALLOW_MOCK_LLM_IN_PROD=true` 放行 |
 | `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | DeepSeek 示例 `https://api.deepseek.com`；腾讯混元 OpenAI 兼容地址示例见 `.env.example`。**地址与型号需按官网核实** |

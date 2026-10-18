@@ -47,7 +47,7 @@ def _production_env() -> dict[str, str]:
             "LLM_API_KEY": "sk-test-only",
             "LLM_BASE_URL": "https://llm.example.com/v1",
             "LLM_MODEL": "test-model",
-            "POSTGRES_PASSWORD": "pg-local-test-only",
+            "POSTGRES_PASSWORD": "pg-local-test-only@with:/#",
             # 部署形态不会设置测试放行标志；显式置 false 隔离 PG 测试
             # 套件 conftest 设置的环境变量（否则用例行为随运行方式漂移）
             "ALLOW_INMEMORY_IN_TESTS": "false",
@@ -109,6 +109,44 @@ def test_compose_services_pass_startup_validation():
     worker_env = _service_env(services["worker"], base)
     assert worker_env["MEMORY_BACKEND"] == "disabled"
     check_memory_backend_shareable(Settings(**_settings_kwargs(worker_env)))
+
+
+def test_compose_pg_env_password_encoded_in_database_url():
+    """threads12 P1（docker-compose.yml:24）/ INV-16：compose 不再把
+    ${POSTGRES_PASSWORD} 原样拼进 DATABASE_URL（密码含 @:/# 时 SQLAlchemy
+    拆错组件、migrate 连不上而 api/worker 永不启动），而是注入分项 PG*
+    变量、由应用侧 postgres_url_from_env 统一 percent-encode 后拼接。
+    机械复现 compose 变量代入后走真实 Settings/DbSettings 构造：含分隔符
+    的假密码必须经 make_url 无损取回、host/port/db 符合 compose 拓扑。
+    全程不打印密码。"""
+    from sqlalchemy.engine import make_url
+
+    compose = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))
+    services = compose["services"]
+    # 明显假值，覆盖 @ : / # 与 %（含「已编码形态」的百分号）分隔符
+    fake_password = "obviously-fake-pa55@with:/#and-%2B"
+
+    for name in ("migrate", "api", "worker"):
+        env = _service_env(
+            services[name], {**_production_env(), "POSTGRES_PASSWORD": fake_password}
+        )
+        # compose 形态锁定：DATABASE_URL 置空串压过 .env 的 SQLite 默认值
+        # （空串 = 未显式配置，应用按 PG* 拼 URL）；PGPASSWORD 传原值不进 URL
+        assert env["DATABASE_URL"] == "", f"{name}: DATABASE_URL 应由 environment 置空"
+        assert env["PGPASSWORD"] == fake_password, f"{name}: PGPASSWORD 应原值透传"
+        assert env["PGHOST"] == "postgres"
+
+        # migrate 只过 DbSettings；api/worker 过完整 Settings——生产校验
+        # 必须按拼出的 PG URL 照常通过，不因密码分隔符而失败
+        settings_cls = DbSettings if name == "migrate" else Settings
+        settings = settings_cls(**_settings_kwargs(env))
+        url = make_url(settings.database_url)
+        assert url.drivername == "postgresql+asyncpg"
+        assert url.username == "personal"
+        assert url.password == fake_password, f"{name}: 密码未无损往返（编码/解码不对称）"
+        assert url.host == "postgres"
+        assert url.port == 5432
+        assert url.database == "personal_agent"
 
 
 def test_compose_migrate_would_reject_full_settings_layering_is_real():

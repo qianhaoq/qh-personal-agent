@@ -21,7 +21,19 @@ services:
     build: .
     env_file: .env
     environment:
-      DATABASE_URL: postgresql+asyncpg://personal:${POSTGRES_PASSWORD}@postgres:5432/personal_agent
+      # INV-16（threads12 P1）：不再把 ${POSTGRES_PASSWORD} 原样拼进
+      # DATABASE_URL——密码含 @:/# 等 URI 分隔符时 SQLAlchemy 拆错组件、
+      # migrate 连不上而 api/worker 永不启动。改注入分项变量（libpq 惯例
+      # 名），由 app/config.py::postgres_url_from_env 统一 percent-encode
+      # 后拼接。
+      # DATABASE_URL 置空串压过 env_file .env 里的本地 SQLite 默认值：
+      # 空串 = 未显式配置（应用按 PG* 拼 URL；显式 URL 永远优先）。
+      DATABASE_URL: ""
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: personal
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: personal_agent
       # init-db 只加载 DbSettings（数据库层校验，threads7 P1 / INV-9）：
       # 建表不依赖 LLM/记忆后端/JWT 配置，沿用 .env 本地默认即可通过；
       # api/worker 按各自 command 过完整 Settings 启动校验
@@ -35,7 +47,13 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      DATABASE_URL: postgresql+asyncpg://personal:${POSTGRES_PASSWORD}@postgres:5432/personal_agent
+      # 同 migrate（INV-16，threads12）：分项 PG* 变量 + 应用侧编码拼接
+      DATABASE_URL: ""
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: personal
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: personal_agent
       # inmemory 仅单进程开发/测试：api 是多 worker、worker 是独立进程，
       # 各自一份内存会静默丢记忆（config 校验会拒绝 inmemory+PG）。生产
       # 记忆后端由后续 PR（feat/mem0-backend）提供，过渡期显式关闭记忆
@@ -62,7 +80,13 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      DATABASE_URL: postgresql+asyncpg://personal:${POSTGRES_PASSWORD}@postgres:5432/personal_agent
+      # 同 migrate/api（INV-16，threads12）：分项 PG* 变量 + 应用侧编码拼接
+      DATABASE_URL: ""
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: personal
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: personal_agent
       # 同 api：独立进程不能用进程内记忆（worker 拓扑校验拒绝 inmemory+PG），
       # 过渡期显式 disabled，生产后端见 feat/mem0-backend
       MEMORY_BACKEND: disabled
