@@ -150,3 +150,53 @@ async def test_mockllm_huge_relative_quantity_no_reminder_no_500(client, user, r
     assert note.status == "organized", "越界数量只影响这条提醒，不影响整理本身"
     assert note.title == "999999999999999999分钟后提醒我喝水"[:20]
     assert reminders == []
+
+
+def test_parse_datetime_overlong_digit_quantity_returns_none():
+    """threads9 P2 / INV-7（mock.py:49）：CPython 的 int(str) 对约 4300 位
+    以上的十进制串直接 ValueError——`_RE_IN_MINUTES` 的 `[0-9]+` 无位数
+    限制，5000 位数字 +「分钟后」会在 `_safe_relative` 之前就炸。位数
+    上界（≤6 位）让超长数量解析为 None（不出提醒）；6 位以内照常解析。"""
+    huge_minutes = "9" * 5000
+    assert parse_datetime(f"{huge_minutes}分钟后提醒我喝水", _now()) is None
+    assert parse_datetime(f"{'8' * 4301}天后交报告", _now()) is None
+    # 7 位：超过位数上界，同样不出提醒（9999999 分钟 ≈ 19 年，荒谬数量）
+    assert parse_datetime("1234567分钟后提醒我喝水", _now()) is None
+    # 6 位以内仍有效
+    dt = parse_datetime("999999分钟后提醒我喝水", _now())
+    assert dt is not None
+    assert parse_datetime("30分钟后提醒我喝水", _now()) is not None
+    # 中文数字不受位数上界影响（_CN_DIGITS / 十几组合本就有界）
+    assert parse_datetime("三十分钟后开会", _now()) is not None
+
+
+async def test_mockllm_overlong_digit_quantity_no_reminder_no_500(client, user, run_jobs):
+    """threads9 P2 端到端：一条 5000 字符内的合法笔记含 4990 位数字 +
+    「天后提醒我喝水」→ MockLLM 不抛 int() 的 ValueError（4300 位上限），
+    笔记照常 organized，只是这条荒谬数量不出提醒、不标 failed。"""
+    import uuid
+
+    from sqlalchemy import select
+
+    from app.db import get_sessionmaker
+    from app.models import Note, Reminder
+    from tests.conftest import auth_headers
+
+    text = "9" * 4990 + "天后提醒我喝水"
+    assert len(text) <= 5000  # 请求体 text 上限内（schemas._MAX_NOTE_TEXT_CHARS）
+    created = await client.post(
+        "/v1/notes",
+        json={"client_note_id": str(uuid.uuid4()), "text": text},
+        headers=auth_headers(user),
+    )
+    assert created.status_code == 202, created.text
+    note_id = created.json()["note_id"]
+    await run_jobs()
+
+    async with get_sessionmaker()() as session:
+        note = await session.get(Note, note_id)
+        reminders = (
+            await session.execute(select(Reminder).where(Reminder.note_id == note_id))
+        ).scalars().all()
+    assert note.status == "organized", "超长数字只影响这条提醒，不影响整理本身"
+    assert reminders == []

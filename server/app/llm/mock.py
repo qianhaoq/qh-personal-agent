@@ -43,10 +43,26 @@ _RE_DAY = re.compile(r"(今天|明天|后天|大后天)")
 _FUTURE_DAY_WORDS = {"明天", "后天", "大后天"}
 
 
+# 十进制数量的位数上界（INV-7，threads9 P2 / mock.py:49）：CPython 的
+# int(str) 对约 4300 位以上的十进制串直接 ValueError——一条合法的 5000
+# 字符笔记含「(4900+ 位数字)分钟后」会在 _safe_relative 之前就炸。6 位
+# （999999 分钟 ≈ 1.9 年）以内照常解析；更大的数量本就荒谬，返回 None
+# （该短语不出提醒）。有意不用正则 [0-9]{1,6} 限位：超长数字串的末 6 位
+# 仍会匹配「分钟后」前的窗口，把 5000 位数错当 999999 分钟
+_MAX_DIGITS = 6
+
+
 def _cn_to_int(s: str) -> int | None:
     s = s.strip()
     if s.isdigit():
-        return int(s)
+        if len(s) > _MAX_DIGITS:
+            return None
+        try:
+            return int(s)
+        except (ValueError, OverflowError):
+            # 防御：位数已限，理论上不可达；解析失败按「无时间」处理，
+            # 不把异常抛上去让确定性重试耗尽、把有效笔记标 failed
+            return None
     if s in _CN_DIGITS:
         return _CN_DIGITS[s]
     # 十几 / 二十几 等两位组合
