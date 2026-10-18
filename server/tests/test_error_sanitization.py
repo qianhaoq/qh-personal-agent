@@ -168,3 +168,176 @@ async def test_500_response_body_contains_no_exception_text(client, user, monkey
     assert body["code"] == "internal_error"
     assert body["message"] == "internal server error"
     assert marker not in r.text, "500 体不得含异常文本（INV-14）"
+
+
+async def test_500_no_sentinel_in_any_logger_record(client, user, monkeypatch, caplog):
+    """threads9 P1（main.py:56）/ INV-14：未处理异常由最外层用户中间件
+    SafeErrorFallbackMiddleware 兜住并**永不 re-raise**——Starlette 的
+    ServerErrorMiddleware 调完 Exception handler 后总是 re-raise、原始
+    traceback 进 uvicorn.error 的那条路不可达。异常消息含哨兵（笔记正文
+    + 伪造密钥）时，**所有** logger 的捕获记录（消息、格式化参数、
+    exc_text）均不含哨兵；兜底日志只含类型名+错误码。"""
+    from app.api import notes as notes_api
+    from app.main import app
+
+    marker = "pa_sk_ALLLOGSECRET_444 SQL参数里的笔记正文"
+
+    async def exploding_allocate_seq(session, *args, **kwargs):
+        raise RuntimeError(f"seq allocation exploded: {marker}")
+
+    monkeypatch.setattr(notes_api, "allocate_seq", exploding_allocate_seq)
+
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    with caplog.at_level(logging.DEBUG):
+        async with AsyncClient(transport=transport, base_url="http://test") as raw:
+            r = await raw.post(
+                "/v1/notes",
+                json={"client_note_id": str(uuid.uuid4()), "text": "会被炸掉的正文"},
+                headers=auth_headers(user),
+            )
+    assert r.status_code == 500, r.text
+    assert marker not in r.text
+
+    assert caplog.records, "兜底中间件应记一行错误日志"
+    for record in caplog.records:
+        blob = (
+            record.getMessage()
+            + "\n"
+            + str(record.args)
+            + "\n"
+            + (record.exc_text or "")
+        )
+        assert marker not in blob, f"logger {record.name} 落了异常原文（INV-14）"
+        assert record.exc_info is None or record.exc_text is None, (
+            f"logger {record.name} 不得带 traceback"
+        )
+    fallback = [
+        rec for rec in caplog.records if "unhandled exception" in rec.getMessage()
+    ]
+    assert fallback, "应有兜底中间件的错误日志"
+    assert any("RuntimeError" in rec.getMessage() for rec in fallback), (
+        "兜底日志只含类型名（safe_error_text）"
+    )
+
+
+async def test_500_real_uvicorn_no_raw_traceback_in_logs(user, monkeypatch):
+    """threads9 P1（main.py:56）/ INV-14：真实 uvicorn 进程（默认日志
+    配置）下复现评审场景——未处理异常不再被 ServerErrorMiddleware
+    re-raise 进 uvicorn.error：兜底中间件吞掉后 uvicorn 收到的是普通
+    500 响应，全进程无哨兵、无 traceback。给 uvicorn/uvicorn.error/
+    uvicorn.access/sqlalchemy.engine/root 各挂捕获 handler（uvicorn.access
+    propagate=False，caplog 的 root handler 收不到，必须逐 logger 挂）。"""
+    import asyncio
+
+    import uvicorn
+
+    from app.api import notes as notes_api
+    from app.main import app
+
+    marker = "pa_sk_UVICORNSECRET_555 SQL绑定参数里的笔记正文"
+
+    async def exploding_allocate_seq(session, *args, **kwargs):
+        raise RuntimeError(f"seq allocation exploded: {marker}")
+
+    monkeypatch.setattr(notes_api, "allocate_seq", exploding_allocate_seq)
+
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    capture = _Capture(level=logging.DEBUG)
+    watched = ["", "uvicorn", "uvicorn.error", "uvicorn.access", "sqlalchemy.engine"]
+    saved_levels: dict[str, int] = {}
+    for name in watched:
+        lg = logging.getLogger(name)
+        saved_levels[name] = lg.level
+        lg.addHandler(capture)
+        lg.setLevel(logging.DEBUG)
+
+    # lifespan=off：不触发 app lifespan 的 create_all/dispose（引擎由测试
+    # 夹具管理），本测试只关心异常传播与日志面
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="debug", lifespan="off"))
+    task = asyncio.create_task(server.serve())
+    try:
+        for _ in range(200):
+            if server.started:
+                break
+            await asyncio.sleep(0.05)
+        assert server.started, "uvicorn 未能在 10s 内启动"
+        port = server.servers[0].sockets[0].getsockname()[1]
+
+        async with AsyncClient(base_url=f"http://127.0.0.1:{port}") as http:
+            r = await http.post(
+                "/v1/notes",
+                json={"client_note_id": str(uuid.uuid4()), "text": "会被炸掉的正文"},
+                headers=auth_headers(user),
+            )
+        assert r.status_code == 500, r.text
+        body = r.json()["error"]
+        assert body["code"] == "internal_error"
+        assert body["message"] == "internal server error"
+        assert marker not in r.text
+    finally:
+        server.should_exit = True
+        await asyncio.wait_for(task, timeout=10)
+        for name in watched:
+            lg = logging.getLogger(name)
+            lg.removeHandler(capture)
+            lg.setLevel(saved_levels[name])
+
+    assert records, "应捕获到 uvicorn/access 的日志"
+    for record in records:
+        blob = (
+            record.getMessage()
+            + "\n"
+            + str(record.args)
+            + "\n"
+            + (record.exc_text or "")
+        )
+        assert marker not in blob, f"logger {record.name} 落了异常原文（INV-14）"
+        assert record.exc_text is None, f"logger {record.name} 带 traceback：{record.getMessage()}"
+
+
+def test_third_party_http_loggers_pinned_to_warning():
+    """threads9 / INV-14：create_app 把 httpx/httpcore/openai 的 logger 钉
+    到 >= WARNING——环境/库默认级别漂移、未来版本把请求细节（LLM 请求体
+    含笔记正文）打进 INFO 日志时，应用层不设防就会把用户内容漏进日志。"""
+    from app.logs import _PINNED_LOGGERS
+    from app.main import create_app
+
+    for name in _PINNED_LOGGERS:
+        logging.getLogger(name).setLevel(logging.DEBUG)
+    create_app()
+    for name in _PINNED_LOGGERS:
+        assert logging.getLogger(name).getEffectiveLevel() >= logging.WARNING, name
+
+
+async def test_access_log_records_template_only_no_query_or_path_values(
+    client, user, caplog
+):
+    """threads9 / INV-14：uvicorn access log 已在 compose/Dockerfile 关闭
+    （请求行含完整 query），进程内唯一的请求级日志 AccessLogMiddleware
+    只记 method + 路由模板 + status + 耗时——/v1/search 的 query 值、
+    路径参数原值、未匹配路径都不进访问日志。"""
+    q_marker = "ACCESSQ-笔记正文-marker"
+    path_marker = "SECRETPATHNOTEID"
+    nomatch_marker = "SECRETNOMATCH"
+    with caplog.at_level(logging.INFO, logger="access"):
+        r1 = await client.get(
+            "/v1/search", params={"q": q_marker}, headers=auth_headers(user)
+        )
+        assert r1.status_code == 200, r1.text
+        r2 = await client.get(f"/v1/notes/{path_marker}", headers=auth_headers(user))
+        assert r2.status_code == 404, r2.text
+        r3 = await client.get(f"/no/such/{nomatch_marker}")
+        assert r3.status_code == 404, r3.text
+
+    text = caplog.text
+    assert q_marker not in text, "访问日志不得含 query 值（INV-14）"
+    assert path_marker not in text, "访问日志不得含路径参数原值（INV-14）"
+    assert nomatch_marker not in text, "未匹配路由只记 (unmatched)，不打原路径"
+    assert "GET /v1/search -> 200" in text
+    assert "GET /v1/notes/{note_id} -> 404" in text
+    assert "GET (unmatched) -> 404" in text

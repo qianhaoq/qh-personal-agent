@@ -243,10 +243,37 @@ class Settings(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def _reject_sqlalchemy_echo(self) -> "Settings":
+        # INV-14（threads9）：见 _reject_echo_in_url——DbSettings 同款校验
+        _reject_echo_in_url(self.database_url)
+        return self
+
 
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+def _reject_echo_in_url(database_url: str) -> None:
+    """INV-14（threads9）：DATABASE_URL 的 URL query 会原样传给
+    create_async_engine 当引擎参数——`?echo=true` 静默开 echo，SQL 与
+    绑定参数（笔记正文等用户内容）整体进 sqlalchemy.engine 日志。任何
+    环境启动即拒；排障需要 SQL 时本地临时改代码，不开配置口。"""
+    from sqlalchemy.engine import make_url
+
+    try:
+        query = make_url(database_url).query
+    except ValueError:
+        # URL 本身非法：交给真正创建引擎的路径报错，这里不抢报
+        return
+    echo = query.get("echo")
+    if echo is not None and str(echo).strip().lower() not in ("", "0", "false", "no", "off"):
+        raise ValueError(
+            "DATABASE_URL 不得通过 URL query 开 SQLAlchemy echo（如 ?echo=true）："
+            "echo 会把 SQL 与绑定参数（用户内容）打进 sqlalchemy.engine 日志"
+            "（INV-14）。排障需要 SQL 时本地临时改代码。"
+        )
 
 
 class DbSettings(BaseSettings):
@@ -263,6 +290,12 @@ class DbSettings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     database_url: str = "sqlite+aiosqlite:///./app.sqlite3"
+
+    @model_validator(mode="after")
+    def _reject_sqlalchemy_echo(self) -> "DbSettings":
+        # 同 Settings（INV-14，threads9）：init-db 的引擎同样吃 URL query
+        _reject_echo_in_url(self.database_url)
+        return self
 
 
 @lru_cache

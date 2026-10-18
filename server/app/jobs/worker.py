@@ -5,12 +5,16 @@ import logging
 from app.config import Settings, get_settings
 from app.db import startup_create_all
 from app.errors import safe_error_text
+from app.logs import harden_third_party_loggers
 from app.pipeline.runner import run_pending_jobs
 
 logging.basicConfig(
     level=get_settings().log_level.upper(),
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
+# 第三方 HTTP 客户端库 logger 钉 >= WARNING（INV-14 框架层，threads9）：
+# worker 不经 create_app，必须在 basicConfig 之后自己调
+harden_third_party_loggers()
 logger = logging.getLogger("worker")
 
 

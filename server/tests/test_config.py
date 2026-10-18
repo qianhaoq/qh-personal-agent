@@ -434,3 +434,32 @@ def test_positive_numeric_settings_defaults_ok():
     assert settings.worker_batch_size > 0
     assert settings.job_max_attempts > 0
     assert settings.ask_top_k > 0
+
+
+def test_database_url_echo_query_rejected():
+    """threads9 / INV-14：DATABASE_URL 的 URL query 会原样传给
+    create_async_engine 当引擎参数——`?echo=true` 静默开 echo，SQL 与绑定
+    参数（笔记正文等用户内容）整体进 sqlalchemy.engine 日志。任何环境
+    （SQLite 开发/测试与 PG 生产 alike）启动即拒；显式关闭的值放行。"""
+    from app.config import DbSettings
+
+    for url in (
+        "sqlite+aiosqlite:///./app.sqlite3?echo=true",
+        "sqlite+aiosqlite:///./app.sqlite3?echo=True",
+        "sqlite+aiosqlite:///./app.sqlite3?echo=1",
+        PG_URL + "?echo=yes",
+    ):
+        with pytest.raises(ValidationError, match="echo"):
+            Settings(database_url=url)
+        with pytest.raises(ValidationError, match="echo"):
+            # init-db 的引擎同样吃 URL query（DbSettings 同款校验）
+            DbSettings(database_url=url)
+
+    for ok in (
+        "sqlite+aiosqlite:///./app.sqlite3",
+        "sqlite+aiosqlite:///./app.sqlite3?echo=false",
+        "sqlite+aiosqlite:///./app.sqlite3?echo=0",
+        "sqlite+aiosqlite:///./app.sqlite3?timeout=30",
+    ):
+        assert Settings(database_url=ok).database_url == ok
+        assert DbSettings(database_url=ok).database_url == ok

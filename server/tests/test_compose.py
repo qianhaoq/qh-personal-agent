@@ -141,3 +141,62 @@ async def test_init_db_does_not_load_full_settings(monkeypatch):
     # DbSettings 入口保持可用：init_db 应经由它拿到 DATABASE_URL
     assert get_db_settings().database_url
     await db_module.init_db()  # 当前测试库（SQLite / PG）建表成功
+
+
+def test_uvicorn_commands_disable_access_log():
+    """threads9 P1（docker-compose.yml:44 / Dockerfile CMD）/ INV-14：
+    uvicorn 默认开 access log，请求行含完整 query——`GET /v1/search?q=
+    <笔记正文>` 整行进 stdout（compose 日志收集面）。每条 uvicorn 命令
+    （compose 各服务的 command 与 Dockerfile 的 CMD）必须带
+    --no-access-log；进程内请求级日志由 AccessLogMiddleware 承担。"""
+    compose = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))
+    uvicorn_commands: list[tuple[str, str]] = []
+    for name, service in compose["services"].items():
+        command = service.get("command") or ""
+        if "uvicorn" in command:
+            uvicorn_commands.append((name, command))
+    assert uvicorn_commands, "compose 必须至少有一个 uvicorn 服务（api）"
+    for name, command in uvicorn_commands:
+        assert "--no-access-log" in command, f"compose 服务 {name} 的 uvicorn 命令缺 --no-access-log"
+
+    dockerfile = (SERVER_DIR / "Dockerfile").read_text(encoding="utf-8")
+    cmd_lines = [ln for ln in dockerfile.splitlines() if ln.strip().upper().startswith("CMD")]
+    assert cmd_lines, "Dockerfile 必须有 CMD"
+    for line in cmd_lines:
+        assert "uvicorn" in line
+        assert "--no-access-log" in line, f"Dockerfile CMD 缺 --no-access-log：{line}"
+
+
+def test_dockerignore_excludes_secrets_and_local_data():
+    """threads9 P1（docker-compose.yml:21）/ INV-14：compose 三个服务都
+    build: .，无 .dockerignore 时 server/.env（JWT/LLM/PG 密钥）与本地
+    SQLite 笔记库（app.sqlite3、tests/_test.sqlite3）会整体发给 builder
+    ——Dockerfile 不 COPY 也拦不住上下文传输。锁定必要模式与镜像 COPY
+    白名单（tests 不进镜像）。"""
+    dockerignore = SERVER_DIR / ".dockerignore"
+    assert dockerignore.exists(), "server/.dockerignore 必须存在（构建上下文收口）"
+    patterns = {
+        line.strip()
+        for line in dockerignore.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    }
+    for required in (
+        ".env",  # 生产密钥（README 生产部署在 server/ 创建）
+        ".env.*",
+        "*.db",
+        "*.sqlite",  # 本地 SQLite 笔记库（含 tests/_test.sqlite3）
+        "*.sqlite-*",
+        ".venv/",
+        "__pycache__/",
+        "tests/",
+        ".git/",
+    ):
+        assert required in patterns, f".dockerignore 缺少必要模式：{required}"
+
+    dockerfile = (SERVER_DIR / "Dockerfile").read_text(encoding="utf-8")
+    copy_sources = re.findall(r"(?im)^COPY\s+(\S+)", dockerfile)
+    assert copy_sources, "Dockerfile 必须显式 COPY（不允许 COPY . 全量进镜像）"
+    for source in copy_sources:
+        assert source not in (".", "./"), "镜像不得 COPY 整个上下文"
+        assert "tests" not in source, f"tests 不得进镜像：{source}"
+        assert source in ("requirements-app.txt", "app"), f"镜像 COPY 超出白名单：{source}"

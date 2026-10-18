@@ -18,5 +18,7 @@ USER appuser
 
 ENV PYTHONUNBUFFERED=1
 
-# api 默认入口；worker 用 compose 覆盖 command
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+# api 默认入口；worker 用 compose 覆盖 command。
+# --no-access-log（INV-14，threads9）：请求行含完整 query（用户内容），
+# 与 docker-compose.yml 的 api command 保持一致
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2", "--no-access-log"]

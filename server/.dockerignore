@@ -1,0 +1,23 @@
+# 构建上下文收口（INV-14，threads9 / docker-compose.yml:21）：上下文在
+# COPY 之前整体发给 builder（legacy/remote 都拿得到全量）——按 README 生产
+# 部署创建的 server/.env（JWT/LLM/PG 密钥）与本地 SQLite 笔记库不得离机。
+# 镜像本身只 COPY requirements-app.txt 与 app/（见 Dockerfile，tests 不进镜像）。
+.env
+.env.*
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.log
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+tests/
+.git/
+.gitignore

@@ -15,7 +15,12 @@ from app.errors import (
     unhandled_exception_handler,
     validation_exception_handler,
 )
-from app.middleware import NulRejectMiddleware
+from app.logs import harden_third_party_loggers
+from app.middleware import (
+    AccessLogMiddleware,
+    NulRejectMiddleware,
+    SafeErrorFallbackMiddleware,
+)
 
 
 @asynccontextmanager
@@ -55,6 +60,16 @@ def create_app() -> FastAPI:
     app.add_exception_handler(RecursionError, recursion_error_handler)
     app.add_exception_handler(Exception, unhandled_exception_handler)
 
+    # 中间件（add 顺序 = 由外到内；INV-14 框架层，threads9）：
+    # - AccessLog 最外：模板级访问日志（uvicorn access log 已在 compose/
+    #   Dockerfile 关闭——请求行含完整 query），兜底 500 的响应也经过
+    #   它的 send 包装，status/耗时照常记录
+    # - SafeErrorFallback 次外：未处理异常最后防线——ServerErrorMiddleware
+    #   调完 Exception handler 后总是 re-raise（traceback 原文进
+    #   uvicorn.error），这里在它内侧把异常吞掉，uvicorn 永远收不到
+    # - NulReject / CORS 保持原有内外关系
+    app.add_middleware(AccessLogMiddleware)
+    app.add_middleware(SafeErrorFallbackMiddleware)
     # NUL 拒绝中间件（INV-7）：path/query 解码后含 \x00 → 422，不进路由
     app.add_middleware(NulRejectMiddleware)
 
@@ -78,6 +93,10 @@ def create_app() -> FastAPI:
     app.include_router(notes.router)
     app.include_router(sync.router)
     app.include_router(ask.router)
+
+    # 第三方 HTTP 客户端库的 logger 钉 >= WARNING（INV-14 框架层，threads9）；
+    # worker 进程在 app/jobs/worker.py 的 basicConfig 之后另行调用
+    harden_third_party_loggers()
     return app
 
 

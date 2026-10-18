@@ -41,7 +41,11 @@ services:
       # 记忆后端由后续 PR（feat/mem0-backend）提供，过渡期显式关闭记忆
       # 功能（disabled 在任何环境允许，memory_sync 平凡收敛标 synced）
       MEMORY_BACKEND: disabled
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2
+    # --no-access-log（INV-14，threads9）：uvicorn 默认 access log 的请求行
+    # 含完整 query（/v1/search?q=<笔记正文> 整行进 stdout/compose 日志收集）；
+    # 进程内的请求级日志由 app/middleware.py::AccessLogMiddleware 承担
+    # （只记 method/路由模板/status/耗时）
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2 --no-access-log
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
       interval: 10s
