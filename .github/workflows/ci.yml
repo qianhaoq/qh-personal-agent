@@ -14,6 +14,9 @@ on:
     types: [opened, synchronize, reopened, ready_for_review, edited]
   push:
     branches: [main]
+    # Docs-only merges don't need a post-merge CI run (PR CI stays unfiltered:
+    # a required check must never go missing on a PR).
+    paths-ignore: ['**/*.md', 'docs/**']
   workflow_dispatch:
 
 permissions:
@@ -21,7 +24,11 @@ permissions:
 
 jobs:
   ci:
-    uses: qianhaoq/devflow-gates/.github/workflows/ci.yml@1a6a4a85728b0c1f3482a52020f94cb8208c73f5  # devflow-gates main @ 1a6a4a8 (pinned; bump deliberately)
+    # `edited` fires on every title/body edit; only a base retarget needs CI.
+    # Caller-level skip: the skipped check is named after this job, never
+    # the required "ci / Build & Test" (whose last result stays in force).
+    if: github.event.action != 'edited' || github.event.changes.base != null
+    uses: qianhaoq/devflow-gates/.github/workflows/ci.yml@3853cc9dedbf1ffd8b10def841ed4c822dae7906  # devflow-gates main @ 3853cc9 (pinned; bump deliberately)
     with:
       python_version: '3.12'
       setup_command: ''
@@ -45,6 +52,10 @@ jobs:
   # changes to server/requirements-mem0.txt or app/memory/mem0_store.py are
   # always exercised.
   pg-detect:
+    # `edited` fires on every title/body edit; only a base retarget needs CI.
+    # Caller-level skip: the skipped check is named after this job, never
+    # the required "ci / Build & Test" (whose last result stays in force).
+    if: github.event.action != 'edited' || github.event.changes.base != null
     name: PG Tests (detect)
     runs-on: ubuntu-latest
     timeout-minutes: 5

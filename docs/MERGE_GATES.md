@@ -1,12 +1,12 @@
 # 合入门禁 | Merge gates
 
-与 dota2.ai / pinhaoyun / ai-devflow-weekly 对齐：CI、Codex、QA 都调用 `qianhaoq/devflow-gates` 的 reusable workflow（固定到 commit `1a6a4a8`，即 1a6a4a85728b0c1f3482a52020f94cb8208c73f5；升级要单独开 PR）。
+与 dota2.ai / pinhaoyun / ai-devflow-weekly 对齐：CI、Codex、QA 都调用 `qianhaoq/devflow-gates` 的 reusable workflow（固定到 commit `3853cc9`，即 3853cc9dedbf1ffd8b10def841ed4c822dae7906；升级要单独开 PR）。
 
 ## 必需检查（branch protection）
 
 - `ci / Build & Test` — `scripts/ci-test.sh`：`server/` 有 Python 代码时跑 ruff + pytest，`android/` 有 Gradle 工程时跑 `assembleDebug testDebugUnitTest`，都没有时直接通过（骨架阶段）。
 - `ci / Secret Scan` — gitleaks 全历史扫描。
-- `codex / Codex Review Gate` — 等 Codex 评审完成；**显式 P0/P1 与未标注线程阻断，显式 P2 不阻断**。PR 评论 `@codex review` 触发；线程 Resolve 后由每 15 分钟的 Gate Refresh 重跑。
+- `codex / Codex Review Gate` — 等 Codex 评审完成；**显式 P0/P1 与未标注线程阻断，显式 P2 不阻断**。PR 评论 `@codex review` 触发；线程 Resolve 不会触发 Actions（已取消每 15 分钟的定时 Refresh 以节省分钟）：Resolve 最后一个阻断线程后在 PR 评论 `/recheck` 触发 Gate Refresh 重跑（或在 PR 分支上 `workflow_dispatch` 填 PR 号）；新 push / Codex 新评论也会自动重评。
 - `qa / QA Gate` — 需要标签 `qa-passed`，且只认白名单用户（仓库变量 `QA_LABELERS`，默认 `qianhaoq`）最后一次打的标签；head 有新提交后旧标签会被摘掉。
 
 分支保护还要求：分支与 main 同步（strict）、对话全部 Resolve、管理员同样受约束、禁止 force-push 和删除。
