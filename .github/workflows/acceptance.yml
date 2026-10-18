@@ -22,4 +22,4 @@ jobs:
       contents: read
       pull-requests: write   # sticky report comment
       checks: read           # read the Codex gate result
-    uses: qianhaoq/devflow-gates/.github/workflows/acceptance.yml@37aef857960dd425a1d48ef781818c89d889db2c  # devflow-gates main @ 37aef85 (pinned; bump deliberately)  # devflow-gates main @ 1a6a4a8 (pinned)
+    uses: qianhaoq/devflow-gates/.github/workflows/acceptance.yml@d83753839f5bf0a3b795f1578b0d1ff8c4cf9ff5  # devflow-gates main @ d837538 (heal cancelled required; bump deliberately)

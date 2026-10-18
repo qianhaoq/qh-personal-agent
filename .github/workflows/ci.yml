@@ -29,7 +29,7 @@ jobs:
     # Caller-level skip: the skipped check carries this job's own name, never
     # a required "ci / …" name, so the last real result stays in force.
     if: github.event.action != 'edited' || github.event.changes.base != null
-    uses: qianhaoq/devflow-gates/.github/workflows/ci.yml@37aef857960dd425a1d48ef781818c89d889db2c  # devflow-gates main @ 37aef85 (pinned; bump deliberately)
+    uses: qianhaoq/devflow-gates/.github/workflows/ci.yml@d83753839f5bf0a3b795f1578b0d1ff8c4cf9ff5  # devflow-gates main @ d837538 (heal cancelled required; bump deliberately)
     with:
       python_version: '3.12'
       setup_command: ''

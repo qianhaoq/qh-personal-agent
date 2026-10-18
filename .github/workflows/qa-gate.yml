@@ -74,7 +74,7 @@ jobs:
       pull-requests: write
       issues: write
       actions: write
-    uses: qianhaoq/devflow-gates/.github/workflows/qa-gate.yml@37aef857960dd425a1d48ef781818c89d889db2c  # devflow-gates main @ 37aef85 (pinned; bump deliberately)
+    uses: qianhaoq/devflow-gates/.github/workflows/qa-gate.yml@d83753839f5bf0a3b795f1578b0d1ff8c4cf9ff5  # devflow-gates main @ d837538 (heal cancelled required; bump deliberately)
     with:
       qa_label: 'qa-passed'
       # Only these logins' labeled event counts as QA sign-off (repo var QA_LABELERS overrides).
@@ -90,4 +90,4 @@ jobs:
   #     pull-requests: read
   #     issues: read
   #     actions: write
-  #   uses: qianhaoq/devflow-gates/.github/workflows/qa-gate.yml@37aef857960dd425a1d48ef781818c89d889db2c  # devflow-gates main @ 37aef85 (pinned; bump deliberately)
+  #   uses: qianhaoq/devflow-gates/.github/workflows/qa-gate.yml@d83753839f5bf0a3b795f1578b0d1ff8c4cf9ff5  # devflow-gates main @ d837538 (heal cancelled required; bump deliberately)
