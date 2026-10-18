@@ -120,9 +120,8 @@ async def test_worker_loop_exception_logged_sanitized_no_traceback(monkeypatch, 
     monkeypatch.setattr(worker_mod, "startup_create_all", _no_create_all)
     monkeypatch.setattr(worker_mod, "run_pending_jobs", failing_run_pending_jobs)
 
-    with caplog.at_level(logging.ERROR, logger="worker"):
-        with pytest.raises(asyncio.CancelledError):
-            await worker_mod.main()
+    with caplog.at_level(logging.ERROR, logger="worker"), pytest.raises(asyncio.CancelledError):
+        await worker_mod.main()
 
     assert calls["n"] == 2, "第一轮异常后循环必须继续（常驻进程不退出）"
     assert "worker loop error" in caplog.text

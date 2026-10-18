@@ -324,7 +324,7 @@ async def test_patch_clears_stale_extraction_fields(client, user, run_jobs):
         json=_note_body("明天上午十点交周报，顺便要买咖啡豆和牛奶"),
         headers=headers,
     )
-    note_id, rev = created.json()["note_id"], created.json()["rev"]
+    note_id = created.json()["note_id"]
     await run_jobs()
 
     got = (await client.get(f"/v1/notes/{note_id}", headers=headers)).json()
@@ -405,17 +405,14 @@ async def test_patch_unchanged_text_keeps_extraction_fields(client, user, run_jo
     )
     assert old_title and old_tags and old_todos
 
-    from sqlalchemy import func, select
-
-    from app.db import get_sessionmaker
-    from app.models import Job
-
     async def _job_counts() -> dict:
         async with get_sessionmaker()() as session:
             return dict(
                 (
                     await session.execute(
-                        select(Job.kind, func.count()).where(Job.note_id == note_id)
+                        select(Job.kind, func.count())
+                        .where(Job.note_id == note_id)
+                        .group_by(Job.kind)
                     )
                 ).all()
             )
