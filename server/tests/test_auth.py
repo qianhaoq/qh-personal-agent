@@ -782,9 +782,9 @@ async def test_login_mints_tokens_after_device_row_lock(client, invite_code, mon
         order.append("upsert_built")
         return real_upsert(*args, **kwargs)
 
-    def pair_recorder(user_id, device_id):
+    def pair_recorder(user_id, device_id, generation):
         order.append("mint")
-        return real_pair(user_id, device_id)
+        return real_pair(user_id, device_id, generation)
 
     monkeypatch.setattr(auth_api, "_device_upsert", upsert_recorder)
     monkeypatch.setattr(auth_api, "_token_pair", pair_recorder)
@@ -1015,3 +1015,159 @@ async def test_refresh_prunes_expired_rows_keeps_revoked_until_expiry(client, in
     replay = await client.post("/v1/auth/refresh", json={"refresh_token": t2})
     assert replay.status_code == 401
     assert replay.json()["error"]["code"] == "refresh_reused"
+
+
+# ---------------------------------------------------------------------------
+# INV-8 陈述 4（threads12 P1，auth.py:82）：凭证代际 fence。吊销后同设备
+# 再登录（复活）只清 revoked_at 是不够的——吊销前签发的 access 会回魂、
+# 被吊销的旧 refresh 重放会连环吊销每个新会话。
+# ---------------------------------------------------------------------------
+
+
+async def _device_generation(device_id: str) -> int:
+    from app.db import get_sessionmaker
+    from app.models import Device
+
+    async with get_sessionmaker()() as session:
+        return (
+            await session.execute(
+                select(Device.credential_generation).where(Device.id == device_id)
+            )
+        ).scalar()
+
+
+async def test_reuse_revoke_then_relogin_fences_old_credentials(client, invite_code):
+    """reuse 吊销 → 同设备再登录：旧 access 401（gen 落后）、旧 refresh
+    重放普通 401 且**不吊销新会话**（不进 refresh_reused 分支）；新签发
+    的 access/refresh 全部可用。"""
+    device_id = "dev_fence"
+
+    async def login() -> dict:
+        resp = await client.post(
+            "/v1/auth/login",
+            json={"invite_code": invite_code, "device_id": device_id, "device_name": "d"},
+        )
+        assert resp.status_code == 200, resp.text
+        return resp.json()
+
+    first = await login()
+    old_access, old_refresh = first["access_token"], first["refresh_token"]
+
+    # 制造一次复用吊销：轮换出第二枚，再重放第一枚
+    rotated = await client.post("/v1/auth/refresh", json={"refresh_token": old_refresh})
+    assert rotated.status_code == 200, rotated.text
+    rotated_refresh = rotated.json()["refresh_token"]
+    reuse = await client.post("/v1/auth/refresh", json={"refresh_token": old_refresh})
+    assert reuse.status_code == 401
+    assert reuse.json()["error"]["code"] == "refresh_reused"
+    assert await _device_generation(device_id) == 1, "复用吊销应把代 +1"
+
+    # 同设备再登录：复活 + 再 +1 代（1 → 2）
+    second = await login()
+    new_access, new_refresh = second["access_token"], second["refresh_token"]
+    assert await _device_generation(device_id) == 2, "复活应再 +1 代"
+
+    # 旧 access：吊销前签发，复活后不得回魂（get_auth 的 gen 校验）
+    stale_notes = await client.get(
+        "/v1/notes", headers={"authorization": f"Bearer {old_access}"}
+    )
+    assert stale_notes.status_code == 401, "吊销前签发的 access 在复活后必须 401"
+
+    # 旧 refresh（被吊销作废的那枚）重放：普通 401，且不得吊销新会话
+    replay_old = await client.post("/v1/auth/refresh", json={"refresh_token": old_refresh})
+    assert replay_old.status_code == 401
+    assert replay_old.json()["error"]["code"] == "unauthorized", "跨代重放是普通 401，不是 refresh_reused"
+    # 被轮换掉的那枚同样跨代：普通 401
+    replay_rotated = await client.post(
+        "/v1/auth/refresh", json={"refresh_token": rotated_refresh}
+    )
+    assert replay_rotated.status_code == 401
+    assert replay_rotated.json()["error"]["code"] == "unauthorized"
+
+    # 关键 fence 断言：上面两次重放之后设备**没有**再次进入吊销态
+    # （旧行为：每次重放都把复活的新会话再吊销一遍，连环 DoS）
+    assert await _device_generation(device_id) == 2, "跨代重放不得再改代（无吊销副作用）"
+
+    # 新会话凭证全部可用
+    fresh_notes = await client.get(
+        "/v1/notes", headers={"authorization": f"Bearer {new_access}"}
+    )
+    assert fresh_notes.status_code == 200, fresh_notes.text
+    fresh_refresh = await client.post("/v1/auth/refresh", json={"refresh_token": new_refresh})
+    assert fresh_refresh.status_code == 200, fresh_refresh.text
+
+
+async def test_plain_relogin_keeps_same_generation_all_tokens_valid(client, invite_code):
+    """普通再登录（设备未吊销）不涨代：两次登录签发的 access/refresh
+    全部同时可用——fence 只针对吊销/复活，不能误伤多端/并发登录语义。"""
+    device_id = "dev_plain_relogin"
+
+    async def login() -> dict:
+        resp = await client.post(
+            "/v1/auth/login",
+            json={"invite_code": invite_code, "device_id": device_id, "device_name": "d"},
+        )
+        assert resp.status_code == 200, resp.text
+        return resp.json()
+
+    first = await login()
+    second = await login()
+    assert await _device_generation(device_id) == 0, "未吊销的再登录不得涨代"
+
+    # 两次的 access 都过 get_auth；两次的 refresh 都能轮换
+    for pair in (first, second):
+        notes = await client.get(
+            "/v1/notes", headers={"authorization": f"Bearer {pair['access_token']}"}
+        )
+        assert notes.status_code == 200, notes.text
+        rotated = await client.post(
+            "/v1/auth/refresh", json={"refresh_token": pair["refresh_token"]}
+        )
+        assert rotated.status_code == 200, rotated.text
+
+
+async def test_concurrent_revive_logins_bump_generation_once_all_tokens_valid(
+    client, invite_code
+):
+    """吊销后的多次（并发）再登录只把代 +1 一次：第一个 upsert 复活
+    （+1），后续 upsert 看到的已是 revoked_at 为空的行（不再 +1）——
+    否则第二次登录会把第一次刚签发的凭证整体打成跨代。两次登录的
+    凭证最终都必须可用。"""
+    device_id = "dev_revive_once"
+
+    async def login() -> dict:
+        resp = await client.post(
+            "/v1/auth/login",
+            json={"invite_code": invite_code, "device_id": device_id, "device_name": "d"},
+        )
+        assert resp.status_code == 200, resp.text
+        return resp.json()
+
+    first = await login()
+    # 轮换成功后重放被轮换的那枚 → 复用吊销（设备 gen 0 → 1）
+    rotated = await client.post(
+        "/v1/auth/refresh", json={"refresh_token": first["refresh_token"]}
+    )
+    assert rotated.status_code == 200, rotated.text
+    replay = await client.post(
+        "/v1/auth/refresh", json={"refresh_token": first["refresh_token"]}
+    )
+    assert replay.status_code == 401
+    assert replay.json()["error"]["code"] == "refresh_reused"
+    assert await _device_generation(device_id) == 1, "复用吊销 +1 代"
+
+    # 吊销后「并发」两次再登录（SQLite 单写者下串行执行，PG 下在 upsert
+    # 的行锁上串行化——两种次序里只有第一个看到 revoked 行）
+    second = await login()
+    third = await login()
+    assert await _device_generation(device_id) == 2, "复活只 +1 一次，第二次不得再涨"
+
+    for pair in (second, third):
+        notes = await client.get(
+            "/v1/notes", headers={"authorization": f"Bearer {pair['access_token']}"}
+        )
+        assert notes.status_code == 200, notes.text
+        refreshed = await client.post(
+            "/v1/auth/refresh", json={"refresh_token": pair["refresh_token"]}
+        )
+        assert refreshed.status_code == 200, refreshed.text

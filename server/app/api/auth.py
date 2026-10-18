@@ -11,7 +11,7 @@ refresh_tokens 表——同设备同账号并发登录各自追加一行、互�
 不碰 sequences。
 """
 from fastapi import APIRouter, Depends
-from sqlalchemy import and_, delete, func, or_, select, update
+from sqlalchemy import and_, case, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.tokens import (
@@ -36,8 +36,10 @@ router = APIRouter(prefix="/v1/auth", tags=["auth"])
 _REFRESH_TOKENS_PER_DEVICE = 5
 
 
-def _token_pair(user_id: str, device_id: str) -> dict:
-    access, expires_in = create_access_token(user_id, device_id)
+def _token_pair(user_id: str, device_id: str, generation: int) -> dict:
+    """access 的 gen claim 与新 refresh 行都携带当前设备凭证代（INV-8
+    陈述 4）：调用方负责传「device 行锁落定之后」读到的代。"""
+    access, expires_in = create_access_token(user_id, device_id, generation)
     return {
         "access_token": access,
         "refresh_token": new_refresh_token(),
@@ -79,6 +81,14 @@ def _device_upsert(device_id: str, user_id: str, body: LoginRequest, now):
         index_elements=[Device.id],
         set_={
             "revoked_at": None,
+            # INV-8 陈述 4（threads12 P1）：真复活（旧行 revoked_at 非空）
+            # 才 +1 代——普通再登录不涨（否则并发登录互相把对方刚签发的
+            # 凭证打成跨代）。SET 里按表名（devices）引用的是冲突前的
+            # **旧行**值，PG 与 SQLite 的 upsert 语义一致
+            "credential_generation": case(
+                (Device.revoked_at.is_not(None), Device.credential_generation + 1),
+                else_=Device.credential_generation,
+            ),
             "last_seen": now,
             # 请求里为空的 name/platform 不覆盖已有值
             "name": func.coalesce(func.nullif(excluded.name, ""), Device.name),
@@ -90,7 +100,7 @@ def _device_upsert(device_id: str, user_id: str, body: LoginRequest, now):
 
 
 async def _append_refresh_token(
-    session: AsyncSession, device_id: str, user_id: str, token: str, now
+    session: AsyncSession, device_id: str, user_id: str, token: str, now, generation: int
 ) -> None:
     """追加一枚 refresh token 并顺手清理设备上的陈旧行（INV-8）。
 
@@ -113,6 +123,9 @@ async def _append_refresh_token(
         token_hash=hash_refresh_token(token),
         created_at=now,
         expires_at=refresh_expiry(),
+        # 行的代在插入时写定、此后不可变（INV-8 陈述 4）：refresh 只对
+        # 「行的代 == 设备当前代」的行轮换
+        credential_generation=generation,
     )
     session.add(row)
     await session.flush()
@@ -170,9 +183,12 @@ async def _revoke_device_for_reuse(
         raise ApiError(401, "unauthorized", "invalid refresh token")
     current = (
         await session.execute(
-            select(RefreshToken.id, RefreshToken.expires_at, RefreshToken.revoked_at).where(
-                RefreshToken.id == token_row_id
-            )
+            select(
+                RefreshToken.id,
+                RefreshToken.expires_at,
+                RefreshToken.revoked_at,
+                RefreshToken.credential_generation,
+            ).where(RefreshToken.id == token_row_id)
         )
     ).first()
     if current is None:
@@ -185,6 +201,13 @@ async def _revoke_device_for_reuse(
         # 理论不可达：revoked_at 只置不清，首读看到的是已提交值，不随开头
         # 的 rollback 撤销。证据消失时绝不吊销设备（防御性普通 401）
         raise ApiError(401, "unauthorized", "invalid refresh token")
+    # INV-8 陈述 4（threads12 P1）：跨代的行是吊销期签发的旧凭证（行的代
+    # 不可变，锁前锁后读都一样；设备代在锁内已重读）。重放它只能普通 401
+    # ——若进吊销分支，被盗的旧 token 每次都能把重新登录的新会话再吊销
+    # 一遍（连环 DoS）。不轮换、不吊销
+    if current.credential_generation != device.credential_generation:
+        raise ApiError(401, "unauthorized", "invalid refresh token")
+    device.credential_generation += 1
     device.revoked_at = utcnow()
     await session.execute(
         update(RefreshToken)
@@ -300,9 +323,19 @@ async def login(body: LoginRequest, session: AsyncSession = Depends(get_db_sessi
     # 追加行的 created_at/修剪判定；upsert 的 last_seen 用旧 now 是
     # 纯展示边界（无任何决策读它）
     now = utcnow()
-    result = _token_pair(user_id, body.device_id)
+    # upsert 落定后标量列重读当前代（同事务、同连接，读到的是本事务刚
+    # 写入的值；标量列不走 identity map）。真复活时 upsert 已 +1——
+    # 吊销前签发的旧凭证（gen 落后）从此被 fence 挡在外面
+    generation = (
+        await session.execute(
+            select(Device.credential_generation).where(Device.id == body.device_id)
+        )
+    ).scalar()
+    result = _token_pair(user_id, body.device_id, generation)
     # 登录只追加：本次返回的 token 与既有各行互不覆盖（INV-8）
-    await _append_refresh_token(session, body.device_id, user_id, result["refresh_token"], now)
+    await _append_refresh_token(
+        session, body.device_id, user_id, result["refresh_token"], now, generation
+    )
     await session.commit()
     return result
 
@@ -329,6 +362,12 @@ async def refresh(body: RefreshRequest, session: AsyncSession = Depends(get_db_s
         device = await _lock_device(session, row.device_id)
         if device is None or device.revoked_at is not None:
             raise ApiError(401, "unauthorized", "device revoked")
+        # INV-8 陈述 4（threads12 P1）：行的代（插入时写定、不可变）必须
+        # 等于设备当前代。跨代 = 吊销期签发的旧凭证在复活后重放：普通 401
+        # ——不轮换（旧凭证不能换新凭证）、也不进复用吊销分支（新会话
+        # 不能被连环吊销）
+        if row.credential_generation != device.credential_generation:
+            raise ApiError(401, "unauthorized", "invalid refresh token")
         # INV-13（threads8 P1，auth.py:294）：开头的 now 是无锁首读时刻，
         # 等锁期间 token 可能已跨过 expires_at——锁内重取 now，让下面的
         # 条件 UPDATE 用行内当前 expires_at 原子判定（条件 UPDATE 的 WHERE
@@ -337,7 +376,7 @@ async def refresh(body: RefreshRequest, session: AsyncSession = Depends(get_db_s
         # 轮换只作废被轮换的那一枚：条件 UPDATE 原子完成，同一枚 token
         # 并发刷新时只有一个能命中
         device_id, token_user_id = row.device_id, row.user_id
-        result = _token_pair(token_user_id, device_id)
+        result = _token_pair(token_user_id, device_id, device.credential_generation)
         rotated = await session.execute(
             update(RefreshToken)
             .where(
@@ -350,7 +389,14 @@ async def refresh(body: RefreshRequest, session: AsyncSession = Depends(get_db_s
         )
         if rotated.rowcount == 1:
             device.last_seen = now
-            await _append_refresh_token(session, device_id, token_user_id, result["refresh_token"], now)
+            await _append_refresh_token(
+                session,
+                device_id,
+                token_user_id,
+                result["refresh_token"],
+                now,
+                device.credential_generation,
+            )
             await session.commit()
             return result
         # rowcount==0 不能直接断定为重放（threads6 P1-3 / INV-8/INV-12）：

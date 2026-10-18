@@ -44,6 +44,11 @@ async def get_auth(request: Request) -> AuthContext:
         device = await session.get(Device, device_id)
         if device is None or device.revoked_at is not None:
             raise ApiError(401, "unauthorized", "device revoked")
+        # INV-8 陈述 4（threads12 P1）：吊销后同设备再登录会复活设备并把
+        # 代 +1——吊销前签发的 access（gen 落后于当前代）不得随之回魂。
+        # 与 revoked 校验同型：只做等值比对、无吊销副作用
+        if payload.get("gen") != device.credential_generation:
+            raise ApiError(401, "unauthorized", "stale device credentials")
     return AuthContext(user_id=user_id, device_id=device_id)
 
 
