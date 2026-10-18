@@ -153,7 +153,10 @@ def _check_timezone(value: str | None) -> str | None:
     try:
         ZoneInfo(value)
     except (ZoneInfoNotFoundError, ValueError) as exc:
-        raise ValueError(f"timezone 必须是合法 IANA 时区名：{value}") from exc
+        # INV-14（threads10 P1，schemas.py:156）：固定文案，不插值 value——
+        # validation_exception_handler 剥 input/ctx 后返回 msg，msg 本身
+        # 不能回显用户提交的原值
+        raise ValueError("timezone 必须是合法 IANA 时区名") from exc
     return value
 
 

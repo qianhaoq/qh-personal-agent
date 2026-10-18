@@ -144,6 +144,24 @@ async def test_validation_error_response_does_not_echo_input(client, user):
     assert "Field required" in r.text, "msg 保留：客户端修正请求所需"
 
 
+async def test_422_fixed_message_does_not_echo_timezone_value(client, user):
+    """threads10 P1（schemas.py:156）/ INV-14：剥 input/ctx 不够——msg 本身
+    就是回显面。校验器 ValueError 一律固定文案：非法 timezone 的 422 体
+    不得包含提交的原值（旧文案 `…时区名：{value}` 原样带回）。"""
+    sentinel = "TZ-ECHO-MARKER-Not/A:Zone"
+    for path, extra in (
+        ("/v1/notes", {"client_note_id": str(uuid.uuid4()), "text": "正文"}),
+        ("/v1/ask", {"text": "今天有什么安排"}),
+    ):
+        r = await client.post(
+            path, json={**extra, "timezone": sentinel}, headers=auth_headers(user)
+        )
+        assert r.status_code == 422, (path, r.text)
+        assert r.json()["error"]["code"] == "validation_error"
+        assert sentinel not in r.text, f"{path} 的 422 msg 不得回显 timezone 原值（INV-14）"
+        assert "timezone" in r.text, "字段名保留：客户端定位问题所需（字段名≠字段值）"
+
+
 async def test_500_response_body_contains_no_exception_text(client, user, monkeypatch):
     """未处理异常（消息含用户内容）→ 500 体是固定文案，绝不回显异常文本。"""
     from app.api import notes as notes_api

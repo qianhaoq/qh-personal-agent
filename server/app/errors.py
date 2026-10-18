@@ -78,8 +78,9 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException) 
 async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
     """422 只回 pydantic 的 type/loc/msg（INV-14，threads8 P1）：errors()
     里的 input/ctx 是请求原值（正文、refresh_token、asr……）的整段回显，
-    不落响应。msg 来自固定模板（自定义校验消息可能引用该请求自己提交的
-    单个字段值，如 timezone 名——客户端修正请求所需，保留该边界）。"""
+    不落响应。msg 也必须干净（threads10 P1，schemas.py:156）：校验器一律
+    固定文案，不得插值用户提交的原值——剥参数不等于脱敏消息，msg 本身
+    就是回显面。"""
     safe_errors = [
         {k: err[k] for k in ("type", "loc", "msg") if k in err} for err in exc.errors()
     ]
