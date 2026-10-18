@@ -225,3 +225,32 @@ def test_dockerignore_excludes_secrets_and_local_data():
         assert source not in (".", "./"), "镜像不得 COPY 整个上下文"
         assert "tests" not in source, f"tests 不得进镜像：{source}"
         assert source in ("requirements-app.txt", "app"), f"镜像 COPY 超出白名单：{source}"
+
+
+def test_gitignore_excludes_sqlite_and_sidecar_files():
+    """threads12 P1（.gitignore:8）/ INV-14：README 记载的本地默认库是
+    app.sqlite3，但 *.sqlite3 匹配不到 -wal/-shm/-journal sidecar（崩溃
+    残留/事务进行中，含完整或部分笔记页）——.gitignore 必须带上与
+    .dockerignore 对齐的全部 sqlite/db 模式，否则一次 git add 就能把
+    旁路文件提交进仓库（本地库进 git 与进构建上下文是同一泄漏类的
+    两个面）。"""
+    gitignore = SERVER_DIR / ".gitignore"
+    assert gitignore.exists(), "server/.gitignore 必须存在"
+    patterns = {
+        line.strip()
+        for line in gitignore.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    }
+    for required in ("*.sqlite", "*.sqlite-*", "*.sqlite3", "*.sqlite3-*", "*.db", "*.db-*"):
+        assert required in patterns, f".gitignore 缺少必要模式：{required}"
+
+    # 与 .dockerignore 的 sqlite/db 模式集一致（两边不允许漂移）
+    dockerignore = (SERVER_DIR / ".dockerignore").read_text(encoding="utf-8").splitlines()
+    docker_sqlite = {
+        line.strip()
+        for line in dockerignore
+        if line.strip().startswith(("*.", "!"))
+        and ("sqlite" in line or ".db" in line)
+    }
+    git_sqlite = {p for p in patterns if "sqlite" in p or p.endswith(".db") or ".db-" in p}
+    assert git_sqlite == docker_sqlite, f"gitignore/dockerignore 的 sqlite 模式漂移：{git_sqlite} vs {docker_sqlite}"

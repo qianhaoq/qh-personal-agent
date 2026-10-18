@@ -4,5 +4,12 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+# SQLite 库与其 sidecar（-wal/-shm/-journal，崩溃残留/事务进行中含笔记页数据）：
+# 与 server/.dockerignore 的模式集对齐（INV-14，threads12 P1）——本地库
+# 既不进构建上下文、也不进 git（*.sqlite3 匹配不到 app.sqlite3-wal 等）
+*.sqlite
+*.sqlite-*
 *.sqlite3
+*.sqlite3-*
 *.db
+*.db-*
