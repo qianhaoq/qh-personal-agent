@@ -1,0 +1,9 @@
+# gitleaks ignore 清单（threads11 Secret Scan 收口）。
+# 每行一个 fingerprint（commit:file:rule:line），只用于「已进历史、无法
+# 改写已推送提交」的误报/已修复项；新增条目必须写明来源与处置。
+#
+# threads11：threads10 D 类在文档里写的「实测示例串」（编造的类密钥形态，
+# 非真实凭据）被 generic-api-key 命中。已在其后继提交把示例改为无类密钥
+# 形态的描述性占位（docs/agent-pitfalls.md / docs/server-invariants.md），
+# 但引入它的提交 e0908dd 已推送、不可改写，此处登记以使全历史扫描归零。
+e0908dd63ed2644501e50e33a992e87505648ead:docs/agent-pitfalls.md:generic-api-key:156

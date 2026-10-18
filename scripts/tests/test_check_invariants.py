@@ -292,6 +292,71 @@ class Fallback(unittest.TestCase):
         """), [])
 
 
+class RawExc(unittest.TestCase):
+    def test_raw_exception_flows_flagged(self):
+        # threads8 P1 (runner.py:71) 的模式：bare 名 / str() / repr() / f-string /
+        # %-format、logger.exception、exc_info=True、.error 属性存储
+        self.assertEqual(rules("""
+        def f(job):
+            try:
+                run()
+            except Exception as e:
+                logger.warning("job failed: %s", e)
+                logger.error("boom: %s", str(e))
+                log.info(f"failed {e}")
+                logger.debug("x %s" % e)
+                logger.info("y %s" % (e,))
+                app_logger.warning("sliced: %s", str(e)[:2000])
+                logger.exception("boom")
+                logger.error("with tb", exc_info=True)
+                job.last_error = str(e)
+                self.error_text = e
+        """), [("INV-NO-RAW-EXC", i) for i in range(6, 16)])
+
+    def test_sanitized_and_out_of_scope_ok(self):
+        self.assertEqual(rules("""
+        def f(job, other):
+            try:
+                run()
+            except Exception as e:
+                summary = safe_error_text(e)
+                logger.warning("job failed: %s", summary)
+                logger.error("worker loop error: %s", safe_error_text(e))
+                job.last_error = summary
+                job.last_error = safe_error_summary(e)["type"]
+                job.attempts = str(e)
+                plain = str(e)
+                logger.error("no exc here: %s", other)
+                catalog.info("not a logger: %s", e)
+                logger.error("exc_info=off", exc_info=False)
+        """), [])
+
+    def test_only_handler_bound_name_tracked(self):
+        # 名字必须由所在 except 子句绑定：别的 handler 的名字/未绑定名字不算
+        self.assertEqual(rules("""
+        def g(err):
+            try:
+                run()
+            except Exception as e:
+                logger.warning("stale: %s", str(err))
+            except ValueError:
+                logger.warning("unbound: %s", e)
+            except KeyError:
+                logger.info("attr not raw: %s", e.code)
+        """), [])
+
+    def test_exemption_requires_rule_id(self):
+        base = """
+        def f(job):
+            try:
+                run()
+            except Exception as e:
+                logger.warning("job failed: %s", e)  # MARK
+        """
+        self.assertEqual(rules(base.replace("MARK", "invariant-ok: INV-NO-RAW-EXC sanitized upstream")), [])
+        self.assertEqual(len(rules(base.replace("MARK", "invariant-ok: INV-NUL wrong rule"))), 1)
+
+
 class Robustness(unittest.TestCase):
     def _run(self, d):
         buf = io.StringIO()

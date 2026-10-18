@@ -1,0 +1,205 @@
+"""数据库模型（S1 子集：users/devices/invite_codes/notes/reminders/jobs/sequences）。"""
+from datetime import UTC, datetime
+
+from sqlalchemy import (
+    JSON,
+    BigInteger,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    text,
+)
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.db import Base
+
+
+def utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
+class Sequence(Base):
+    """全局单调序列，作为 /v1/sync 的 cursor 来源。"""
+
+    __tablename__ = "sequences"
+
+    name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[int] = mapped_column(BigInteger, default=0)
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    timezone: Mapped[str] = mapped_column(String(64), default="Asia/Shanghai")
+    status: Mapped[str] = mapped_column(String(16), default="active")
+
+
+class InviteCode(Base):
+    __tablename__ = "invite_codes"
+
+    code: Mapped[str] = mapped_column(String(64), primary_key=True)
+    max_uses: Mapped[int] = mapped_column(Integer, default=1)
+    used: Mapped[int] = mapped_column(Integer, default=0)
+    # 该邀请码创建的账号：同一码后续登录复用同一 user（used 只计注册次数）
+    owner_user_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class Device(Base):
+    __tablename__ = "devices"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    name: Mapped[str] = mapped_column(String(128), default="")
+    platform: Mapped[str] = mapped_column(String(32), default="android")
+    last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 凭证代际（INV-8 陈述 4，threads12 P1）：吊销/复活时 +1（见
+    # app/api/auth.py 的 _device_upsert/_revoke_device_for_reuse）。access
+    # JWT 的 gen claim 与 refresh_tokens 行各携带签发时的代，get_auth/
+    # refresh 校验不一致一律普通 401——吊销前签发的凭证不得在复活后回魂，
+    # 被吊销旧 refresh 的重放不得连环吊销重新登录的新会话
+    credential_generation: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+
+
+class RefreshToken(Base):
+    """设备的 refresh 凭据，一行一枚（threads5 P1-2，INV-8）。
+
+    devices 行不再存 refresh 哈希：同设备同账号并发登录各自追加一行、
+    互不覆盖——每个成功响应返回的 token 在过期/被显式作废（轮换、设备
+    吊销、登出）或被每设备 5 枚上限挤出（见 app/api/auth.py 的修剪）
+    之前都有效。轮换只作废被轮换的那一行；被轮换的行保留（revoked_at
+    非空）供复用检测（重放即吊销整台设备）。
+    """
+
+    __tablename__ = "refresh_tokens"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    device_id: Mapped[str] = mapped_column(ForeignKey("devices.id"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    token_hash: Mapped[str] = mapped_column(String(128), unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 签发时的设备凭证代（插入时写定、此后不可变）：refresh 只对「行的代
+    # == 设备当前代」的行轮换（INV-8 陈述 4，threads12 P1）。跨代的行是
+    # 吊销期签发的旧凭证，重放得普通 401——不轮换、也不进复用吊销分支
+    credential_generation: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+
+
+class Note(Base):
+    __tablename__ = "notes"
+    __table_args__ = (UniqueConstraint("user_id", "client_note_id", name="uq_note_user_client"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    client_note_id: Mapped[str] = mapped_column(String(64))
+    text: Mapped[str] = mapped_column(Text, default="")
+    title: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    source: Mapped[str] = mapped_column(String(16), default="app")
+    asr_meta_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    recorded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    timezone: Mapped[str] = mapped_column(String(64), default="Asia/Shanghai")
+    # uploaded -> organized | failed（整理期间不再落库 organizing 中间态：
+    # LLM 调用在事务外，没有可以承载它的短事务）
+    status: Mapped[str] = mapped_column(String(16), default="uploaded", index=True)
+    category: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    tags: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    todos: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    llm_calls: Mapped[int] = mapped_column(Integer, default=0)
+    # 记忆同步状态（服务端内部，不进 API 响应、不占 change_seq）：
+    # pending（有变更待同步）| synced（记忆 == f(note 当前态)）| failed
+    #（同步耗尽，可见可恢复）。写删记忆的唯一入口是 memory_sync job
+    # （见 app/pipeline/memory_sync.py）
+    memory_status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
+    rev: Mapped[int] = mapped_column(Integer, default=1)
+    change_seq: Mapped[int] = mapped_column(BigInteger, default=0, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class Reminder(Base):
+    __tablename__ = "reminders"
+    __table_args__ = (
+        Index("ix_reminders_user_note", "user_id", "note_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    note_id: Mapped[str | None] = mapped_column(ForeignKey("notes.id"), nullable=True)
+    title: Mapped[str] = mapped_column(String(256))
+    fire_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rrule: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    # suggested | scheduled | done | cancelled
+    status: Mapped[str] = mapped_column(String(16), default="suggested", index=True)
+    rev: Mapped[int] = mapped_column(Integer, default=1)
+    change_seq: Mapped[int] = mapped_column(BigInteger, default=0, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class Job(Base):
+    """任务队列行。kind ∈ {extract, memory_sync}（见 docs/server-invariants.md INV-2）：
+
+    - extract 携带 note_rev（入队时的笔记版本；执行时 rev 不一致即跳过=done）；
+    - memory_sync 不带 rev，按 note 当前状态收敛记忆；每个 note 至多一个
+      pending / 一个 running 的 memory_sync（部分唯一索引硬保证）。
+    """
+
+    __tablename__ = "jobs"
+    __table_args__ = (
+        Index("ix_jobs_status_run_after", "status", "run_after"),
+        Index("ix_jobs_note_id", "note_id"),
+        # 部分唯一索引（双方言）：memory_sync 的 pending / running 各自按
+        # note 去重/串行化，数据库层硬保证（INV-2.3/2.4）
+        Index(
+            "uq_jobs_memsync_pending",
+            "note_id",
+            unique=True,
+            postgresql_where=text("kind = 'memory_sync' AND status = 'pending'"),
+            sqlite_where=text("kind = 'memory_sync' AND status = 'pending'"),
+        ),
+        Index(
+            "uq_jobs_memsync_running",
+            "note_id",
+            unique=True,
+            postgresql_where=text("kind = 'memory_sync' AND status = 'running'"),
+            sqlite_where=text("kind = 'memory_sync' AND status = 'running'"),
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(32))
+    payload_json: Mapped[str] = mapped_column(Text, default="{}")
+    # pending | running | done | failed
+    status: Mapped[str] = mapped_column(String(16), default="pending")
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3)
+    run_after: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 持有租约的 worker 实例 id：收尾按 (status, locked_by, locked_at) 校验，
+    # 任务被回收换主后旧 worker 的收尾不再生效（见 jobs.queue.finalize_claim）
+    locked_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # 任务归属的笔记（两种 kind 都填）；extract 另带入队时的 rev
+    note_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    note_rev: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+# 记忆后端自身的表（若需要）由后端实现管理（生产后端在 feat/mem0-backend
+# 分支），不在这里定义。

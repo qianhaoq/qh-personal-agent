@@ -1,0 +1,9 @@
+# 运行时依赖见 requirements-app.txt（Docker 镜像只装它，不带测试工具）。
+# CI 安装本文件以同时获得 pytest-asyncio（pytest 由 CI 显式安装）。
+-r requirements-app.txt
+
+# ---- 测试依赖 ----
+pytest>=8.2
+pytest-asyncio>=0.23
+# tests/test_compose.py 解析 docker-compose.yml 验证各服务启动校验
+pyyaml>=6

@@ -1,0 +1,121 @@
+services:
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+
+  # one-shot 建表（INV-9）：PG 下 init-db 在事务内 pg_advisory_xact_lock
+  # 串行化，api/worker 等 migrate 成功退出后才启动（各自不再 create_all）
+  migrate:
+    build: .
+    env_file: .env
+    environment:
+      # INV-16（threads12 P1）：不再把 ${POSTGRES_PASSWORD} 原样拼进
+      # DATABASE_URL——密码含 @:/# 等 URI 分隔符时 SQLAlchemy 拆错组件、
+      # migrate 连不上而 api/worker 永不启动。改注入分项变量（libpq 惯例
+      # 名），由 app/config.py::postgres_url_from_env 统一 percent-encode
+      # 后拼接。
+      # DATABASE_URL 置空串压过 env_file .env 里的本地 SQLite 默认值：
+      # 空串 = 未显式配置（应用按 PG* 拼 URL；显式 URL 永远优先）。
+      DATABASE_URL: ""
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: personal
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: personal_agent
+      # init-db 只加载 DbSettings（数据库层校验，threads7 P1 / INV-9）：
+      # 建表不依赖 LLM/记忆后端/JWT 配置，沿用 .env 本地默认即可通过；
+      # api/worker 按各自 command 过完整 Settings 启动校验
+    command: python -m app.cli init-db
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # 同 migrate（INV-16，threads12）：分项 PG* 变量 + 应用侧编码拼接
+      DATABASE_URL: ""
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: personal
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: personal_agent
+      # inmemory 仅单进程开发/测试：api 是多 worker、worker 是独立进程，
+      # 各自一份内存会静默丢记忆（config 校验会拒绝 inmemory+PG）。生产
+      # 记忆后端由后续 PR（feat/mem0-backend）提供，过渡期显式关闭记忆
+      # 功能（disabled 在任何环境允许，memory_sync 平凡收敛标 synced）
+      MEMORY_BACKEND: disabled
+    # --no-access-log（INV-14，threads9）：uvicorn 默认 access log 的请求行
+    # 含完整 query（/v1/search?q=<笔记正文> 整行进 stdout/compose 日志收集）；
+    # 进程内的请求级日志由 app/middleware.py::AccessLogMiddleware 承担
+    # （只记 method/路由模板/status/耗时）
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2 --no-access-log
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # 同 migrate/api（INV-16，threads12）：分项 PG* 变量 + 应用侧编码拼接
+      DATABASE_URL: ""
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: personal
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: personal_agent
+      # 同 api：独立进程不能用进程内记忆（worker 拓扑校验拒绝 inmemory+PG），
+      # 过渡期显式 disabled，生产后端见 feat/mem0-backend
+      MEMORY_BACKEND: disabled
+    command: python -m app.jobs.worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  postgres:
+    # pgvector 镜像同时是业务库：vector 扩展当前未使用，保留该镜像是为了
+    # 与 feat/mem0-backend 落地后的数据卷/镜像形态保持一致，避免合并时
+    # 二次迁移
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: personal
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: personal_agent
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U personal -d personal_agent"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:

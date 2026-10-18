@@ -1,0 +1,5 @@
+# 域名换成自己的；备案完成前可用 IP + 自签证书内测
+{$DOMAIN:localhost} {
+	reverse_proxy api:8000
+	encode gzip
+}

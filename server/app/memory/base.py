@@ -1,0 +1,91 @@
+"""MemoryStore 抽象：全部按 user_id 隔离。
+
+记忆归属（INV-3，docs/server-invariants.md）：每条由本服务写入的记忆
+metadata 必含 note_id 与 source_rev——记忆只属于 note 的当前 rev。
+写删记忆的唯一入口是 memory_sync job（app/pipeline/memory_sync.py）。
+
+枚举完整性（threads5 P1-1，INV-3）：凡是「全量」语义的枚举（list /
+delete_by_note / delete_all）必须完整——一页取满又无法推进时抛
+MemoryEnumerationIncomplete 让 job 失败重试，绝不当成已取全/已同步
+（固定大 top_k 当全量会在超限用户身上留下删不净的记忆且 job 报成功）。
+
+生产记忆后端（mem0 + pgvector）在 feat/mem0-backend 分支（threads7 拆分，
+后续 PR）；本仓实现为 inmemory（单进程开发/测试）与 disabled（显式空后端），
+两者都必须满足 INV-3 的后端契约。
+"""
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+
+
+class MemoryEnumerationIncomplete(RuntimeError):
+    """全量枚举无法证明完整（一页取满且无游标可推进/删除未生效）。
+
+    调用方（memory_sync job）应让任务失败重试，不得视为已同步。"""
+
+
+@dataclass
+class MemoryItem:
+    id: str
+    user_id: str
+    text: str
+    note_id: str | None = None
+    source_rev: int | None = None
+    score: float = 0.0
+    created_at: str | None = None
+
+
+class MemoryStore(ABC):
+    """add 返回本次写入的全部记忆（后端一次 add 可能产生多条）；
+    delete 按 memory id 列表精确删（复查不一致时只删本次新增，修 C9）。"""
+
+    @abstractmethod
+    async def add(
+        self, user_id: str, text: str, *, note_id: str | None = None, source_rev: int | None = None
+    ) -> list[MemoryItem]: ...
+
+    @abstractmethod
+    async def search(self, user_id: str, query: str, top_k: int = 5) -> list[MemoryItem]: ...
+
+    @abstractmethod
+    async def list(self, user_id: str) -> list[MemoryItem]: ...
+
+    @abstractmethod
+    async def delete(self, user_id: str, memory_ids: list[str]) -> int: ...
+
+    @abstractmethod
+    async def delete_by_note(self, user_id: str, note_id: str) -> int: ...
+
+    @abstractmethod
+    async def delete_all(self, user_id: str) -> int: ...
+
+
+_store: MemoryStore | None = None
+
+
+def get_memory_store() -> MemoryStore:
+    global _store
+    if _store is None:
+        from app.config import get_settings
+
+        backend = get_settings().memory_backend
+        if backend == "inmemory":
+            from app.memory.inmemory import InMemoryStore
+
+            _store = InMemoryStore()
+        elif backend == "disabled":
+            from app.memory.disabled import DisabledMemoryStore
+
+            _store = DisabledMemoryStore()
+        else:
+            # config 已用 Literal 限制取值，正常到不了这里；防止未来新增后端
+            # 或绕过校验直接改配置时静默退化成错误实现
+            raise ValueError(f"未知 MEMORY_BACKEND：{backend}（只支持 inmemory | disabled；生产后端由 feat/mem0-backend 提供）")
+    return _store
+
+
+def set_memory_store(store: MemoryStore) -> None:
+    """测试/替换后端用。"""
+    global _store
+    _store = store
