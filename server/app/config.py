@@ -29,6 +29,31 @@ _HEX_DIGITS = frozenset(string.hexdigits)
 # base64url 的 -_ 换成标准 base64 的 +/ 后统一走严格的标准解码
 _URLSAFE_TO_STD = str.maketrans("-_", "+/")
 
+# 数值配置的有限上界（threads13 P2 / INV-10.7）：+inf/NaN/超大整数过了
+# 「必须为正」这一关，却让下游 timedelta(...)/httpx.Timeout/循环在运行期
+# OverflowError 或失真——如 ACCESS_TOKEN_TTL_SECONDS=10**30 让每次 login
+# 在 `now + timedelta(...)` 处 OverflowError、超大 JOB_LOCK_TIMEOUT_SECONDS
+# 让死任务几乎不被回收。上界按各字段下游计算的合理量级设定（列全字段，
+# 新增数值配置必须同步本表与 _require_positive_numeric_settings）。
+_NUMERIC_UPPER_BOUNDS = {
+    # timedelta(seconds=) + datetime exp：access 短期凭证，30 天封顶
+    "ACCESS_TOKEN_TTL_SECONDS": 30 * 86400,
+    # timedelta(days=)：refresh 可长，10 年封顶（datetime.max 溢出界约 7973 年，留足余量）
+    "REFRESH_TOKEN_TTL_DAYS": 3650,
+    # httpx.Timeout：单次 LLM 调用 1 小时封顶（更大只会占死 worker 循环）
+    "LLM_TIMEOUT_SECONDS": 3600.0,
+    # 每次失败都全额退避重试，50 次封顶
+    "JOB_MAX_ATTEMPTS": 50,
+    # running 回收窗口：1 天封顶（更大的窗口=死任务一天不被回收）
+    "JOB_LOCK_TIMEOUT_SECONDS": 86400,
+    # 轮询睡眠间隔：1 小时封顶（更大=worker 近乎停摆）
+    "WORKER_POLL_INTERVAL_SECONDS": 3600.0,
+    # 单轮批量：1000 封顶（更大长时间占住循环）
+    "WORKER_BATCH_SIZE": 1000,
+    # /v1/ask 检索条数：100 封顶（更大无意义且拖慢问答）
+    "ASK_TOP_K": 100,
+}
+
 
 def _decode_secret(secret: str) -> bytes | None:
     """把 JWT_SECRET 解码成它编码的随机字节；不是合法编码返回 None。
@@ -257,8 +282,11 @@ class Settings(BaseSettings):
         """INV-10.7（threads8 P2，config.py:99）：数值配置必须为正。0/负值
         会让相应循环或调用静默失效（WORKER_BATCH_SIZE=0 时 worker 日志一切
         正常但循环体永不执行、任何笔记都不被整理）——启动时一次性列出
-        **全部**非正字段。新增数值型配置必须加进下表并同步 .env.example
-        （docs/server-invariants.md 自查清单第 15 条）。"""
+        **全部**非正字段。threads13 P2 补有限上界：+inf/超大整数过了「为正」
+        这关，却让下游 timedelta/httpx.Timeout/循环在运行期 OverflowError
+        （如 ACCESS_TOKEN_TTL_SECONDS 过大让 login 的 `now + timedelta(...)`
+        抛 OverflowError）。新增数值型配置必须加进下表与 _NUMERIC_UPPER_BOUNDS
+        并同步 .env.example（docs/server-invariants.md 自查清单第 15 条）。"""
         checks = {
             "ACCESS_TOKEN_TTL_SECONDS": self.access_token_ttl_seconds,
             "REFRESH_TOKEN_TTL_DAYS": self.refresh_token_ttl_days,
@@ -275,6 +303,22 @@ class Settings(BaseSettings):
             raise ValueError(
                 "数值配置必须为正（0/负值会让相应循环或调用静默失效）："
                 + "、".join(f"{NAME}={value!r}" for NAME, value in bad.items())
+            )
+        # 上界判定同时拦下 +inf（inf > 任何有限上界）；NaN 已被上一条拦住
+        oversized = {
+            name: value
+            for name, value in checks.items()
+            if value > _NUMERIC_UPPER_BOUNDS[name]
+        }
+        if oversized:
+            raise ValueError(
+                "数值配置超出有限上界（+inf/超大整数会让下游 timedelta/"
+                "httpx.Timeout/循环在运行期 OverflowError 或失真，如 login "
+                "的 now+timedelta）："
+                + "、".join(
+                    f"{name}={value!r}（上界 {_NUMERIC_UPPER_BOUNDS[name]!r}）"
+                    for name, value in oversized.items()
+                )
             )
         return self
 

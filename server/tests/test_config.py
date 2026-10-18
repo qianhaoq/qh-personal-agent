@@ -673,3 +673,93 @@ def test_mock_provider_skips_base_url_shape_check():
     默认值必须照常通过，否则本地开发起不来）。"""
     settings = Settings(database_url="sqlite+aiosqlite:///./app.sqlite3", llm_provider="mock")
     assert settings.llm_base_url == ""
+
+
+# ---------------------------------------------------------------------------
+# threads13 P2（config.py:248）/ INV-10.7：数值配置的有限上界——+inf/超大
+# 整数过了「必须为正」这一关，却让下游 timedelta/httpx.Timeout 在运行期
+# OverflowError（如 ACCESS_TOKEN_TTL_SECONDS 过大时每次 login 的
+# now + timedelta(...) 抛 OverflowError）。
+# ---------------------------------------------------------------------------
+
+
+def test_oversized_numeric_settings_rejected():
+    """过大 TTL/超时/批量启动即拒（连字段名与上界一起报出），
+    不再等到 login 的 timedelta 处 OverflowError。"""
+    from datetime import timedelta
+
+    with pytest.raises(ValidationError, match="有限上界") as exc_info:
+        Settings(
+            database_url="sqlite+aiosqlite:///./app.sqlite3",
+            access_token_ttl_seconds=10**30,
+            refresh_token_ttl_days=10**20,
+        )
+    msg = str(exc_info.value)
+    assert "ACCESS_TOKEN_TTL_SECONDS" in msg and "REFRESH_TOKEN_TTL_DAYS" in msg, msg
+
+    # 这些值确实是下游 timedelta 的 OverflowError 来源（上界把它们挡在启动期）
+    with pytest.raises(OverflowError):
+        timedelta(seconds=10**30)
+    with pytest.raises(OverflowError):
+        timedelta(days=10**20)
+
+    for field, value in (
+        ("access_token_ttl_seconds", 30 * 86400 + 1),
+        ("refresh_token_ttl_days", 3651),
+        ("llm_timeout_seconds", float("inf")),  # +inf > 任何有限上界
+        ("llm_timeout_seconds", 3601.0),
+        ("job_max_attempts", 10**9),
+        ("job_lock_timeout_seconds", 86401),
+        ("worker_poll_interval_seconds", 10**18),
+        ("worker_batch_size", 10**15),
+        ("ask_top_k", 101),
+    ):
+        with pytest.raises(ValidationError, match="有限上界"):
+            Settings(database_url="sqlite+aiosqlite:///./app.sqlite3", **{field: value})
+
+
+def test_numeric_settings_at_upper_bounds_ok():
+    """恰好等于上界的值放行（上界本身是合法配置，不是被拒值）。"""
+    from datetime import timedelta
+
+    from app.config import _NUMERIC_UPPER_BOUNDS
+
+    kwargs = {
+        "access_token_ttl_seconds": _NUMERIC_UPPER_BOUNDS["ACCESS_TOKEN_TTL_SECONDS"],
+        "refresh_token_ttl_days": _NUMERIC_UPPER_BOUNDS["REFRESH_TOKEN_TTL_DAYS"],
+        "llm_timeout_seconds": _NUMERIC_UPPER_BOUNDS["LLM_TIMEOUT_SECONDS"],
+        "job_max_attempts": _NUMERIC_UPPER_BOUNDS["JOB_MAX_ATTEMPTS"],
+        "job_lock_timeout_seconds": _NUMERIC_UPPER_BOUNDS["JOB_LOCK_TIMEOUT_SECONDS"],
+        "worker_poll_interval_seconds": _NUMERIC_UPPER_BOUNDS["WORKER_POLL_INTERVAL_SECONDS"],
+        "worker_batch_size": _NUMERIC_UPPER_BOUNDS["WORKER_BATCH_SIZE"],
+        "ask_top_k": _NUMERIC_UPPER_BOUNDS["ASK_TOP_K"],
+    }
+    settings = Settings(database_url="sqlite+aiosqlite:///./app.sqlite3", **kwargs)
+    for name, value in kwargs.items():
+        assert getattr(settings, name) == value
+    # TTL 上界值本身都能安全构造 timedelta（下游 login/refresh 的算法）
+    timedelta(
+        seconds=kwargs["access_token_ttl_seconds"], days=kwargs["refresh_token_ttl_days"]
+    )
+
+
+def test_numeric_upper_bounds_table_covers_all_checked_fields():
+    """上界表与「必须为正」清单的字段集合必须一致——新增数值配置漏掉
+    上界表时在这里掉出来（自查清单第 15 条的机械保障）。"""
+    from app.config import _NUMERIC_UPPER_BOUNDS
+
+    settings = Settings(database_url="sqlite+aiosqlite:///./app.sqlite3")
+    checked = {
+        "ACCESS_TOKEN_TTL_SECONDS": settings.access_token_ttl_seconds,
+        "REFRESH_TOKEN_TTL_DAYS": settings.refresh_token_ttl_days,
+        "LLM_TIMEOUT_SECONDS": settings.llm_timeout_seconds,
+        "JOB_MAX_ATTEMPTS": settings.job_max_attempts,
+        "JOB_LOCK_TIMEOUT_SECONDS": settings.job_lock_timeout_seconds,
+        "WORKER_POLL_INTERVAL_SECONDS": settings.worker_poll_interval_seconds,
+        "WORKER_BATCH_SIZE": settings.worker_batch_size,
+        "ASK_TOP_K": settings.ask_top_k,
+    }
+    assert set(_NUMERIC_UPPER_BOUNDS) == set(checked), "两张表必须覆盖同一组字段"
+    # 上界必须有限且为正（float("inf") 当上界等于没设）
+    for name, bound in _NUMERIC_UPPER_BOUNDS.items():
+        assert 0 < bound < float("inf"), name
