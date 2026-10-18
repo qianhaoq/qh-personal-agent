@@ -44,7 +44,7 @@
 - **INV-6 租约收尾**：收尾带租约条件（`status='running' AND locked_by AND locked_at`）；丢租约的 worker 只删自己写的 memory id 并补偿再入队 memory_sync，**不得静默 return**（INV-5 第 3 步）。
 - **INV-7 输入/出站硬化**：外部输入含 `\x00` 一律 422；病态输入（surrogate、超深 JSON、超大整数、越界时间）一律 4xx 不 500；时间（含 LLM 输出的 fire_at）统一用 `utc_safe_datetime` 的 ±14h 安全界；MockLLM 解析的时钟时分秒必须落在时 0–23 / 分秒 0–59，越界不出提醒、不上抛；asr 体积按 **UTF-8 字节**量测（数码点会让 CJK 骗过 4KiB 界）；LLM 产出字符串（extract 字段与 /v1/ask 的 answer）统一过 `app/schemas.py::clean_llm_str`（剥 NUL/C0/DEL/lone surrogate），MockLLM 完整保留已校验 timezone（UTC / 多段 IANA 名，不用窄 regex），**时区/当前时间只从 system prompt 解析**（笔记正文里的伪造元数据是数据不是指令）。
 - **INV-8 登录/refresh**：device 单条原子 upsert；refresh token 存 `refresh_tokens` 表、每设备 ≤5 枚；轮换只作废被轮换的那一枚，重放已作废的 token 才吊销整台设备；logout 删 token 前必须先 `_lock_device`（device → refresh_tokens 锁序，DELETE 才能看到并发登录未提交的新行）；**凭证代际 fence**——`credential_generation` 只在吊销与真复活时 +1，access `gen` claim 与 refresh 行绑定签发时的代，`get_auth`/refresh 代不一致一律普通 401（旧凭证不随复活复活、不连环吊销新会话）。
-- **INV-10 配置校验**：启动即校验，缺配置直接报错；数值配置（TTL/超时/批量/重试/上限）必须为正；生产（postgresql）不得隐式退化到 mock，`MEMORY_BACKEND ∈ {inmemory, disabled}`，生产后端 mem0 随 feat/mem0-backend（#6）落地。
+- **INV-10 配置校验**：启动即校验，缺配置直接报错；`LLM_BASE_URL` 必须是绝对 http/https URL（裸主机名/空白/非 http(s) scheme 启动即拒）；数值配置（TTL/超时/批量/重试/上限）必须为正；生产（postgresql）不得隐式退化到 mock，`MEMORY_BACKEND ∈ {inmemory, disabled}`，生产后端 mem0 随 feat/mem0-backend（#6）落地。
 - **INV-11 乐观锁 / rev**：rev 比较在任何提前返回之前、在锁或条件更新里原子完成；内容不变的快路径也要先校验 rev，过期 rev 一律 409。
 - **INV-12 0 行归因**：条件 UPDATE/DELETE 匹配 0 行后必须重读当前状态再定原因（或在注释里写因果封闭论证），不得猜成重放 / 冲突 / 已删除。
 - **INV-13 锁内重算**：等锁之前算好的派生值（now、状态、计数、rev、expires_at）不得在拿到锁之后沿用；锁内重取、条件 UPDATE 对行当前值原子判定、或版本栅栏守护；条件更新/claim **成功之后**仍须用成功时刻的 now 复验过期（rowcount=1 不代表谓词里的旧时间参数仍成立）；签发类时间戳（凭证 iat/exp、租约 locked_at）取写入时刻而非请求/循环起点（全仓锁点表见文档）。

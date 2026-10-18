@@ -627,3 +627,49 @@ def test_settings_builds_pg_url_from_pg_env_vars(monkeypatch):
         llm_model="test-model",
     )
     assert make_url(settings.database_url).password == fake_password
+
+
+# ---------------------------------------------------------------------------
+# threads13 P2（config.py:188）/ INV-10.1：LLM_BASE_URL 必须是绝对的
+# http/https URL——非空但畸形的值此前能过「三元组齐备」检查，/healthz
+# 照常报 provider，而每次 extract/ask 都在 httpx 构造请求时才失败。
+# ---------------------------------------------------------------------------
+
+
+def test_openai_malformed_base_url_rejected():
+    """裸主机名、空白、无 scheme、非 http(s) scheme：任何环境启动即拒。"""
+    for bad in (
+        "llm.internal",  # 裸主机名（无 scheme，会被当相对路径）
+        " https://llm.example.com/v1",  # 前导空白
+        "https://llm.example.com/v1 ",  # 尾随空白
+        "https://llm .example.com/v1",  # 内嵌空白
+        "ftp://llm.example.com/v1",  # 非 http(s) scheme
+        "//llm.example.com/v1",  # 协议相对
+        "https://",  # 空 netloc
+        "/v1/api",  # 相对路径
+    ):
+        kwargs = dict(_OPENAI_COMPLETE, llm_base_url=bad)
+        with pytest.raises(ValidationError, match="LLM_BASE_URL"):
+            Settings(database_url="sqlite+aiosqlite:///./app.sqlite3", **kwargs)
+        with pytest.raises(ValidationError, match="LLM_BASE_URL"):
+            _pg_settings(**kwargs)
+
+
+def test_openai_absolute_http_base_url_ok():
+    for ok in (
+        "https://llm.example.com/v1",
+        "http://localhost:8000/v1",
+        "HTTPS://LLM.EXAMPLE.COM",  # urlsplit 规范化 scheme 大小写
+    ):
+        settings = Settings(
+            database_url="sqlite+aiosqlite:///./app.sqlite3",
+            **dict(_OPENAI_COMPLETE, llm_base_url=ok),
+        )
+        assert settings.llm_base_url == ok
+
+
+def test_mock_provider_skips_base_url_shape_check():
+    """LLM_PROVIDER=mock 时 base_url 不参与任何调用，形态不校验（空串
+    默认值必须照常通过，否则本地开发起不来）。"""
+    settings = Settings(database_url="sqlite+aiosqlite:///./app.sqlite3", llm_provider="mock")
+    assert settings.llm_base_url == ""

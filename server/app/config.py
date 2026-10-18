@@ -6,7 +6,7 @@ import string
 from collections.abc import Mapping
 from functools import lru_cache
 from typing import Literal
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import ValidationError, model_validator
@@ -190,6 +190,31 @@ class Settings(BaseSettings):
         if missing:
             raise ValueError(
                 "LLM_PROVIDER=openai 必须同时设置 " + "、".join(missing) + "（缺任一项启动即失败，不会静默回落）"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _require_absolute_http_llm_base_url(self) -> "Settings":
+        """threads13 P2（config.py:188）/ INV-10.1：LLM_PROVIDER=openai 时
+        LLM_BASE_URL 必须是**绝对的 http/https URL**。此前「三元组齐备」
+        只查非空——裸主机名（llm.internal）、含空白的值、ftp:// 这类非
+        http(s) scheme 都能过启动校验，/healthz 照常报 provider，而每次
+        extract/ask 都在 httpx 构造请求时才失败（确定性部署错误耗尽全部
+        抽取任务才暴露）。任何环境生效；错误文案不含配置原值（INV-14）。"""
+        if self.llm_provider != "openai":
+            return self
+        raw = self.llm_base_url
+        url = urlsplit(raw)
+        if (
+            any(ch.isspace() for ch in raw)
+            or url.scheme not in ("http", "https")
+            or not url.netloc
+        ):
+            raise ValueError(
+                "LLM_BASE_URL 必须是绝对的 http/https URL（如 "
+                "https://llm.example.com/v1）：当前值是裸主机名/相对路径、"
+                "含空白字符，或 scheme 不是 http(s)——这类值要到运行期 "
+                "httpx 构造请求时才失败，不会在启动时报出来"
             )
         return self
 
