@@ -64,8 +64,9 @@ jobs:
       (github.event_name != 'pull_request_review' ||
       github.event.review.state == 'approved' ||
       github.event.review.user.login == 'copilot-pull-request-reviewer[bot]')
-    uses: qianhaoq/devflow-gates/.github/workflows/auto-merge.yml@3853cc9dedbf1ffd8b10def841ed4c822dae7906  # devflow-gates main @ 3853cc9 (pinned; bump deliberately)
+    uses: qianhaoq/devflow-gates/.github/workflows/auto-merge.yml@88a9af464d5bcb9620231cf3be952b119c17b0e3  # devflow-gates main @ 88a9af4 (pinned; bump deliberately)
     with:
+      runs_on: '["self-hosted", "linux", "x64"]'
       # Exact check-run names = "<caller job name> / <called job name>"
       # from YOUR ci.yml / codex-gate.yml / qa-gate.yml callers. "ci / Secret Scan"
       # is required so a red gitleaks run can never be auto-merged.

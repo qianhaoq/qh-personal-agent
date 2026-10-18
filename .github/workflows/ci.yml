@@ -28,9 +28,10 @@ jobs:
     # Caller-level skip: the skipped check is named after this job, never
     # the required "ci / Build & Test" (whose last result stays in force).
     if: github.event.action != 'edited' || github.event.changes.base != null
-    uses: qianhaoq/devflow-gates/.github/workflows/ci.yml@3853cc9dedbf1ffd8b10def841ed4c822dae7906  # devflow-gates main @ 3853cc9 (pinned; bump deliberately)
+    uses: qianhaoq/devflow-gates/.github/workflows/ci.yml@88a9af464d5bcb9620231cf3be952b119c17b0e3  # devflow-gates main @ 88a9af4 (pinned; bump deliberately)
     with:
-      python_version: '3.12'
+      runs_on: '["self-hosted", "linux", "x64"]'
+      python_version: ''  # self-hosted Debian: skip setup-python; python3.12 on PATH via uv
       setup_command: ''
       test_command: 'bash scripts/ci-test.sh'
       working_directory: '.'
@@ -57,7 +58,7 @@ jobs:
     # the required "ci / Build & Test" (whose last result stays in force).
     if: github.event.action != 'edited' || github.event.changes.base != null
     name: PG Tests (detect)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 5
     permissions:
       contents: read
@@ -83,7 +84,7 @@ jobs:
     name: PG Tests (PostgreSQL 16, non-required)
     needs: pg-detect
     if: needs.pg-detect.outputs.run == 'true'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 10
     permissions:
       contents: read
