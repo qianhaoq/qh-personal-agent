@@ -49,7 +49,7 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt
 cp .env.example .env          # 默认即 mock + sqlite + inmemory，可直接用
 .venv/bin/python -m app.cli create-invite --uses 5   # 创建邀请码
-.venv/bin/uvicorn app.main:app --reload              # api
+.venv/bin/uvicorn app.main:app --reload --no-access-log   # api（--no-access-log：请求行含完整 query，INV-14）
 .venv/bin/python -m app.jobs.worker                  # 整理 worker（另开一个终端）
 ```
 

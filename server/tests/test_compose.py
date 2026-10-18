@@ -167,6 +167,26 @@ def test_uvicorn_commands_disable_access_log():
         assert "--no-access-log" in line, f"Dockerfile CMD 缺 --no-access-log：{line}"
 
 
+def test_readme_documented_uvicorn_command_disables_access_log():
+    """threads10 P1（README.md:52）/ INV-14：文档里的启动示例与部署清单
+    同口径——照 README 起步的本地开发会把 `GET /v1/search?q=<笔记正文>`
+    整行打进终端/开发日志。解析 README 全部 fenced code block，每条含
+    uvicorn 的命令行都必须带 --no-access-log。"""
+    readme = SERVER_DIR / "README.md"
+    uvicorn_lines: list[str] = []
+    in_block = False
+    for line in readme.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_block = not in_block
+            continue
+        if in_block and "uvicorn" in line:
+            uvicorn_lines.append(line)
+    assert uvicorn_lines, "README 必须至少记载一条 uvicorn 启动命令（本地开发）"
+    for line in uvicorn_lines:
+        assert "--no-access-log" in line, f"README 文档示例的 uvicorn 命令缺 --no-access-log：{line}"
+
+
 def test_dockerignore_excludes_secrets_and_local_data():
     """threads9 P1（docker-compose.yml:21）/ INV-14：compose 三个服务都
     build: .，无 .dockerignore 时 server/.env（JWT/LLM/PG 密钥）与本地
