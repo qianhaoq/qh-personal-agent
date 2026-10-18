@@ -108,12 +108,23 @@ def _parse_llm_json(raw: str) -> dict:
     return data
 
 
+def _as_list(value) -> list:
+    """集合字段收口（INV-7，threads13 P2 / extract.py:138）：OpenAI 兼容
+    供应商按 strict=False 调用，schema-violating 但合法 JSON 的结果
+    （{"tags": 1, "todos": "…"}）能到达 _coerce_extraction——对非 list
+    迭代直接 TypeError，确定性重试耗尽把本来有效的笔记标 failed。非
+    list 的集合字段整字段视为缺失（丢弃不上抛）；有意用 isinstance(x, list)
+    而不是「可迭代」判定：dict/str 可迭代，但迭代出的键/字符不是本仓
+    期望的元素形态。"""
+    return value if isinstance(value, list) else []
+
+
 def _coerce_extraction(data: dict) -> dict:
     """字段兜底与类型收口。每个字符串都过 clean_llm_str（INV-7，公共实现见 app/schemas.py）；剥完
     为空的 tags/todos/提醒标题整条丢弃。fire_at 不在这里清：_parse_fire_at
     的 fromisoformat + utc_safe_datetime 天然拒绝含控制字符的值。"""
     todos = []
-    for t in data.get("todos") or []:
+    for t in _as_list(data.get("todos")):
         if not isinstance(t, dict):
             continue
         text = clean_llm_str(t.get("text"), 200)
@@ -125,7 +136,7 @@ def _coerce_extraction(data: dict) -> dict:
             todo["due"] = due
         todos.append(todo)
     reminders = []
-    for r in data.get("suggested_reminders") or []:
+    for r in _as_list(data.get("suggested_reminders")):
         if not isinstance(r, dict):
             continue
         title = clean_llm_str(r.get("title"), 200)
@@ -134,7 +145,7 @@ def _coerce_extraction(data: dict) -> dict:
     return {
         "title": clean_llm_str(data.get("title"), 100),
         "tags": [
-            t for t in (clean_llm_str(tag, 32) for tag in data.get("tags") or []) if t
+            t for t in (clean_llm_str(tag, 32) for tag in _as_list(data.get("tags"))) if t
         ][:8],
         "todos": todos[:20],
         "suggested_reminders": reminders[:10],
