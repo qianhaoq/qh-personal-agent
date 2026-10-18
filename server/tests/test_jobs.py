@@ -128,6 +128,66 @@ async def test_expired_running_job_last_allowed_attempt_still_executes(client, u
     assert note.status == "organized"
 
 
+async def test_claim_lease_issued_at_update_moment_not_loop_start(client, user, monkeypatch):
+    """threads10 / INV-13（queue.py 租约签发时刻）：locked_at 是**租约签发
+    时间**，必须取置 running 语句写入时刻的 utcnow()，而不是 claim_next
+    循环开头的 now——PG SELECT … FOR UPDATE 在 job 行锁上等待的时间会
+    等量缩短租约（等待越久越早被回收、活 worker 越早被误判失灵）。
+    钩子注入等锁窗口（置 running / 换主续租前推进可控时钟），断言
+    locked_at=推进后时刻而非循环起点；回收（_reclaim_running）与首次
+    领取（_mark_running）是同一断言面。"""
+    from datetime import UTC, datetime
+
+    from app.jobs import queue as queue_mod
+    from app.timeutil import as_utc
+
+    _note_id, job_id = await _create_note_with_job(client, user)
+
+    # 循环起点放在真实入队时刻之后：run_after<=now 成立，job 可领
+    loop_start = datetime.now(UTC) + timedelta(minutes=1)
+    after_wait = loop_start + timedelta(seconds=30)
+    clock = {"now": loop_start}
+    monkeypatch.setattr(queue_mod, "utcnow", lambda: clock["now"])
+
+    real_mark_running = queue_mod._mark_running
+
+    async def mark_running_after_lock_wait(session, jid, worker_id):
+        clock["now"] = after_wait  # FOR UPDATE 等锁窗口消耗 30s
+        return await real_mark_running(session, jid, worker_id)
+
+    monkeypatch.setattr(queue_mod, "_mark_running", mark_running_after_lock_wait)
+
+    async with (
+        get_sessionmaker()() as session,
+        session.begin(),
+        claim_next(session, worker_id="wkr_lease") as job,
+    ):
+        assert job is not None
+        assert job.id == job_id, "run_after 最早的是刚创建的 extract 任务"
+        assert as_utc(job.locked_at) == after_wait, "租约签发时刻=写入时刻，不被等锁时间缩短"
+
+    # 回收路径（换主续租）同一断言面：锁过期后再次领取
+    await _expire_lock(job_id)
+    monkeypatch.setattr(queue_mod, "_mark_running", real_mark_running)
+    after_reclaim_wait = after_wait + timedelta(minutes=2)
+    real_reclaim = queue_mod._reclaim_running
+
+    async def reclaim_after_lock_wait(session, jid, cutoff, worker_id):
+        clock["now"] = after_reclaim_wait
+        return await real_reclaim(session, jid, cutoff, worker_id)
+
+    monkeypatch.setattr(queue_mod, "_reclaim_running", reclaim_after_lock_wait)
+
+    async with (
+        get_sessionmaker()() as session,
+        session.begin(),
+        claim_next(session, worker_id="wkr_lease2") as job,
+    ):
+        assert job is not None
+        assert job.id == job_id
+        assert as_utc(job.locked_at) == after_reclaim_wait, "换主续租的签发时刻同样是写入时刻"
+
+
 # ---------------------------------------------------------------------------
 # INV-6：租约换主后旧 worker 的收尾不生效（extract / memory_sync 两种 kind）
 # ---------------------------------------------------------------------------

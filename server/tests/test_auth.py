@@ -646,6 +646,59 @@ async def test_invite_expires_while_loser_waiting_claim_403(client, monkeypatch)
     assert loser_device is None, "输方不得凭已过期邀请登录：无设备行、无凭证"
 
 
+async def test_invite_claim_revalidates_expiry_after_claim_success_403(client, monkeypatch):
+    """threads10 P1 / INV-13（auth.py:211）：claim 成功（rowcount==1）之后
+    仍须用成功时刻的 now 复验过期。PG READ COMMITTED 下这条条件 UPDATE
+    在 invite 行锁上等待别的事务时，锁释放后用**等待前绑定**的 now 参数
+    重评谓词——这里用「时钟已推过 expires_at、但执行真实抢占仍传等锁前
+    的旧 now」等价复现该窗口：旧代码只信 rowcount 直接建号；修复后抢占
+    成功 → 锁内重读 expires_at + 重取 utcnow() 复验 → 过期则回滚本次
+    claim（owner/used 撤销）并 403，不签发任何凭证。行值谓词（owner/
+    used）无此问题，本测试锁定的是墙钟参数的陈旧面。"""
+    from datetime import UTC, datetime, timedelta
+
+    from app.api import auth as auth_api
+    from app.db import get_sessionmaker
+    from app.models import Device, InviteCode, User
+
+    t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    expires = t0 + timedelta(seconds=5)
+    clock = {"now": t0}
+    monkeypatch.setattr(auth_api, "utcnow", lambda: clock["now"])
+
+    code = "inv_claim_revalidate_expiry"
+    async with get_sessionmaker()() as session:
+        session.add(
+            InviteCode(code=code, owner_user_id=None, used=0, max_uses=10, expires_at=expires)
+        )
+        await session.commit()
+
+    real_claim = auth_api._claim_invite_first_use
+
+    async def claim_with_stale_predicate_now(session, invite_code, user_id, now):
+        # 等锁消耗了时间：真实世界时钟（成功后的 utcnow() 读到的）已跨过
+        # expires_at；UPDATE 谓词仍用等待前绑定的旧 now 重评（PG 行为）
+        clock["now"] = expires + timedelta(seconds=1)
+        return await real_claim(session, invite_code, user_id, now)
+
+    monkeypatch.setattr(auth_api, "_claim_invite_first_use", claim_with_stale_predicate_now)
+
+    resp = await client.post(
+        "/v1/auth/login", json={"invite_code": code, "device_id": "dev_claim_revalidate"}
+    )
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["error"]["code"] == "invalid_invite"
+
+    async with get_sessionmaker()() as session:
+        invite = await session.get(InviteCode, code)
+        users = (await session.execute(select(User))).scalars().all()
+        device = await session.get(Device, "dev_claim_revalidate")
+    assert invite.owner_user_id is None, "过期判定回滚本次 claim：owner 复位"
+    assert invite.used == 0, "过期判定回滚本次 claim：used 复位"
+    assert users == [], "不得创建账号"
+    assert device is None, "不签发凭证：无设备行"
+
+
 async def test_login_mints_tokens_after_device_row_lock(client, invite_code, monkeypatch):
     """threads9 P1 / INV-13（auth.py:248）：_token_pair 必须在 device
     upsert 落定之后调用——upsert 的行/PK 锁是 login 最长的等待窗口

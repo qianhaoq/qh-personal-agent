@@ -201,7 +201,15 @@ async def _claim_invite_first_use(
 ) -> bool:
     """首用抢占（原 login 内联）：条件 UPDATE 把 owner_user_id 从 NULL 置为
     本事务用户 id、used+1，WHERE 同时原子判定未用尽与未过期。rowcount!=0
-    即抢占成功（调用方创建账号）；0 行 → 调用方走 _resolve_lost_invite。"""
+    即抢占成功（调用方创建账号）；0 行 → 调用方走 _resolve_lost_invite。
+
+    INV-13（threads10 P1，auth.py:211）：`expires_at > :now` 是**语句参数**，
+    PG READ COMMITTED 下这条 UPDATE 在 invite 行锁上等待别的事务时，锁
+    释放后用等待前绑定的 now 重评谓词——等待期间跨过 expires_at 的码仍
+    rowcount=1 抢占成功，绕过输方归因直接创建账号。行值谓词（owner/used）
+    由 UPDATE 对行当前值原子判定，无此问题；只有墙钟绑定参数会陈旧。
+    故抢占成功后（仍持行锁）标量列重读 expires_at、重取 utcnow() 复验；
+    已过期 → 回滚本次 claim（owner/used 撤销）并按过期 403，不签发凭证。"""
     claimed = await session.execute(
         update(InviteCode)
         .where(
@@ -213,7 +221,19 @@ async def _claim_invite_first_use(
         .values(owner_user_id=user_id, used=InviteCode.used + 1)
         .execution_options(synchronize_session=False)
     )
-    return claimed.rowcount != 0
+    if claimed.rowcount == 0:
+        return False
+    # 成功后复验：谓词里的 now 是等锁前绑定的，rowcount=1 不代表仍未过期
+    # （标量列重读绕过 identity map，INV-12；不 rollback 的重读必须如此）
+    expires_at = (
+        await session.execute(
+            select(InviteCode.expires_at).where(InviteCode.code == invite_code)
+        )
+    ).scalar()
+    if expires_at is not None and as_utc(expires_at) <= utcnow():
+        await session.rollback()
+        raise ApiError(403, "invalid_invite", "邀请码不存在或已过期")
+    return True
 
 
 async def _resolve_lost_invite(session: AsyncSession, invite_code: str) -> str:
