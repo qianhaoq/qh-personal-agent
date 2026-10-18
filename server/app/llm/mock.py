@@ -10,7 +10,9 @@ from __future__ import annotations
 import json
 import re
 from datetime import UTC, datetime, timedelta
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from app.schemas import utc_safe_datetime
 
 DEFAULT_TZ = "Asia/Shanghai"
 
@@ -41,10 +43,26 @@ _RE_DAY = re.compile(r"(今天|明天|后天|大后天)")
 _FUTURE_DAY_WORDS = {"明天", "后天", "大后天"}
 
 
+# 十进制数量的位数上界（INV-7，threads9 P2 / mock.py:49）：CPython 的
+# int(str) 对约 4300 位以上的十进制串直接 ValueError——一条合法的 5000
+# 字符笔记含「(4900+ 位数字)分钟后」会在 _safe_relative 之前就炸。6 位
+# （999999 分钟 ≈ 1.9 年）以内照常解析；更大的数量本就荒谬，返回 None
+# （该短语不出提醒）。有意不用正则 [0-9]{1,6} 限位：超长数字串的末 6 位
+# 仍会匹配「分钟后」前的窗口，把 5000 位数错当 999999 分钟
+_MAX_DIGITS = 6
+
+
 def _cn_to_int(s: str) -> int | None:
     s = s.strip()
     if s.isdigit():
-        return int(s)
+        if len(s) > _MAX_DIGITS:
+            return None
+        try:
+            return int(s)
+        except (ValueError, OverflowError):
+            # 防御：位数已限，理论上不可达；解析失败按「无时间」处理，
+            # 不把异常抛上去让确定性重试耗尽、把有效笔记标 failed
+            return None
     if s in _CN_DIGITS:
         return _CN_DIGITS[s]
     # 十几 / 二十几 等两位组合
@@ -58,6 +76,19 @@ def _cn_to_int(s: str) -> int | None:
 
 def _day_offset(word: str) -> int:
     return {"今天": 0, "明天": 1, "后天": 2, "大后天": 3}.get(word, 0)
+
+
+def _safe_relative(base: datetime, **delta: float) -> datetime | None:
+    """相对时间的安全构造（threads8 P2 / INV-7）：巨大数量（如
+    「999999999999999999分钟后」「10000000天后」）会让 timedelta 构造或
+    datetime 加法抛 OverflowError，或把结果推出 utc_safe_datetime 的
+    ±14h 安全线——都视为「这条文本解析不出时间」，返回 None（不出提醒），
+    而不是把异常抛上去让确定性重试耗尽、把有效笔记标 failed。"""
+    try:
+        dt = base + timedelta(**delta)
+    except (OverflowError, ValueError, OSError):
+        return None
+    return utc_safe_datetime(dt)
 
 
 def parse_datetime(text: str, now: datetime, tzname: str = DEFAULT_TZ) -> datetime | None:
@@ -75,17 +106,17 @@ def parse_datetime(text: str, now: datetime, tzname: str = DEFAULT_TZ) -> dateti
     if m:
         n = _cn_to_int(m.group(1))
         if n is not None:
-            return base + timedelta(minutes=n)
+            return _safe_relative(base, minutes=n)
     m = _RE_IN_HOURS.search(text)
     if m:
         n = _cn_to_int(m.group(1))
         if n is not None:
-            return base + timedelta(hours=n)
+            return _safe_relative(base, hours=n)
     m = _RE_IN_DAYS.search(text)
     if m:
         n = _cn_to_int(m.group(1))
         if n is not None:
-            return base + timedelta(days=n)
+            return _safe_relative(base, days=n)
 
     day_m = _RE_DAY.search(text)
     clock_m = _RE_CLOCK.search(text)
@@ -104,7 +135,11 @@ def parse_datetime(text: str, now: datetime, tzname: str = DEFAULT_TZ) -> dateti
             period == "中午" and hour < 11
         ):
             hour += 12
-        hour = min(hour, 23)
+        # INV-7（threads11 P2，mock.py:139）：时分越界（“99 点”“3 点 99 分”）
+        # 不钳位也不上抛——min(hour, 23) 会把“99 点”变成错误的 23:00 提醒，
+        # ValueError 会 500。视为没解析出时间，返回 None（无提醒）。
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            return None
         dt = base.replace(hour=hour, minute=minute, second=0, microsecond=0) + timedelta(days=day_off)
         return resolve(dt) if day_off == 0 else dt
 
@@ -176,15 +211,32 @@ class MockLLM:
             m = re.search(r"<note>(.*?)</note>", content, re.DOTALL)
             if m:
                 note_text = m.group(1).strip()
+            # INV-7（threads13 P2，mock.py:210）：时区/当前时间**只从
+            # system prompt 解析**——user 消息里的笔记原文是数据不是指令，
+            # 含「时区：UTC」「当前时间：2099-…」时若继续扫下去，伪造的
+            # 元数据会覆盖请求链路已校验的 timezone 与 recorded_at 参照，
+            # 相对提醒排到错误的时刻
+            if msg.get("role") != "system":
+                continue
             m = re.search(r"当前时间[:：]\s*([0-9T:+\-.Zz]+)", content)
             if m:
                 try:
                     now = datetime.fromisoformat(m.group(1))
                 except ValueError:
                     pass
-            m = re.search(r"时区[:：]\s*([A-Za-z_]+/[A-Za-z_+\-0-9]+)", content)
+            m = re.search(r"时区[:：]\s*([A-Za-z0-9_+\-/]+)", content)
             if m:
-                tzname = m.group(1)
+                # INV-7（threads12 P2，mock.py:222）：完整保留**已校验**的
+                # 时区——UTC（无斜杠段）不再漏捕回退 Asia/Shanghai，多段
+                # IANA 名（America/Argentina/Buenos_Aires）不再被窄正则
+                # 截成前两段（截断值过 ZoneInfo 会抛错）。正则只圈词法
+                # 合法的候选，有效性交给 ZoneInfo 判定：非法候选保持
+                # 默认/已捕获值，绝不让 ZoneInfo 异常炸掉整次抽取
+                try:
+                    ZoneInfo(m.group(1))
+                    tzname = m.group(1)
+                except (ZoneInfoNotFoundError, ValueError):
+                    pass
         return note_text, now, tzname
 
     def _extraction(self, messages: list[dict]) -> str:

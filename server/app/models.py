@@ -61,6 +61,14 @@ class Device(Base):
     platform: Mapped[str] = mapped_column(String(32), default="android")
     last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 凭证代际（INV-8 陈述 4，threads12 P1）：吊销/复活时 +1（见
+    # app/api/auth.py 的 _device_upsert/_revoke_device_for_reuse）。access
+    # JWT 的 gen claim 与 refresh_tokens 行各携带签发时的代，get_auth/
+    # refresh 校验不一致一律普通 401——吊销前签发的凭证不得在复活后回魂，
+    # 被吊销旧 refresh 的重放不得连环吊销重新登录的新会话
+    credential_generation: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
 
 
 class RefreshToken(Base):
@@ -82,6 +90,12 @@ class RefreshToken(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 签发时的设备凭证代（插入时写定、此后不可变）：refresh 只对「行的代
+    # == 设备当前代」的行轮换（INV-8 陈述 4，threads12 P1）。跨代的行是
+    # 吊销期签发的旧凭证，重放得普通 401——不轮换、也不进复用吊销分支
+    credential_generation: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
 
 
 class Note(Base):
@@ -187,4 +201,5 @@ class Job(Base):
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
-# 兼容占位：mem0 后端自身的表由 mem0 管理，不在这里定义。
+# 记忆后端自身的表（若需要）由后端实现管理（生产后端在 feat/mem0-backend
+# 分支），不在这里定义。

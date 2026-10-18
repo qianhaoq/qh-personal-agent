@@ -53,18 +53,29 @@ async def init_db() -> None:
     咨询锁，多进程/并发执行安全且串行化（api/worker 启动时不再各自建表，
     docker-compose 由 one-shot migrate 服务先跑本命令）。SQLite 直接
     create_all（单文件库无并发部署场景）。
+
+    只加载 DbSettings（数据库层，threads7 P1 / INV-9 校验分层）：自建
+    引擎、用完即 dispose，不经 get_engine/get_settings——建表不依赖
+    LLM/记忆后端/JWT 配置，也不被它们的生产校验挡住（tests/
+    test_compose.py::test_init_db_does_not_load_full_settings 毒化验证）。
     """
     from app import models  # noqa: F401 确保模型已注册
+    from app.config import get_db_settings
 
-    engine = get_engine()
-    if get_settings().database_url.startswith("postgresql"):
+    database_url = get_db_settings().database_url
+    engine = create_async_engine(database_url, pool_pre_ping=True, future=True)
+    try:
+        if database_url.startswith("postgresql"):
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("SELECT pg_advisory_xact_lock(:key)"), {"key": _INIT_DB_ADVISORY_KEY}
+                )
+                await conn.run_sync(Base.metadata.create_all)
+            return
         async with engine.begin() as conn:
-            await conn.execute(
-                text("SELECT pg_advisory_xact_lock(:key)"), {"key": _INIT_DB_ADVISORY_KEY}
-            )
             await conn.run_sync(Base.metadata.create_all)
-        return
-    await create_all()
+    finally:
+        await engine.dispose()
 
 
 async def startup_create_all() -> None:

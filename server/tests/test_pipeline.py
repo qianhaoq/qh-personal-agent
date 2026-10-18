@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from sqlalchemy import select
 
 from app.models import Job, Note, Reminder
-from app.timeutil import to_iso
+from app.timeutil import as_utc, to_iso
 from tests.conftest import auth_headers
 
 
@@ -170,7 +170,9 @@ async def test_first_llm_failure_leaves_no_side_effects(client, user, monkeypatc
         assert job.status == "pending"
         assert job.attempts == 1
         assert job.note_rev == 1
-        assert "transient llm failure" in (job.last_error or "")
+        # INV-14（threads8 P1）：last_error 只记类型名+错误码，不落异常原文
+        assert "RuntimeError" in (job.last_error or "")
+        assert "transient llm failure" not in (job.last_error or "")
         # 抽取未成功：没有 memory_sync 被入队，也没有任何记忆
         memsync = (
             await session.execute(
@@ -560,3 +562,109 @@ async def test_enqueue_uses_configured_max_attempts(client, user, monkeypatch):
     note_id = r.json()["note_id"]
     job = await _extract_job(note_id)
     assert job.max_attempts == 5
+
+
+async def test_llm_output_unsafe_control_chars_stripped(client, user, run_jobs, monkeypatch):
+    """threads8 P2 / INV-7（extract.py:120）：LLM 输出的字符串含 NUL、C0
+    控制符、DEL、孤立 UTF-16 代理对时（json.loads 接受它们，写 PG
+    text/JSON 列时编码失败是确定性的）→ 落库前剥掉；剥完为空的
+    tags/todos/提醒标题整条丢弃；笔记照常 organized、不 500、不重试。"""
+
+    class DirtyLLM:
+        async def chat(self, messages, response_format=None):
+            return (
+                '{"title": "标\\u0000题带NUL", '
+                '"tags": ["工\\u0000作", "\\u0000", "孤立\\ud800代理"], '
+                '"todos": [{"text": "买\\u0000牛奶", "due": "2030-01-01\\u0000"}, '
+                '{"text": "\\u0000"}, {"text": "带\\ud800代理的待办"}], '
+                '"suggested_reminders": [{"title": "提\\u0000醒交周报", '
+                '"fire_at": "2030-01-01T09:00:00+08:00"}, '
+                '{"title": "\\u0000", "fire_at": "2030-02-01T09:00:00+08:00"}]}'
+            )
+
+    async def fake_get_llm():
+        return DirtyLLM()
+
+    monkeypatch.setattr("app.pipeline.extract.get_llm_client", fake_get_llm)
+    r = await client.post(
+        "/v1/notes",
+        json={
+            "client_note_id": str(uuid.uuid4()),
+            "text": "一条会收到脏字符串的笔记",
+        },
+        headers={"authorization": f"Bearer {user['access_token']}"},
+    )
+    assert r.status_code == 202, r.text
+    note_id = r.json()["note_id"]
+    await run_jobs()
+
+    from datetime import UTC, datetime
+
+    from app.db import get_sessionmaker
+    from app.models import Note, Reminder
+
+    async with get_sessionmaker()() as session:
+        note = await session.get(Note, note_id)
+        reminders = (
+            await session.execute(select(Reminder).where(Reminder.note_id == note_id))
+        ).scalars().all()
+    assert note.status == "organized", "脏字符只影响个别字段，不该把笔记拖进重试/失败"
+    assert note.title == "标题带NUL"
+    assert note.tags == ["工作", "孤立代理"], "剥完为空的 tag 整条丢弃"
+    assert note.todos == [
+        {"text": "买牛奶", "due": "2030-01-01"},
+        {"text": "带代理的待办"},
+    ], "todo 文本/due 同样清干净，纯脏字符的 todo 丢弃"
+    assert [r.title for r in reminders] == ["提醒交周报"], "纯脏字符的提醒标题丢弃"
+    assert as_utc(reminders[0].fire_at) == datetime(2030, 1, 1, 1, 0, tzinfo=UTC)
+    for value in [note.title, note.tags, note.todos] + [r.title for r in reminders]:
+        joined = value if isinstance(value, str) else str(value)
+        assert "\x00" not in joined and "\x7f" not in joined
+
+
+async def test_llm_non_list_collection_fields_discarded_not_failed(client, user, run_jobs, monkeypatch):
+    """threads13 P2 / INV-7（extract.py:138）：OpenAI 兼容供应商按
+    strict=False 调用，schema-violating 但合法 JSON 的结果（tags=1、
+    todos=2.5、suggested_reminders="x"）能到达 _coerce_extraction——对
+    非 list 迭代直接 TypeError，确定性重试耗尽把本来有效的笔记标
+    failed。非 list 的集合字段整字段丢弃，笔记照常 organized。"""
+
+    class SloppyLLM:
+        async def chat(self, messages, response_format=None):
+            return json.dumps(
+                {"title": "标题照常", "tags": 1, "todos": 2.5, "suggested_reminders": "不是列表"},
+                ensure_ascii=False,
+            )
+
+    async def fake_get_llm():
+        return SloppyLLM()
+
+    monkeypatch.setattr("app.pipeline.extract.get_llm_client", fake_get_llm)
+    r = await client.post(
+        "/v1/notes",
+        json={
+            "client_note_id": str(uuid.uuid4()),
+            "text": "一条 LLM 返回畸形集合字段的笔记",
+        },
+        headers=auth_headers(user),
+    )
+    assert r.status_code == 202, r.text
+    note_id = r.json()["note_id"]
+    await run_jobs()
+
+    from app.db import get_sessionmaker
+    from app.models import Note, Reminder
+
+    async with get_sessionmaker()() as session:
+        note = await session.get(Note, note_id)
+        reminders = (
+            await session.execute(select(Reminder).where(Reminder.note_id == note_id))
+        ).scalars().all()
+        job = (
+            await session.execute(select(Job).where(Job.kind == "extract", Job.note_id == note_id))
+        ).scalar_one()
+    assert note.status == "organized", "畸形集合字段只影响对应字段，不该把笔记拖进重试/失败"
+    assert note.title == "标题照常"
+    assert note.tags == [] and note.todos == [], "非 list 集合字段整字段丢弃"
+    assert reminders == []
+    assert job.status == "done"

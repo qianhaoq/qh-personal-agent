@@ -31,7 +31,10 @@ change_seq 写回，与业务路径（note → … → jobs → sequences）不�
 
 租约（P2）：领取时写入 locked_by（worker 实例 id）与 locked_at，收尾
 （finalize_claim）按两者 + status='running' 条件校验——任务被回收给
-别的 worker 后，旧 worker 的收尾一律放弃，不再改动 job/note。
+别的 worker 后，旧 worker 的收尾一律放弃，不再改动 job/note。threads15
+P1 起**外部调用结果的写回事务**同样先过 lease_still_held（锁 job 行
+复核同一三元组）：extract 的 LLM 慢于锁超时时，被回收/判死后的迟到
+结果不得写回 note 或入队 memory_sync。
 
 用法：
     await enqueue(session, "extract", {"note_id": "...", "rev": 1},
@@ -138,7 +141,15 @@ async def claim_next(session: AsyncSession, worker_id: str | None = None):
 
     worker_id 写入 jobs.locked_by 作为租约持有者；缺省时每次生成一次性
     id（等价于“领取后即失联”的 worker，回收语义不受影响）。调用方负责
-    在同一个事务里完成领取，并用 finalize_claim 做带租约校验的收尾。
+    提交领取写入，并用 finalize_claim 做带租约校验的收尾。
+
+    **判死路径会中途 commit（INV-1，threads11）**：循环判死一个锁过期
+    且次数用尽的 job 后先提交该转移（释放 note/sequences 行锁）再找下
+    一个候选。因此调用方**不得**把本调用包在 `session.begin()` 上下文
+    管理器里继续用同一事务（commit 后上下文内再发语句会
+    InvalidRequestError）——正确形态是 claim 上下文退出后自行
+    commit/rollback（见 runner._claim_one）；只走 pending/回收路径的调用
+    不触发中途 commit，两种包法都兼容。
     """
     now = utcnow()
     wid = worker_id or new_worker_id()
@@ -174,15 +185,20 @@ async def _claim_postgres(session: AsyncSession, now: datetime, worker_id: str) 
         job_id, status, attempts, max_attempts, _payload_json = row[:5]
         kind, note_id, note_rev = row[5], row[6], row[7]
         if status == "pending":
-            job = await _mark_running(session, job_id, now, worker_id)
+            job = await _mark_running(session, job_id, worker_id)
         elif attempts >= max_attempts:
             # running 锁过期且次数已用尽（含最后一次允许的尝试）：不再执行，直接判死
             await _fail_expired(
                 session, job_id, kind=kind, note_id=note_id, note_rev=note_rev
             )
+            # INV-1（threads11 P1，queue.py:182）：_fail_expired 已按队列锁序
+            # 拿了 note 与 sequences 行锁——判死转移立即提交（释放全部行锁）
+            # 再找下一个候选；同一事务继续锁下一个 job/note 会与并发 PATCH
+            # （先持 note 行锁、正等 sequences）构成 AB-BA 死锁
+            await session.commit()
             job = None
         else:
-            job = await _reclaim_running(session, job_id, now, cutoff, worker_id)
+            job = await _reclaim_running(session, job_id, cutoff, worker_id)
         if job is not None:
             return job
         # 判死/抢占/唯一索引冲突未成功：继续找下一个候选
@@ -217,7 +233,7 @@ async def _claim_sqlite(session: AsyncSession, now: datetime, worker_id: str) ->
     for job_id, status, run_after, locked_at, attempts, max_attempts, payload_json, kind, note_id, note_rev in rows:
         if status == "pending":
             if as_utc(run_after) <= now:
-                job = await _mark_running(session, job_id, now, worker_id)
+                job = await _mark_running(session, job_id, worker_id)
                 if job is not None:
                     return job
             continue
@@ -226,25 +242,33 @@ async def _claim_sqlite(session: AsyncSession, now: datetime, worker_id: str) ->
             continue
         if attempts >= max_attempts:
             await _fail_expired(session, job_id, kind=kind, note_id=note_id, note_rev=note_rev)
+            # 同 _claim_postgres（INV-1，threads11）：判死转移提交后再继续扫；
+            # SQLite 单写者虽无 AB-BA，转移也不得挂在后续领取的事务里
+            await session.commit()
             continue
-        job = await _reclaim_running(session, job_id, now, cutoff, worker_id)
+        job = await _reclaim_running(session, job_id, cutoff, worker_id)
         if job is not None:
             return job
     return None
 
 
 async def _mark_running(
-    session: AsyncSession, job_id: str, now: datetime, worker_id: str
+    session: AsyncSession, job_id: str, worker_id: str
 ) -> Job | None:
     # savepoint：两个 worker 并发把同 note 的两个 pending memory_sync 置
     # running 时，必有一方在 uq_jobs_memsync_running 上 IntegrityError——
     # 只回滚这一个候选，事务继续找下一个（INV-5 方案 C）
+    #
+    # INV-13（threads10）：locked_at 是**租约签发时间**，取写入时刻的
+    # utcnow() 而非 claim 循环开头的 now——PG FOR UPDATE 等锁消耗的时间
+    # 会等量缩短租约（等待越久越早被回收、活 worker 越早被误判失灵）。
+    # WHERE 无时间谓词，不需要循环外的 now
     try:
         async with session.begin_nested():
             result = await session.execute(
                 update(Job)
                 .where(Job.id == job_id, Job.status == "pending")
-                .values(status="running", attempts=Job.attempts + 1, locked_at=now, locked_by=worker_id)
+                .values(status="running", attempts=Job.attempts + 1, locked_at=utcnow(), locked_by=worker_id)
             )
             claimed = result.rowcount
     except IntegrityError:
@@ -256,13 +280,17 @@ async def _mark_running(
 
 
 async def _reclaim_running(
-    session: AsyncSession, job_id: str, now: datetime, cutoff: datetime, worker_id: str
+    session: AsyncSession, job_id: str, cutoff: datetime, worker_id: str
 ) -> Job | None:
-    """回收锁过期的 running 任务（attempts +1、换租约）。条件更新防并发抢占。"""
+    """回收锁过期的 running 任务（attempts +1、换租约）。条件更新防并发抢占。
+
+    locked_at 同 _mark_running：签发时刻在函数内取写入时刻的 utcnow()
+    （threads10，INV-13）；cutoff 是 WHERE 谓词参数，维持调用方传入的
+    循环外值——方向保守（刚过期的租约晚一轮被回收，不错收），既有边界。"""
     result = await session.execute(
         update(Job)
         .where(Job.id == job_id, Job.status == "running", Job.locked_at < cutoff)
-        .values(attempts=Job.attempts + 1, locked_at=now, locked_by=worker_id)
+        .values(attempts=Job.attempts + 1, locked_at=utcnow(), locked_by=worker_id)
         .execution_options(synchronize_session=False)
     )
     if result.rowcount == 0:  # 已被别人回收
@@ -369,6 +397,44 @@ async def _mark_memory_sync_failed(session: AsyncSession, *, note_id: str, job_i
         .execution_options(synchronize_session=False)
     )
     return bool(result.rowcount)
+
+
+async def lease_still_held(
+    session: AsyncSession,
+    *,
+    job_id: str | None,
+    worker_id: str | None,
+    locked_at: datetime | None,
+) -> bool:
+    """锁 job 行并复核租约（threads15 P1 / INV-6/13）：把外部调用结果写回
+    业务数据的事务，写之前先在这里原子确认「自己仍是这个 job 的持有者」。
+
+    - PG：SELECT ... FOR UPDATE 拿行锁后比对 (status, locked_by, locked_at)
+      ——回收路径（对 running 行的条件 UPDATE）在本事务提交前拿不到行锁，
+      锁内读到的就是当前真值，等价于 finalize_claim 的收尾栅栏；SQLite 无
+      行锁，单写者模型天然串行。
+    - 比对在 Python 里做 as_utc 归一（SQLite 以字符串存 datetime，SQL 等
+      值比较对 aware 参数不可靠），与 finalize_claim / _mark_memory_status
+      同口径。
+    - job_id 为 None（测试 / 无租约上下文的调用）按无栅栏处理，返回 True。
+
+    锁序（INV-1）：本函数只锁 job 行；调用方随后的业务行写入必须排在它
+    之后（jobs → note，与 finalize/判死路径同向，不与业务路径成环）。
+    """
+    if job_id is None:
+        return True
+    stmt = select(Job).where(Job.id == job_id)
+    if is_postgres():
+        stmt = stmt.with_for_update()
+    job_row = (await session.execute(stmt)).scalar_one_or_none()
+    return (
+        job_row is not None
+        and job_row.status == "running"
+        and worker_id is not None
+        and job_row.locked_by == worker_id
+        and locked_at is not None
+        and as_utc(job_row.locked_at) == locked_at
+    )
 
 
 async def finalize_claim(

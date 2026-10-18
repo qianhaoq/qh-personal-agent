@@ -8,7 +8,7 @@ MemoryStore.add / delete / delete_by_note 调用方。
 
 1. **读**：短读事务读 note 的 (deleted_at, rev, text, status, user_id)，
    随即提交，不持锁、不占序列。
-2. **写外部**（事务外，无任何 DB 会话——mem0 内部还有 LLM/embedding）：
+2. **写外部**（事务外，无任何 DB 会话——记忆后端内部还有 LLM/embedding）：
    已删除 → 只 delete_by_note；未删除且 organized → delete_by_note 后
    add(text, metadata={note_id, source_rev=rev})，记录本次 add 返回的全部
    memory id；未删除且未 organized（uploaded/failed）→ 只 delete_by_note、
@@ -19,7 +19,11 @@ MemoryStore.add / delete / delete_by_note 调用方。
    locked_by=:worker_id AND locked_at=:claimed）。租约仍在且与第 1 步相同 →
    条件 UPDATE memory_status（'synced'；note 已 failed 且记忆为空则
    'failed'——该状态下不可能再有记忆），条件 id+rev+未删除，不占 seq、
-   不碰 updated_at/change_seq（INV-2.6）；租约仍在但状态已变 → **只删本次
+   不碰 updated_at/change_seq（INV-2.6）；**置位事务内再原子复核一次租约**
+   （threads8 P2 / INV-13：本步的复核会话已提交，若协程在两步之间暂停、
+   任务被回收换主，迟到的 worker 仍会写下 synced 掩盖未同步状态——置位
+   与租约判定必须同事务原子完成，复核不过不置位、静默让位给后继任务）；
+   租约仍在但状态已变 → **只删本次
    add 产生的 memory id**（按 id 删，绝不 delete_by_note，修 C9：不误删
    并发新 rev 任务刚写入的记忆）+ INSERT memory_sync … ON CONFLICT DO
    NOTHING 再入队（与变更事务已入队的 pending 去重合并），job 仍算 done；
@@ -47,7 +51,7 @@ from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.db import get_sessionmaker
-from app.jobs.queue import enqueue
+from app.jobs.queue import enqueue, lease_still_held
 from app.memory.base import MemoryItem, get_memory_store
 from app.models import Job, Note
 from app.timeutil import as_utc
@@ -65,7 +69,7 @@ async def sync_note_memory(
 
     job_id/worker_id/locked_at 是认领快照里的租约凭证（threads5 P2-1）：
     复查时除 (rev, deleted_at) 外还必须确认自己仍持有租约——外部写
-    （mem0 的 LLM/embedding）超过锁超时后任务会被回收换主，仅比
+    （记忆后端的 LLM/embedding）超过锁超时后任务会被回收换主，仅比
     (rev, deleted_at) 挡不住「复活慢 worker 的迟到写入」。不带租约信息
     的调用（测试/未来账户级路径）按无栅栏处理。"""
     maker = get_sessionmaker()
@@ -115,24 +119,48 @@ async def sync_note_memory(
         # 在换主执行完成之后才落地，把新持有者写的记忆删掉且再无后继任务
         # ——「删己 id」对账不了这部分损害，唯一可靠的兜底是让队列再收敛
         # 一次（ON CONFLICT DO NOTHING 与已有 pending 去重；迟到执行不得
-        # 置位/写 note，但允许留下这一个 INSERT，见 INV-6）
-        if added:
-            await store.delete(user_id, [m.id for m in added])
-        async with maker() as session, session.begin():
-            await enqueue(
-                session, "memory_sync", {"note_id": note_id}, note_id=note_id, dedupe_pending=True
-            )
+        # 置位/写 note，但允许留下这一个 INSERT，见 INV-6）。
+        # 删己 id 与补偿入队必须 try/finally（threads7 P1 / INV-5）：本执行
+        # 租约已丢、收尾会被 finalize_claim 放弃，清理抛异常再吞掉入队就
+        # 再无任何收敛途径——异常照常上抛，入队绝不缺席
+        try:
+            if added:
+                await store.delete(user_id, [m.id for m in added])
+        finally:
+            await _compensating_requeue(maker, note_id)
         return
 
     if unchanged:
         # 已删除的终态：条件更新自然不命中（deleted_at IS NULL），记忆已清
-        await _mark_memory_status(maker, note_id, rev, failed=again.status == "failed")
+        # 置位事务内自带原子租约复核（见 _mark_memory_status）
+        await _mark_memory_status(
+            maker,
+            note_id,
+            rev,
+            failed=again.status == "failed",
+            job_id=job_id,
+            worker_id=worker_id,
+            locked_at=locked_at,
+        )
         return
 
     # 状态已变：只删本次 add 产生的 memory id（修 C9），再入队（pending
-    # 去重合并），由下一个任务按新状态收敛；本 job 仍算 done
-    if added:
-        await store.delete(user_id, [m.id for m in added])
+    # 去重合并），由下一个任务按新状态收敛；本 job 仍算 done。同丢租约
+    # 路径：删己 id 抛异常也必须留下后继任务（threads7 P1 / INV-5），
+    # 异常上抛由 runner 记录错误并按租约收尾（重试或让位给 pending）
+    try:
+        if added:
+            await store.delete(user_id, [m.id for m in added])
+    finally:
+        await _compensating_requeue(maker, note_id)
+
+
+async def _compensating_requeue(
+    maker: async_sessionmaker[AsyncSession], note_id: str
+) -> None:
+    """补偿再入队（INV-5）：与调用方的「删己 id」清理构成 try/finally 的
+    finally 侧——清理抛异常也一定入队（ON CONFLICT DO NOTHING 与既有
+    pending 去重合并）。"""
     async with maker() as session, session.begin():
         await enqueue(
             session, "memory_sync", {"note_id": note_id}, note_id=note_id, dedupe_pending=True
@@ -145,12 +173,30 @@ async def _mark_memory_status(
     rev: int,
     *,
     failed: bool,
-) -> None:
+    job_id: str | None = None,
+    worker_id: str | None = None,
+    locked_at: datetime | None = None,
+) -> bool:
     """置 memory_status（服务端内部状态，不进 API 响应）：不占 change_seq、
     也不碰 updated_at（INV-2.6——`updated_at=Note.updated_at` 自赋值抑制
     列级 onupdate，否则会产生客户端永远观察不到的时间戳）。条件 id + rev +
-    未删除：期间又被 PATCH/DELETE 时不置位，交给重新入队的任务。"""
+    未删除：期间又被 PATCH/DELETE 时不置位，交给重新入队的任务。
+
+    threads8 P2 / INV-5/6/13：置位必须与租约复核**同事务原子**——调用方的
+    复查会话在到达这里之前已提交，若协程在两步之间暂停、租约被回收换主，
+    只比 (id, rev, 未删除) 的迟到 worker 仍会写下 synced 掩盖未同步状态。
+    复核走 queue.lease_still_held（threads15 起与本仓其他写回栅栏共用：
+    事务内锁 job 行（PG FOR UPDATE；锁序 = 队列路径 jobs → note，见 INV-1
+    表，业务路径对 jobs 只 INSERT 不 UPDATE，无 AB-BA），取行后在 Python
+    里比 as_utc(locked_at)——SQLite 以字符串存 datetime，SQL 等值比较对
+    aware 参数不可靠）。复核不过**不置位、静默让位**（回收者必有后继：
+    换主执行或回收后 pending 再入队都会再收敛，同 finalize_claim 的语义）；
+    无租约上下文（测试/账户级路径）按无栅栏处理。返回是否实际置位。"""
     async with maker() as session, session.begin():
+        if job_id is not None and not await lease_still_held(
+            session, job_id=job_id, worker_id=worker_id, locked_at=locked_at
+        ):
+            return False
         await session.execute(
             update(Note)
             .where(Note.id == note_id, Note.rev == rev, Note.deleted_at.is_(None))
@@ -160,3 +206,4 @@ async def _mark_memory_status(
             )
             .execution_options(synchronize_session=False)
         )
+    return True

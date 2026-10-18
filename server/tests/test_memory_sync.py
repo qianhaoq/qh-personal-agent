@@ -797,6 +797,66 @@ async def test_memory_sync_recheck_fences_reclaimed_lease_deletes_own_ids(
     assert not [j for j in jobs if j.status in ("pending", "running")]
 
 
+async def test_memory_sync_mark_status_skipped_when_lease_lost_before_update(
+    client, user, run_jobs, monkeypatch
+):
+    """threads8 P2 / INV-5/6/13（memory_sync.py:131）：复查会话看到租约
+    仍在、状态未变，但置位事务开启前协程暂停、租约被回收换主（job 回
+    pending 等待新认领）→ 置位必须与租约复核**同事务原子**：迟到的
+    worker 不得写下 synced 掩盖「换主后尚未收敛」的状态，静默让位给
+    后继任务；排空后由新持有者正常置位。"""
+    from app.db import get_sessionmaker
+    from app.jobs.queue import enqueue
+    from app.pipeline import memory_sync
+    from app.pipeline.runner import run_pending_jobs
+    from app.timeutil import utcnow
+
+    note_id = await _create_note(client, user, "置位前一刻丢租约的笔记")
+    await run_jobs()  # organized + 初次收敛（memory_status=synced）
+
+    # 复位 memory_status：若置位没被租约栅栏拦下，迟到的 worker 会把它
+    # 覆盖成 synced（模拟期间一次不动 rev 的内部推进，同上例手法）
+    maker = get_sessionmaker()
+    async with maker() as session, session.begin():
+        await session.execute(
+            update(Note).where(Note.id == note_id).values(memory_status="pending")
+        )
+    async with maker() as session, session.begin():
+        await enqueue(session, "memory_sync", {"note_id": note_id}, note_id=note_id)
+
+    real_mark = memory_sync._mark_memory_status
+
+    async def mark_after_lease_reclaim(maker_, note_id_, rev_, *, failed, **lease):
+        # 注入「复查通过 → 置位事务开启」之间的暂停窗口：回收者把租约
+        # 换主（status 回 pending；真实并发发生在别的连接上，等价）
+        async with maker() as session, session.begin():
+            await session.execute(
+                update(Job)
+                .where(Job.id == lease["job_id"])
+                .values(
+                    status="pending", run_after=utcnow(), locked_by=None, locked_at=None
+                )
+            )
+        return await real_mark(maker_, note_id_, rev_, failed=failed, **lease)
+
+    monkeypatch.setattr(memory_sync, "_mark_memory_status", mark_after_lease_reclaim)
+    assert await run_pending_jobs(limit=1, worker_id="wkr_stale") == 1
+
+    note = await _note(note_id)
+    assert note.memory_status == "pending", "丢租约的迟到置位必须被拦下"
+    jobs = await _memsync_jobs(note_id)
+    running_or_pending = [j.status for j in jobs if j.status in ("pending", "running")]
+    assert running_or_pending == ["pending"], (
+        f"被回收的任务应回到 pending 等后继：{[j.status for j in jobs]}"
+    )
+
+    # 排空：换主后的新持有者按当前状态正常置位
+    monkeypatch.undo()
+    await run_jobs()
+    note = await _note(note_id)
+    assert note.memory_status == "synced"
+
+
 class StalledDeleteStore(InMemoryStore):
     """目标笔记的**第一次** delete_by_note 先挂起：模拟 mem0 清理调用本身
     耗过锁超时（threads6 P1-1 的交错源头），放行后照常执行删除。"""
@@ -928,3 +988,139 @@ async def test_memory_sync_status_updates_do_not_touch_updated_at_or_change_seq(
     assert [n for n in page2.json()["notes"] if n["note_id"] == note_id] == [], (
         "updated_at 若被推进而 seq 不动，客户端永远观察不到那个新时间戳"
     )
+
+
+async def test_inmemory_list_page_cap_raises_when_full():
+    """INV-3（后端契约第 1 条）：InMemoryStore 的 list() 页上限取满即抛
+    MemoryEnumerationIncomplete（进程内字典本不截断，上限让"取不全即报错"
+    的契约可测；mem0 后端实现同一语义）。"""
+    capped = InMemoryStore(list_page_size=2)
+    for text, note in (("甲", "n1"), ("乙", "n1"), ("丙", "n2")):
+        await capped.add("usr_1", text, note_id=note)
+    with pytest.raises(MemoryEnumerationIncomplete):
+        await capped.list("usr_1")
+
+    # 上限高于存量：可证明取全，照常返回
+    roomy = InMemoryStore(list_page_size=5)
+    await roomy.add("usr_1", "甲", note_id="n1")
+    assert len(await roomy.list("usr_1")) == 1
+
+
+
+class FailingCleanupStore(DelayedAddStore):
+    """删己 id 的清理调用（delete）记录后无条件抛异常：模拟记忆后端在
+    复查清理阶段故障——threads7 P1 / INV-5 的 try/finally 触发点。"""
+
+    async def delete(self, user_id, memory_ids):
+        self.deleted_ids.append(list(memory_ids))
+        raise RuntimeError("cleanup exploded")
+
+
+async def test_memory_sync_lost_lease_delete_failure_still_requeues(
+    client, user, run_jobs
+):
+    """threads7 P1 / INV-5（memory_sync.py:123）：丢租约路径的「删己 id →
+    补偿再入队」必须 try/finally——清理调用抛异常也一定留下补偿任务。
+    本执行租约已丢、收尾会被 finalize_claim 放弃（无重试），入队若被
+    吞掉就再无任何收敛途径。"""
+    from datetime import timedelta
+
+    from app.config import get_settings
+    from app.db import get_sessionmaker
+    from app.jobs.queue import enqueue
+    from app.pipeline.runner import run_pending_jobs
+    from app.timeutil import utcnow
+
+    note_id = await _create_note(client, user, "清理会在丢租约后炸掉的笔记")
+    await run_jobs()  # organized rev=2，初次收敛完成
+
+    store = FailingCleanupStore()
+    store.target_note_id = note_id
+    set_memory_store(store)
+
+    maker = get_sessionmaker()
+    async with maker() as session, session.begin():
+        await enqueue(session, "memory_sync", {"note_id": note_id}, note_id=note_id)
+
+    worker1 = asyncio.create_task(run_pending_jobs(limit=1, worker_id="wkr_old"))
+    await asyncio.wait_for(store.entered.wait(), timeout=5)
+
+    # 租约过期 → 新 worker 回收换主并把同一 job 跑完（置 synced）
+    async with maker() as session, session.begin():
+        await session.execute(
+            update(Job)
+            .where(Job.kind == "memory_sync", Job.note_id == note_id, Job.status == "running")
+            .values(
+                locked_at=utcnow()
+                - timedelta(seconds=get_settings().job_lock_timeout_seconds + 60)
+            )
+        )
+    assert await run_pending_jobs(limit=1, worker_id="wkr_new") == 1
+
+    store.release.set()
+    await asyncio.wait_for(worker1, timeout=10)
+
+    # 复活的慢 worker：复查丢租约 → 删己 id 抛异常，但补偿任务必须已在
+    assert store.deleted_ids, "前置失败：慢 worker 应尝试过删己 id"
+    jobs = await _memsync_jobs(note_id)
+    compensating = [j for j in jobs if j.status == "pending"]
+    assert len(compensating) == 1, (
+        f"清理抛异常也必须留下补偿 pending：{[j.status for j in jobs]}"
+    )
+
+    # 排空后照常收敛：补偿任务 delete_by_note 重做清理、写新记忆、置 synced
+    await run_jobs()
+    note = await _note(note_id)
+    assert note.memory_status == "synced"
+    items = await _items(store, user["user_id"], note_id)
+    assert items and all(m.source_rev == note.rev for m in items)
+    assert len({m.id for m in items}) == len(items), "终态恰好一组记忆"
+
+
+async def test_memory_sync_rev_change_delete_failure_still_requeues(
+    client, user, run_jobs
+):
+    """threads7 P1 / INV-5（memory_sync.py:123）：状态已变路径同样要求
+    「删己 id → 补偿再入队」在 try/finally 里——清理抛异常时异常上抛，
+    而补偿任务不缺席。
+
+    直接调 sync_note_memory（不走 runner，无重试兜底）并让窗口内的状态
+    变化**不留自己的 pending**（直接推进 rev，模拟变更事务的后继已被
+    消费/让位的交错）：此刻补偿入队是唯一可能的后继任务——吞掉它，
+    这条笔记就永远无人收敛。"""
+    from app.db import get_sessionmaker
+    from app.pipeline.memory_sync import sync_note_memory
+
+    note_id = await _create_note(client, user, "清理会在复查后炸掉的笔记")
+    await run_jobs()  # organized rev=2
+
+    store = FailingCleanupStore()
+    store.target_note_id = note_id
+    set_memory_store(store)
+
+    maker = get_sessionmaker()
+    task = asyncio.create_task(sync_note_memory(note_id))
+    await asyncio.wait_for(store.entered.wait(), timeout=5)
+
+    # add 窗口内笔记 rev 变化，且不产生别的 pending
+    async with maker() as session, session.begin():
+        await session.execute(update(Note).where(Note.id == note_id).values(rev=3))
+
+    store.release.set()
+    # 异常照常上抛（调用方决定重试），但 finally 已完成补偿入队
+    with pytest.raises(RuntimeError, match="cleanup exploded"):
+        await asyncio.wait_for(task, timeout=10)
+
+    assert store.deleted_ids, "前置失败：本次执行应尝试过删己 id"
+    jobs = await _memsync_jobs(note_id)
+    pending = [j for j in jobs if j.status == "pending"]
+    assert len(pending) == 1, (
+        f"清理抛异常也必须留下后继 pending：{[j.status for j in jobs]}"
+    )
+
+    # 排空：补偿任务按新 rev 收敛，终态 synced
+    await run_jobs()
+    note = await _note(note_id)
+    assert note.memory_status == "synced"
+    items = await _items(store, user["user_id"], note_id)
+    assert items and all(m.source_rev == note.rev for m in items)

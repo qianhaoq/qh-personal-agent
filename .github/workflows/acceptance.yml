@@ -12,8 +12,16 @@ permissions: {}
 
 jobs:
   acceptance:
+    # Saves Actions minutes: label events for other labels skip without
+    # booting a runner (Measure runs the PR's tests). Keep in sync with
+    # tests_changed.exempt_label if .github/acceptance.yml changes it.
+    if: >-
+      (github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
+      github.event.label.name == 'no-test-needed'
     permissions:
       contents: read
       pull-requests: write   # sticky report comment
       checks: read           # read the Codex gate result
-    uses: qianhaoq/devflow-gates/.github/workflows/acceptance.yml@1a6a4a85728b0c1f3482a52020f94cb8208c73f5  # devflow-gates main @ 1a6a4a8 (pinned)
+    uses: qianhaoq/devflow-gates/.github/workflows/acceptance.yml@88a9af464d5bcb9620231cf3be952b119c17b0e3  # devflow-gates main @ 88a9af4 (pinned; bump deliberately)  # devflow-gates main @ 1a6a4a8 (pinned)
+    with:
+      runs_on: '["self-hosted", "linux", "x64"]'

@@ -32,6 +32,16 @@ Rules (checker id -> docs/server-invariants.md id):
                    implicit fallback: inside an `except` handler, a bare `else:`
                    branch, or an `if` whose test is a negation / `is None` /
                    empty-string check (e.g. missing key).
+  INV-NO-RAW-EXC  [INV-14 异常不落原文] Inside an `except ... as <name>` handler, that bound name must not
+                   reach a log call or an *error*-named attribute raw. Flagged, for the
+                   handler-bound name only (unbound or attribute-rooted uses are ignored,
+                   precision over recall): a logger call (receiver named logger/log/
+                   *_logger) with the bare name, str(name)/repr(name) (slices included),
+                   an f-string interpolating it, or '%s' % name as an argument;
+                   logger.exception(...) and exc_info=<truthy constant> in the handler;
+                   <anything .error-named> = <raw name or str()/repr() of it>. Sanitizer
+                   calls (e.g. safe_error_text(exc)) are accepted — only the name itself
+                   flowing raw is a finding.
 
 Exemption (trailing comment on the flagged line, rule id required):
     # invariant-ok: INV-SEQ-LAST <reason>
@@ -56,7 +66,12 @@ SESSION_WRITES = {"add", "add_all", "merge", "delete", "execute"}
 TXN_END = {"commit", "rollback"}
 KNOWN_FAKES = {"MockLLM", "FakeLLM", "InMemoryStore"}
 HTTP_METHODS = {"get", "post", "put", "patch", "delete", "head", "options", "api_route"}
-SOURCE_INV = {"INV-SEQ-LAST": "INV-1", "INV-NUL": "INV-7", "INV-NO-FALLBACK": "INV-10"}
+SOURCE_INV = {
+    "INV-SEQ-LAST": "INV-1",
+    "INV-NUL": "INV-7",
+    "INV-NO-FALLBACK": "INV-10",
+    "INV-NO-RAW-EXC": "INV-14",
+}
 OK_MARK = re.compile(r"#\s*invariant-ok:\s*(INV-[A-Z-]+)\s+\S")
 
 
@@ -386,7 +401,85 @@ def check_fallback(tree, path, parents) -> list[Finding]:
     return out
 
 
-CHECKS = (check_seq_last, check_nul, check_fallback)
+# ------------------------------------------------------------------ INV-NO-RAW-EXC
+# 日志接收者：logger / log / *_logger / *_log（首尾精确匹配——"catalog" 这类
+# 尾缀巧合不算）。receiver 取点表达式最后一段（logger、self.log 都识别）。
+_LOGGER_RECV = re.compile(r"^(\w+[_])?log(ger)?$")
+
+
+def _logger_call(call: ast.Call) -> bool:
+    f = call.func
+    return (
+        isinstance(f, ast.Attribute)
+        and _name(f.value) is not None
+        and _LOGGER_RECV.match(_name(f.value)) is not None
+    )
+
+
+def _exc_leaks(node: ast.AST, bound: str) -> bool:
+    """该表达式的值会把异常原文带出去：裸 bound 名、str/repr(bound)、
+    f-string 插值 bound、'%s' % bound（含元组）、以上再取切片。属性访问
+    （exc.code）与别的函数调用（safe_error_text(exc)）不算——精确优先。"""
+    if isinstance(node, ast.Name):
+        return node.id == bound
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ("str", "repr"):
+        return len(node.args) == 1 and _exc_leaks(node.args[0], bound)
+    if isinstance(node, ast.JoinedStr):
+        return any(isinstance(v, ast.FormattedValue) and _exc_leaks(v.value, bound) for v in node.values)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
+        return _exc_leaks(node.right, bound)
+    if isinstance(node, ast.Tuple):
+        return any(_exc_leaks(e, bound) for e in node.elts)
+    if isinstance(node, ast.Subscript):
+        return _exc_leaks(node.value, bound)
+    return False
+
+
+def check_raw_exc(tree, path, parents) -> list[Finding]:
+    """INV-14（threads8 P1）：except 子句绑定的异常名不得原文进入日志、
+    traceback 或 *error* 命名的属性（jobs.last_error 等）。只看绑定名本身
+    的裸流动，sanitizer 包装放行；logger.exception/exc_info=True 在 handler
+    内无条件命中（traceback 必带消息原文）。"""
+    out = []
+    for handler in ast.walk(tree):
+        if not isinstance(handler, ast.ExceptHandler) or not handler.name:
+            continue
+        bound = handler.name
+        for node in ast.walk(handler):
+            if node is handler:
+                continue
+            if isinstance(node, ast.Call) and _logger_call(node):
+                if node.func.attr == "exception":
+                    out.append(Finding(path, node.lineno, "INV-NO-RAW-EXC",
+                        "logger.exception(...) logs the raw traceback (the exception message may embed user content): "
+                        "use logger.error with a safe summary (app/errors.py::safe_error_text)"))
+                    continue
+                if any(k.arg == "exc_info" and isinstance(k.value, ast.Constant) and k.value.value
+                       for k in node.keywords):
+                    out.append(Finding(path, node.lineno, "INV-NO-RAW-EXC",
+                        "exc_info=<truthy> logs the raw traceback (the exception message may embed user content): "
+                        "log type+code only (app/errors.py::safe_error_text)"))
+                    continue
+                if any(_exc_leaks(a, bound) for a in node.args):
+                    out.append(Finding(path, node.lineno, "INV-NO-RAW-EXC",
+                        f"logger call receives the exception ('{bound}') raw: its message may embed user content "
+                        "(SQLAlchemy StatementError str() includes SQL bound params); log type+code only "
+                        "(app/errors.py::safe_error_text)"))
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                value = node.value
+                if value is None:
+                    continue
+                for t in targets:
+                    if isinstance(t, ast.Attribute) and "error" in t.attr.lower() and _exc_leaks(value, bound):
+                        out.append(Finding(path, node.lineno, "INV-NO-RAW-EXC",
+                            f"'{ast.unparse(t)}' would persist the raw exception text: store "
+                            "safe_error_text(exc) (type+code) instead"))
+                        break
+    return out
+
+
+CHECKS = (check_seq_last, check_nul, check_fallback, check_raw_exc)
 
 
 def check_source(src: str, path: str) -> list[Finding]:

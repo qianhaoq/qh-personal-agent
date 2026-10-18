@@ -527,6 +527,120 @@ async def test_extract_finalize_concurrent_patch_no_deadlock(client, user, monke
     assert note.text == "并发 PATCH 的内容"
 
 
+@requires_postgres
+async def test_claim_dead_jobs_commit_between_candidates_no_deadlock(client, user, monkeypatch):
+    """threads11 P1 / INV-1（queue.py:182）：claim 循环判死过期 job A
+    （_fail_expired 已持 note A 行锁 + sequences 行锁）后必须先提交再扫
+    候选 B——旧实现同一事务继续锁 job B/note B，与并发 PATCH（先持
+    note B 行锁、正等 sequences）构成 AB-BA，PG DeadlockDetected→500/异常。
+
+    钩子把 worker 钉在「判死 A 完成、未扫 B」的位置；此时 PATCH note B
+    拿到 note 行锁并阻塞在 sequences 上；放行后正确实现（判死转移已随
+    commit 落定、sequences 锁已释放）里 PATCH 顺利完成，worker 对 note B
+    的条件更新只等 PATCH 提交——无环。"""
+    from datetime import timedelta
+
+    from sqlalchemy import select, update
+
+    from app.config import get_settings
+    from app.db import get_sessionmaker
+    from app.jobs import queue as queue_mod
+    from app.models import Job, Note
+    from app.pipeline.runner import run_pending_jobs
+    from app.timeutil import utcnow
+
+    headers = auth_headers(user)
+    note_a = (
+        await client.post(
+            "/v1/notes",
+            json={"client_note_id": str(uuid.uuid4()), "text": "判死 A 的笔记"},
+            headers=headers,
+        )
+    ).json()["note_id"]
+    note_b = (
+        await client.post(
+            "/v1/notes",
+            json={"client_note_id": str(uuid.uuid4()), "text": "候选 B 的笔记"},
+            headers=headers,
+        )
+    ).json()["note_id"]
+
+    maker = get_sessionmaker()
+    async with maker() as session:
+        jobs = {
+            j.note_id: j
+            for j in (
+                await session.execute(select(Job).where(Job.kind == "extract"))
+            ).scalars().all()
+        }
+    job_a, job_b = jobs[note_a], jobs[note_b]
+
+    # 两个 extract job 都判死（running + 锁过期 + 次数用尽）；run_after
+    # 错开保证 A 先被扫（不依赖 created_at 的精度）
+    timeout = get_settings().job_lock_timeout_seconds
+    dead = {
+        "status": "running",
+        "attempts": get_settings().job_max_attempts,
+        "locked_by": "wkr_dead",
+        "locked_at": utcnow() - timedelta(seconds=timeout + 60),
+    }
+    async with maker() as session, session.begin():
+        await session.execute(
+            update(Job)
+            .where(Job.id == job_a.id)
+            .values(**dead, run_after=utcnow() - timedelta(hours=2))
+        )
+        await session.execute(
+            update(Job)
+            .where(Job.id == job_b.id)
+            .values(**dead, run_after=utcnow() - timedelta(hours=1))
+        )
+
+    a_failed, go_next = asyncio.Event(), asyncio.Event()
+    calls = {"fail": 0}
+    real_fail_expired = queue_mod._fail_expired
+
+    async def fail_expired_pause_after_first(session, job_id, *, kind, note_id, note_rev):
+        calls["fail"] += 1
+        result = await real_fail_expired(
+            session, job_id, kind=kind, note_id=note_id, note_rev=note_rev
+        )
+        if calls["fail"] == 1:
+            # 判死 A 的转移做完（本事务此刻持有 note A + sequences 行锁），
+            # 钉住：先让 PATCH 拿到 note B、阻塞在 sequences 上
+            a_failed.set()
+            await go_next.wait()
+        return result
+
+    monkeypatch.setattr(queue_mod, "_fail_expired", fail_expired_pause_after_first)
+
+    worker = asyncio.create_task(run_pending_jobs(worker_id="wkr_scan11"))
+    await asyncio.wait_for(a_failed.wait(), timeout=5)
+
+    patch_task = asyncio.create_task(
+        client.patch(
+            f"/v1/notes/{note_b}", json={"text": "并发 PATCH 的内容", "rev": 1}, headers=headers
+        )
+    )
+    await asyncio.sleep(0.3)
+    assert not patch_task.done(), "PATCH 应阻塞在 worker（判死 A）持有的 sequences 行锁上"
+
+    go_next.set()
+    patched = await asyncio.wait_for(patch_task, timeout=10)
+    await asyncio.wait_for(worker, timeout=15)
+    await run_pending_jobs()  # 排空 PATCH 入队的 extract / memory_sync
+
+    # 无 DeadlockDetected 引发的 500/异常；判死转移与 PATCH 各自照常落库
+    assert patched.status_code == 200, patched.text
+    async with maker() as session:
+        job_a_row = await session.get(Job, job_a.id)
+        note_a_row = await session.get(Note, note_a)
+        note_b_row = await session.get(Note, note_b)
+    assert job_a_row.status == "failed"
+    assert note_a_row.status == "failed"
+    assert note_b_row.text == "并发 PATCH 的内容"
+
+
 async def test_concurrent_first_login_same_invite_single_user(client, invite_code):
     """P1：5 个并发首登同一邀请码，只创建 1 个用户。
 

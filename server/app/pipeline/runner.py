@@ -7,6 +7,7 @@ from datetime import datetime
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.db import get_sessionmaker
+from app.errors import safe_error_text
 from app.jobs.queue import claim_next, finalize_claim, new_worker_id
 from app.timeutil import as_utc
 
@@ -42,7 +43,9 @@ async def run_pending_jobs(
     1. 认领事务（status=running、attempts+1、写租约 locked_by/locked_at）
     2. 执行：事务划分由具体 job 实现负责——extract 内部是“短读事务 →
        事务外 LLM → 短写事务”，memory_sync 是“短读 → 事务外写记忆 →
-       复查/再入队”多个短事务，外部调用（LLM/mem0）从不在数据库事务里。
+       复查/再入队”多个短事务，外部调用（LLM/记忆后端）从不在数据库事务里。
+       两类 job 写回数据库前都先原子复核租约（threads15 P1 / INV-6/13：
+       外部调用慢于锁超时时任务已被回收换主，过期结果不得落库）。
        memory_sync 复查发现笔记状态已变时删掉本次新增的记忆并再入队
        （按 note 幂等收敛，见 app.pipeline.memory_sync）
     3. 收尾事务（带租约校验，见 finalize_claim）：成功标 done；失败则
@@ -67,8 +70,12 @@ async def run_pending_jobs(
         try:
             await execute_job(claimed.kind, claimed.payload, claim=claimed)
         except Exception as exc:  # noqa: BLE001 队列要兜住所有错误
-            logger.warning("job %s (%s) failed: %s", claimed.id, claimed.kind, exc)
-            await _finalize(maker, claimed, str(exc), retry_delay_seconds, me)
+            # INV-14（threads8 P1，runner.py:71）：异常消息可能内嵌用户内容
+            # （SQLAlchemy StatementError 的 str 默认带 SQL 绑定参数=笔记
+            # 正文），日志与 jobs.last_error 只记类型名+错误码
+            summary = safe_error_text(exc)
+            logger.warning("job %s (%s) failed: %s", claimed.id, claimed.kind, summary)
+            await _finalize(maker, claimed, summary, retry_delay_seconds, me)
             continue
 
         await _finalize(maker, claimed, None, retry_delay_seconds, me)
@@ -76,24 +83,29 @@ async def run_pending_jobs(
 
 
 async def _claim_one(maker: async_sessionmaker[AsyncSession], worker_id: str) -> _Claimed | None:
-    """事务 1：认领一个到期 job（None 表示队列空）。"""
-    async with (
-        maker() as session,
-        session.begin(),
-        claim_next(session, worker_id=worker_id) as job,
-    ):
-        if job is None:
-            return None
-        return _Claimed(
-            id=job.id,
-            kind=job.kind,
-            payload=json.loads(job.payload_json or "{}"),
-            attempts=job.attempts,
-            max_attempts=job.max_attempts,
-            locked_by=job.locked_by or worker_id,
-            # SQLite 读回 naive、PG 读回 aware：统一成 aware UTC 再比较
-            locked_at=as_utc(job.locked_at),
-        )
+    """事务 1：认领一个到期 job（None 表示队列空）。
+
+    不用 session.begin() 上下文管理器：claim_next 的判死路径会中途
+    commit（INV-1，threads11——判死转移（note/sequences 行锁）提交后才
+    找下一个候选），上下文管理器里 commit 后无法继续发语句；这里在
+    claim 上下文退出后自行提交领取写入（判死转移已由 queue 内部提交）。
+    """
+    async with maker() as session:
+        async with claim_next(session, worker_id=worker_id) as job:
+            if job is None:
+                return None
+            claimed = _Claimed(
+                id=job.id,
+                kind=job.kind,
+                payload=json.loads(job.payload_json or "{}"),
+                attempts=job.attempts,
+                max_attempts=job.max_attempts,
+                locked_by=job.locked_by or worker_id,
+                # SQLite 读回 naive、PG 读回 aware：统一成 aware UTC 再比较
+                locked_at=as_utc(job.locked_at),
+            )
+        await session.commit()
+        return claimed
 
 
 async def _finalize(
@@ -123,12 +135,19 @@ async def _finalize(
 async def execute_job(kind: str, payload: dict, *, claim: _Claimed | None = None) -> None:
     """执行一个 job。事务划分由具体实现负责（extract / memory_sync 都是
     多个短事务 + 事务外调用，见各自模块的 docstring）。claim 携带租约
-    凭证：memory_sync 复查时据此确认自己仍是持有者（threads5 P2-1，
-    INV-5 第 3 步/INV-6 的租约栅栏）。"""
+    凭证：两类 job 把外部调用结果写回数据库前都据此原子复核自己仍是
+    持有者（memory_sync 复查/置位自 threads5 P2-1 起，extract 写回自
+    threads15 P1 起，INV-5 第 3 步/INV-6/13 的租约栅栏）。"""
     if kind == "extract":
         from app.pipeline.extract import extract_note
 
-        await extract_note(payload["note_id"], enqueued_rev=payload.get("rev"))
+        await extract_note(
+            payload["note_id"],
+            enqueued_rev=payload.get("rev"),
+            job_id=claim.id if claim is not None else None,
+            worker_id=claim.locked_by if claim is not None else None,
+            locked_at=claim.locked_at if claim is not None else None,
+        )
     elif kind == "memory_sync":
         from app.pipeline.memory_sync import sync_note_memory
 

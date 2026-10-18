@@ -1,5 +1,6 @@
 """jwt_secret 与记忆后端的生产校验：postgresql 下 secret 必须是 >=32
-字节随机值的编码、MEMORY_BACKEND 不能是 inmemory，SQLite 不受影响。"""
+字节随机值的编码、MEMORY_BACKEND 不能是 inmemory（用 mem0 或 disabled），
+SQLite 不受影响。"""
 import base64
 import pathlib
 import secrets
@@ -14,22 +15,16 @@ PG_URL = "postgresql+asyncpg://u:p@localhost/db"
 GOOD_HEX = bytes(range(32)).hex()
 
 
-@pytest.fixture(autouse=True)
-def _assume_mem0ai_installed(monkeypatch):
-    """本机测试环境不装 mem0ai：INV-10.3 的安装探测统一按已安装放行，
-    「未安装」路径由专门用例单独改写探测结果模拟。"""
-    monkeypatch.setattr("app.config._mem0ai_installed", lambda: True)
-
-
 def _pg_settings(**kwargs) -> Settings:
-    """生产形态（postgresql）的合法基线：强 secret + mem0 记忆后端 + 合法 LLM。
+    """生产形态（postgresql）的合法基线：强 secret + disabled 记忆后端 +
+    合法 LLM。
 
     不带 memory_backend 的话会先撞上“生产拒绝 inmemory”的校验（PG 跑
     测试时 conftest 还设置了 ALLOW_INMEMORY_IN_TESTS，行为随运行方式
     漂移），LLM 同理（ALLOW_MOCK_LLM_IN_PROD），显式固定住。
     """
     kwargs.setdefault("jwt_secret", GOOD_HEX)
-    kwargs.setdefault("memory_backend", "mem0")
+    kwargs.setdefault("memory_backend", "disabled")
     kwargs.setdefault("allow_mock_llm_in_prod", True)
     return Settings(database_url=PG_URL, **kwargs)
 
@@ -132,12 +127,15 @@ def test_sqlite_default_secret_ok():
     assert settings.jwt_secret == DEFAULT_JWT_SECRET
 
 
-def test_memory_backend_only_accepts_known_values():
-    """P2：MEMORY_BACKEND 只接受 inmemory|mem0，未知值启动即校验失败。"""
+def test_memory_backend_only_accepts_known_values(monkeypatch):
+    """MEMORY_BACKEND 只接受 inmemory|disabled|mem0；未知值启动即拒。"""
     assert Settings(memory_backend="inmemory").memory_backend == "inmemory"
-    assert Settings(memory_backend="mem0").memory_backend == "mem0"
+    assert Settings(memory_backend="disabled").memory_backend == "disabled"
     with pytest.raises(ValidationError, match="memory_backend"):
         Settings(memory_backend="redis")
+    # mem0 需已安装才过 _require_memory_backend_installed；这里只验枚举
+    monkeypatch.setattr("app.config._mem0ai_installed", lambda: True)
+    assert Settings(memory_backend="mem0").memory_backend == "mem0"
 
 
 def test_production_inmemory_memory_backend_rejected():
@@ -150,6 +148,12 @@ def test_production_inmemory_memory_backend_rejected():
         _pg_settings(memory_backend="inmemory", allow_inmemory_in_tests=False)
 
 
+def test_production_inmemory_rejection_mentions_mem0():
+    """拒绝信息必须指出两条出路：MEMORY_BACKEND=mem0 或 disabled。"""
+    with pytest.raises(ValidationError, match=r"MEMORY_BACKEND=mem0.*MEMORY_BACKEND=disabled"):
+        _pg_settings(memory_backend="inmemory", allow_inmemory_in_tests=False)
+
+
 def test_production_inmemory_with_explicit_test_flag_allowed():
     """ALLOW_INMEMORY_IN_TESTS=true 只为单进程跑 PG 测试套件放行（生产
     不要设；独立 worker 进程无论该标志都拒绝）。"""
@@ -157,8 +161,11 @@ def test_production_inmemory_with_explicit_test_flag_allowed():
     assert settings.memory_backend == "inmemory"
 
 
-def test_production_mem0_memory_backend_ok():
-    assert _pg_settings(memory_backend="mem0").memory_backend == "mem0"
+def test_production_disabled_memory_backend_ok():
+    """threads7：disabled（显式空后端）在任何环境都允许——不需要放行
+    标志（它是显式选择，不是要挡的危险配置）。"""
+    settings = _pg_settings(memory_backend="disabled")
+    assert settings.memory_backend == "disabled"
 
 
 def test_sqlite_inmemory_memory_backend_ok():
@@ -167,43 +174,25 @@ def test_sqlite_inmemory_memory_backend_ok():
     assert settings.memory_backend == "inmemory"
 
 
-def test_env_example_local_default_inmemory_documents_mem0():
-    """threads5 P2-3：模板本地默认 inmemory（本地安装步骤不装 mem0ai，
-    默认 mem0 会让照抄模板的人启动即报错）；mem0 行以注释给出并写明
-    安装命令与单进程局限。"""
+def test_env_example_documents_memory_backend_choices():
+    """模板本地默认 inmemory（单进程局限写明）；mem0/disabled 以注释给出；
+    MEM0_EMBEDDING_* 与 requirements-mem0.txt 安装说明齐全。"""
     env_example = (
         pathlib.Path(__file__).resolve().parent.parent / ".env.example"
     ).read_text(encoding="utf-8")
     lines = [ln.strip() for ln in env_example.splitlines()]
     assert "MEMORY_BACKEND=inmemory" in lines
     assert "# MEMORY_BACKEND=mem0" in lines
-    # 安装命令与单进程局限必须写明（读者据此知道何时切换 mem0）
-    assert any("pip install -r requirements-mem0.txt" in ln for ln in lines)
+    assert "# MEMORY_BACKEND=disabled" in lines
     assert any("单进程" in ln for ln in lines)
-    # mem0 的 embedding/LLM OpenAI 兼容配置有占位说明
-    assert any(ln.startswith("# MEM0_EMBEDDING_BASE_URL=") for ln in lines)
-    assert any(ln.startswith("# MEM0_EMBEDDING_MODEL=") for ln in lines)
-    # threads6 P2 / INV-10.5：独立 embedding 凭据有说明（含回落语义）
-    assert any(ln.startswith("# MEM0_EMBEDDING_API_KEY=") for ln in lines)
-    assert any("回落 LLM_API_KEY" in ln for ln in lines)
-
-
-def test_mem0_backend_missing_mem0ai_rejected_at_startup(monkeypatch):
-    """threads5 P2-3 / INV-10.3：MEMORY_BACKEND=mem0 而未装 mem0ai——启动
-    即报错且错误信息带安装命令（记忆 store 懒构造，不查的话要等第一次
-    /search 才 500）。任何环境生效。"""
-    monkeypatch.setattr("app.config._mem0ai_installed", lambda: False)
-    with pytest.raises(ValidationError, match="requirements-mem0.txt"):
-        _pg_settings(memory_backend="mem0")
-    # SQLite 本地开发同样生效（不是只挡生产）
-    with pytest.raises(ValidationError, match="requirements-mem0.txt"):
-        Settings(database_url="sqlite+aiosqlite:///./app.sqlite3", memory_backend="mem0")
+    assert any("requirements-mem0.txt" in ln for ln in lines)
+    assert any(ln.startswith("# MEM0_EMBEDDING_") for ln in lines)
 
 
 def test_worker_refuses_inmemory_with_postgres():
     """threads5 P2-3 / INV-10.4：独立 worker 进程无论放行标志都拒绝
     inmemory+PG——它写的记忆对 api 进程的 /search 不可见；SQLite 本地
-    开发不受限。"""
+    开发与 disabled（显式空后端，threads7）不受限。"""
     from app.jobs.worker import check_memory_backend_shareable
 
     flagged = Settings(
@@ -219,8 +208,8 @@ def test_worker_refuses_inmemory_with_postgres():
     sqlite = Settings(database_url="sqlite+aiosqlite:///./app.sqlite3", memory_backend="inmemory")
     check_memory_backend_shareable(sqlite)  # SQLite 本地开发：不抛
 
-    mem0 = _pg_settings(memory_backend="mem0")
-    check_memory_backend_shareable(mem0)  # PG + mem0：正常
+    disabled = _pg_settings(memory_backend="disabled")
+    check_memory_backend_shareable(disabled)  # PG + disabled（显式空后端）：不抛
 
 
 def test_get_memory_store_unknown_backend_raises(monkeypatch):
@@ -407,30 +396,482 @@ def test_env_example_documents_new_runtime_flags():
     assert any(ln.startswith("# CORS_ALLOW_ORIGINS=") for ln in lines)
 
 
-def test_mem0_embedding_custom_config_without_key_rejected():
-    """threads6 P2 / INV-10.5：自定义 embedding 源（MEM0_EMBEDDING_BASE_URL /
-    MEM0_EMBEDDING_API_KEY 任一设置）而解析不出凭据（两项 key 都空）——
-    启动即 ValidationError（任何环境），而不是运行期拿空 key 向 embedding
-    源 401。完全共源（都不设置）不受影响。"""
-    # 自定义 base_url，但既没有 embedding key 也没有 LLM key 可回落
-    with pytest.raises(ValidationError, match="MEM0_EMBEDDING"):
-        _pg_settings(
-            mem0_embedding_base_url="https://embed.example.com/v1",
-        )
-    # 只设置 embedding key 本身就是凭据：通过
-    assert (
-        _pg_settings(mem0_embedding_api_key="sk-embed").mem0_embedding_api_key == "sk-embed"
-    )
-    # 自定义 base_url + LLM key 回落：通过（回落链在 mem0_store 侧生效）
-    assert _pg_settings(
-        llm_api_key="sk-llm", mem0_embedding_base_url="https://embed.example.com/v1"
-    ).mem0_embedding_base_url.startswith("https://")
-    # 完全共源（什么都不设置）：校验不介入，LLM key 完备性归 LLM 校验管
-    assert _pg_settings().mem0_embedding_api_key == ""
-    # SQLite 本地开发同样生效（不是只挡生产）
-    with pytest.raises(ValidationError, match="MEM0_EMBEDDING"):
+
+def test_non_positive_numeric_settings_rejected():
+    """threads8 P2 / INV-10.7（config.py:99）：数值配置 0/负值启动即拒，
+    一次性列出**全部**非正字段（WORKER_BATCH_SIZE=0 会让 worker 循环体
+    永不执行而日志一切正常）。任何环境生效。"""
+    with pytest.raises(ValidationError, match="数值配置必须为正") as exc_info:
         Settings(
             database_url="sqlite+aiosqlite:///./app.sqlite3",
-            mem0_embedding_base_url="https://embed.example.com/v1",
-            llm_api_key="",
+            worker_batch_size=0,
+            ask_top_k=-1,
         )
+    msg = str(exc_info.value)
+    assert "WORKER_BATCH_SIZE=0" in msg and "ASK_TOP_K=-1" in msg, msg
+
+    for field, value in (
+        ("access_token_ttl_seconds", 0),
+        ("refresh_token_ttl_days", 0),
+        ("llm_timeout_seconds", 0),
+        ("job_max_attempts", -1),
+        ("job_lock_timeout_seconds", 0),
+        ("worker_poll_interval_seconds", 0),
+    ):
+        with pytest.raises(ValidationError, match="数值配置必须为正"):
+            Settings(database_url="sqlite+aiosqlite:///./app.sqlite3", **{field: value})
+
+
+def test_positive_numeric_settings_defaults_ok():
+    settings = Settings(database_url="sqlite+aiosqlite:///./app.sqlite3")
+    assert settings.worker_batch_size > 0
+    assert settings.job_max_attempts > 0
+    assert settings.ask_top_k > 0
+
+
+def test_database_url_echo_query_rejected():
+    """threads9 / INV-14：DATABASE_URL 的 URL query 会原样传给
+    create_async_engine 当引擎参数——`?echo=true` 静默开 echo，SQL 与绑定
+    参数（笔记正文等用户内容）整体进 sqlalchemy.engine 日志。任何环境
+    （SQLite 开发/测试与 PG 生产 alike）启动即拒；显式关闭的值放行。"""
+    from app.config import DbSettings
+
+    for url in (
+        "sqlite+aiosqlite:///./app.sqlite3?echo=true",
+        "sqlite+aiosqlite:///./app.sqlite3?echo=True",
+        "sqlite+aiosqlite:///./app.sqlite3?echo=1",
+        PG_URL + "?echo=yes",
+    ):
+        with pytest.raises(ValidationError, match="echo"):
+            Settings(database_url=url)
+        with pytest.raises(ValidationError, match="echo"):
+            # init-db 的引擎同样吃 URL query（DbSettings 同款校验）
+            DbSettings(database_url=url)
+
+    for ok in (
+        "sqlite+aiosqlite:///./app.sqlite3",
+        "sqlite+aiosqlite:///./app.sqlite3?echo=false",
+        "sqlite+aiosqlite:///./app.sqlite3?echo=0",
+        "sqlite+aiosqlite:///./app.sqlite3?timeout=30",
+    ):
+        assert Settings(database_url=ok).database_url == ok
+        assert DbSettings(database_url=ok).database_url == ok
+
+
+def test_get_settings_validation_failure_does_not_leak_secret_values(monkeypatch, caplog):
+    """threads10 P1（config.py:68）/ INV-14：启动校验失败的 ConfigError、
+    全链 traceback、uvicorn.error 式日志记录都不含密钥明文——pydantic
+    ValidationError 的 input_value 截断 repr 会露出尾部字段值（jwt_secret
+    / database_url 密码），而 get_settings 跑在中间件挂载之前（api 模块级
+    create_app、worker 模块级 basicConfig），traceback 会整段落进程日志。
+    字段名（MEMORY_BACKEND）与校验文案保留，排障不受损。"""
+    import logging
+    import traceback
+
+    from app.config import ConfigError, get_settings
+
+    secret = "sk-LEAK-MARKER-" + secrets.token_hex(24)
+    monkeypatch.setenv("DATABASE_URL", PG_URL)
+    monkeypatch.setenv("JWT_SECRET", secret)
+    # 让某个 mode="after" 校验失败：生产拓扑拒绝 inmemory。两个放行标志
+    # 必须显式摘掉——PG 测试套件的 conftest 会设置它们（否则行为随运行
+    # 方式漂移）
+    monkeypatch.setenv("MEMORY_BACKEND", "inmemory")
+    monkeypatch.delenv("ALLOW_INMEMORY_IN_TESTS", raising=False)
+    get_settings.cache_clear()
+    try:
+        with pytest.raises(ConfigError) as exc_info:
+            get_settings()
+        exc = exc_info.value
+
+        # 1) 异常消息本身：不含密钥原值，保留字段名/校验文案可排障
+        assert secret not in str(exc)
+        assert PG_URL.split("://", 1)[1] not in str(exc), "database_url 原值不进消息"
+        assert "MEMORY_BACKEND" in str(exc)
+
+        # 2) from None 抑制隐式 __context__：全链 traceback 也没有原
+        #    ValidationError（其 input_value repr 含全部已加载字段值）
+        formatted = "".join(traceback.format_exception(exc))
+        assert secret not in formatted
+        assert "input_value" not in formatted
+
+        # 3) 进程日志出口（uvicorn.error 的 exc_info 记录形态）
+        caplog.clear()
+        with caplog.at_level(logging.ERROR, logger="uvicorn.error"):
+            logging.getLogger("uvicorn.error").error("Application startup failed", exc_info=exc)
+        fmt = logging.Formatter()
+        for record in caplog.records:
+            rendered = fmt.format(record)
+            assert secret not in rendered
+            assert "input_value" not in rendered
+    finally:
+        get_settings.cache_clear()
+
+
+def test_get_db_settings_validation_failure_does_not_leak_database_url(monkeypatch):
+    """同一脱敏边界覆盖 init-db 入口（cli 只走 DbSettings）：URL query 开
+    echo 被拒时，ConfigError 消息只含固定校验文案，不含 URL 原值（内嵌
+    的 PG 密码）。"""
+    from app.config import ConfigError, get_db_settings
+
+    marker = "pa-db-leak-marker"
+    monkeypatch.setenv("DATABASE_URL", f"postgresql+asyncpg://u:{marker}@localhost/db?echo=true")
+    get_db_settings.cache_clear()
+    try:
+        with pytest.raises(ConfigError) as exc_info:
+            get_db_settings()
+        assert marker not in str(exc_info.value)
+        assert "localhost" not in str(exc_info.value), "URL 任何部分都不进消息"
+        assert "echo" in str(exc_info.value), "校验文案保留"
+    finally:
+        get_db_settings.cache_clear()
+
+
+# ---------------------------------------------------------------------------
+# INV-16（threads12 P1）：密钥拼进 URL 前必须 percent-encode。compose 注入
+# 分项 PG* 变量，应用侧 postgres_url_from_env 统一 quote(safe="") 拼接。
+# 测试一律用明显假值，且不打印任何「密码」。
+# ---------------------------------------------------------------------------
+
+
+def test_postgres_url_from_env_encodes_password_special_chars():
+    """单元：密码/用户名含 URI 分隔符（@ : / # % 空格）时，拼出的 URL 经
+    make_url 解析必须还原出原值（SQLAlchemy 按百分号解码 userinfo）。"""
+    from sqlalchemy.engine import make_url
+
+    from app.config import postgres_url_from_env
+
+    # 明显假值：全部 URI 保留字符各来一份
+    fake_password = "p@ss:word/#frag%2 0"
+    fake_user = "us@er"
+    url = postgres_url_from_env(
+        {
+            "PGHOST": "db.internal",
+            "PGPORT": "5433",
+            "PGUSER": fake_user,
+            "PGPASSWORD": fake_password,
+            "PGDATABASE": "agent_db",
+        }
+    )
+    assert url is not None
+    parsed = make_url(url)
+    assert parsed.drivername == "postgresql+asyncpg"
+    assert parsed.username == fake_user, "用户名必须编码后可还原"
+    assert parsed.password == fake_password, "密码必须编码后可还原"
+    assert parsed.host == "db.internal"
+    assert parsed.port == 5433
+    assert parsed.database == "agent_db"
+    # URL 文本里不出现原始密码（只出现其编码形态）
+    assert fake_password not in url
+
+    # 无 PGPASSWORD/PGHOST（触发键）→ None：调用方沿用 DATABASE_URL/默认值
+    assert postgres_url_from_env({"PGPORT": "5432"}) is None
+    assert postgres_url_from_env({}) is None
+    # 缺省项回落到 compose 拓扑默认（personal/postgres:5432/personal_agent）
+    default_url = postgres_url_from_env({"PGPASSWORD": "plain"})
+    assert default_url == "postgresql+asyncpg://personal:plain@postgres:5432/personal_agent"
+
+
+def test_settings_builds_pg_url_from_pg_env_vars(monkeypatch):
+    """PG* 分项变量（构造 kwargs 或真实环境变量）→ database_url 为拼出的
+    PG URL；显式 DATABASE_URL 永远优先（本地 SQLite 开发不受影响）。"""
+    from sqlalchemy.engine import make_url
+
+    from app.config import DbSettings, Settings
+
+    # compose 形态下 DATABASE_URL 不设（或由 environment 置空压过 .env 的
+    # SQLite 默认）；conftest 给测试进程设置的 DATABASE_URL 需先摘掉
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    for key in ("PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE"):
+        monkeypatch.delenv(key, raising=False)
+
+    fake_password = "p%40ss-with:delims/#"
+    # 1) 构造 kwargs（键大小写不敏感——pydantic 字段名是小写）
+    kwargs = {k.lower(): v for k, v in {
+        "PGHOST": "pg1",
+        "PGUSER": "personal",
+        "PGPASSWORD": fake_password,
+        "PGPORT": "5432",
+        "PGDATABASE": "agent",
+    }.items()}
+    db = DbSettings(**kwargs)
+    assert db.database_url.startswith("postgresql+asyncpg://")
+    assert make_url(db.database_url).password == fake_password
+
+    # 2) 真实环境变量（compose 的 environment 注入路径）
+    monkeypatch.setenv("PGHOST", "pg2")
+    monkeypatch.setenv("PGPASSWORD", fake_password)
+    db2 = DbSettings()
+    assert make_url(db2.database_url).password == fake_password
+    assert make_url(db2.database_url).host == "pg2"
+
+    # 3) 显式 database_url 优先：PG* 被忽略（含空串以外的一切显式值）
+    db3 = DbSettings(database_url="sqlite+aiosqlite:///./x.db", pghost="ignored", pgpassword="ignored")
+    assert db3.database_url == "sqlite+aiosqlite:///./x.db"
+
+    # 4) 完整 Settings 同路径（生产形态校验按拼出的 PG URL 生效）
+    settings = Settings(
+        **kwargs,
+        jwt_secret=GOOD_HEX,
+        memory_backend="disabled",
+        llm_provider="openai",
+        llm_api_key="sk-test-only",
+        llm_base_url="https://llm.example.com/v1",
+        llm_model="test-model",
+    )
+    assert make_url(settings.database_url).password == fake_password
+
+
+def test_postgres_url_from_env_missing_password_is_config_error(monkeypatch):
+    """threads14 P2（config.py:357）/ INV-16：PGHOST 在而 PGPASSWORD 缺时
+    不再 KeyError（裸 traceback）——受控 ConfigError 明确报缺（PG 默认值
+    表没有密码项可兜底）；确需 trust 无密码连接时显式 PGPASSWORD="" 合法
+    （空密码段照常拼出、make_url 解析回空串）。"""
+    from sqlalchemy.engine import make_url
+
+    from app.config import ConfigError, DbSettings, postgres_url_from_env
+
+    # 纯函数：只有 PGHOST（触发键）无 PGPASSWORD
+    with pytest.raises(ConfigError, match="PGPASSWORD"):
+        postgres_url_from_env({"PGHOST": "db.internal"})
+
+    # Settings/DbSettings 的 before-validator 同路径：pydantic 不吞非
+    # ValueError，ConfigError 直接出界（与 get_settings 的脱敏出口同型）
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    for key in ("PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE"):
+        monkeypatch.delenv(key, raising=False)
+    with pytest.raises(ConfigError, match="PGPASSWORD"):
+        DbSettings(pghost="db.internal")
+
+    # 显式空串 = 明确的 trust 形态：合法，拼出空密码段
+    url = postgres_url_from_env({"PGHOST": "db.internal", "PGPASSWORD": ""})
+    assert url is not None
+    assert make_url(url).password == ""
+    assert make_url(url).host == "db.internal"
+
+
+
+# ---------------------------------------------------------------------------
+# threads13 P2（config.py:188）/ INV-10.1：LLM_BASE_URL 必须是绝对的
+# http/https URL——非空但畸形的值此前能过「三元组齐备」检查，/healthz
+# 照常报 provider，而每次 extract/ask 都在 httpx 构造请求时才失败。
+# ---------------------------------------------------------------------------
+
+
+def test_openai_malformed_base_url_rejected():
+    """裸主机名、空白、无 scheme、非 http(s) scheme：任何环境启动即拒。"""
+    for bad in (
+        "llm.internal",  # 裸主机名（无 scheme，会被当相对路径）
+        " https://llm.example.com/v1",  # 前导空白
+        "https://llm.example.com/v1 ",  # 尾随空白
+        "https://llm .example.com/v1",  # 内嵌空白
+        "ftp://llm.example.com/v1",  # 非 http(s) scheme
+        "//llm.example.com/v1",  # 协议相对
+        "https://",  # 空 netloc
+        "/v1/api",  # 相对路径
+    ):
+        kwargs = dict(_OPENAI_COMPLETE, llm_base_url=bad)
+        with pytest.raises(ValidationError, match="LLM_BASE_URL"):
+            Settings(database_url="sqlite+aiosqlite:///./app.sqlite3", **kwargs)
+        with pytest.raises(ValidationError, match="LLM_BASE_URL"):
+            _pg_settings(**kwargs)
+
+
+def test_openai_absolute_http_base_url_ok():
+    for ok in (
+        "https://llm.example.com/v1",
+        "http://localhost:8000/v1",
+        "HTTPS://LLM.EXAMPLE.COM",  # urlsplit 规范化 scheme 大小写
+    ):
+        settings = Settings(
+            database_url="sqlite+aiosqlite:///./app.sqlite3",
+            **dict(_OPENAI_COMPLETE, llm_base_url=ok),
+        )
+        assert settings.llm_base_url == ok
+
+
+def test_openai_base_url_without_usable_authority_rejected():
+    """threads14 P2（config.py:236）/ INV-10.1：netloc 非空 ≠ 有可用的
+    HTTP authority——无 hostname（http://user@:80）或端口非法/越界
+    （:notaport / :99999）的值此前能过「绝对 http(s) URL」检查，
+    /healthz 照常报 provider，而每次 extract/ask 都在 OpenAICompatClient
+    构造/发送请求时才失败。端口合法性在 url.port 属性访问时才求值
+    （非法/越界抛 ValueError），必须强制求值再放行。threads15 P2 补：
+    显式 :0 是保留端口，urlsplit 对它放行——同样拒（端口须 ∈ 1..65535）。"""
+    for bad in (
+        "http://user@:80",  # 有 userinfo 无 hostname
+        "http://:8080",  # 空 hostname
+        "https://example.com:notaport",  # 端口非数字（.port 访问时抛 ValueError）
+        "https://example.com:99999",  # 端口越界（.port 访问时抛 ValueError）
+        "https://example.com:0",  # 保留端口 0（threads15 P2：urlsplit 放行，须显式拒）
+    ):
+        kwargs = dict(_OPENAI_COMPLETE, llm_base_url=bad)
+        with pytest.raises(ValidationError, match="LLM_BASE_URL"):
+            Settings(database_url="sqlite+aiosqlite:///./app.sqlite3", **kwargs)
+        with pytest.raises(ValidationError, match="LLM_BASE_URL"):
+            _pg_settings(**kwargs)
+
+    # 显式合法端口照常放行（不被误伤）
+    for ok in ("http://llm.internal:8000/v1", "https://10.0.0.5"):
+        settings = Settings(
+            database_url="sqlite+aiosqlite:///./app.sqlite3",
+            **dict(_OPENAI_COMPLETE, llm_base_url=ok),
+        )
+        assert settings.llm_base_url == ok
+
+
+def test_mock_provider_skips_base_url_shape_check():
+    """LLM_PROVIDER=mock 时 base_url 不参与任何调用，形态不校验（空串
+    默认值必须照常通过，否则本地开发起不来）。"""
+    settings = Settings(database_url="sqlite+aiosqlite:///./app.sqlite3", llm_provider="mock")
+    assert settings.llm_base_url == ""
+
+
+# ---------------------------------------------------------------------------
+# threads13 P2（config.py:248）/ INV-10.7：数值配置的有限上界——+inf/超大
+# 整数过了「必须为正」这一关，却让下游 timedelta/httpx.Timeout 在运行期
+# OverflowError（如 ACCESS_TOKEN_TTL_SECONDS 过大时每次 login 的
+# now + timedelta(...) 抛 OverflowError）。
+# ---------------------------------------------------------------------------
+
+
+def test_oversized_numeric_settings_rejected():
+    """过大 TTL/超时/批量启动即拒（连字段名与上界一起报出），
+    不再等到 login 的 timedelta 处 OverflowError。"""
+    from datetime import timedelta
+
+    with pytest.raises(ValidationError, match="有限上界") as exc_info:
+        Settings(
+            database_url="sqlite+aiosqlite:///./app.sqlite3",
+            access_token_ttl_seconds=10**30,
+            refresh_token_ttl_days=10**20,
+        )
+    msg = str(exc_info.value)
+    assert "ACCESS_TOKEN_TTL_SECONDS" in msg and "REFRESH_TOKEN_TTL_DAYS" in msg, msg
+
+    # 这些值确实是下游 timedelta 的 OverflowError 来源（上界把它们挡在启动期）
+    with pytest.raises(OverflowError):
+        timedelta(seconds=10**30)
+    with pytest.raises(OverflowError):
+        timedelta(days=10**20)
+
+    for field, value in (
+        ("access_token_ttl_seconds", 30 * 86400 + 1),
+        ("refresh_token_ttl_days", 3651),
+        ("llm_timeout_seconds", float("inf")),  # +inf > 任何有限上界
+        ("llm_timeout_seconds", 3601.0),
+        ("job_max_attempts", 10**9),
+        ("job_lock_timeout_seconds", 86401),
+        ("worker_poll_interval_seconds", 10**18),
+        ("worker_batch_size", 10**15),
+        ("ask_top_k", 101),
+    ):
+        with pytest.raises(ValidationError, match="有限上界"):
+            Settings(database_url="sqlite+aiosqlite:///./app.sqlite3", **{field: value})
+
+
+def test_numeric_settings_at_upper_bounds_ok():
+    """恰好等于上界的值放行（上界本身是合法配置，不是被拒值）。"""
+    from datetime import timedelta
+
+    from app.config import _NUMERIC_UPPER_BOUNDS
+
+    kwargs = {
+        "access_token_ttl_seconds": _NUMERIC_UPPER_BOUNDS["ACCESS_TOKEN_TTL_SECONDS"],
+        "refresh_token_ttl_days": _NUMERIC_UPPER_BOUNDS["REFRESH_TOKEN_TTL_DAYS"],
+        "llm_timeout_seconds": _NUMERIC_UPPER_BOUNDS["LLM_TIMEOUT_SECONDS"],
+        "job_max_attempts": _NUMERIC_UPPER_BOUNDS["JOB_MAX_ATTEMPTS"],
+        "job_lock_timeout_seconds": _NUMERIC_UPPER_BOUNDS["JOB_LOCK_TIMEOUT_SECONDS"],
+        "worker_poll_interval_seconds": _NUMERIC_UPPER_BOUNDS["WORKER_POLL_INTERVAL_SECONDS"],
+        "worker_batch_size": _NUMERIC_UPPER_BOUNDS["WORKER_BATCH_SIZE"],
+        "ask_top_k": _NUMERIC_UPPER_BOUNDS["ASK_TOP_K"],
+    }
+    settings = Settings(database_url="sqlite+aiosqlite:///./app.sqlite3", **kwargs)
+    for name, value in kwargs.items():
+        assert getattr(settings, name) == value
+    # TTL 上界值本身都能安全构造 timedelta（下游 login/refresh 的算法）
+    timedelta(
+        seconds=kwargs["access_token_ttl_seconds"], days=kwargs["refresh_token_ttl_days"]
+    )
+
+
+def test_numeric_upper_bounds_table_covers_all_checked_fields():
+    """上界表与「必须为正」清单的字段集合必须一致——新增数值配置漏掉
+    上界表时在这里掉出来（自查清单第 15 条的机械保障）。"""
+    from app.config import _NUMERIC_UPPER_BOUNDS
+
+    settings = Settings(database_url="sqlite+aiosqlite:///./app.sqlite3")
+    checked = {
+        "ACCESS_TOKEN_TTL_SECONDS": settings.access_token_ttl_seconds,
+        "REFRESH_TOKEN_TTL_DAYS": settings.refresh_token_ttl_days,
+        "LLM_TIMEOUT_SECONDS": settings.llm_timeout_seconds,
+        "JOB_MAX_ATTEMPTS": settings.job_max_attempts,
+        "JOB_LOCK_TIMEOUT_SECONDS": settings.job_lock_timeout_seconds,
+        "WORKER_POLL_INTERVAL_SECONDS": settings.worker_poll_interval_seconds,
+        "WORKER_BATCH_SIZE": settings.worker_batch_size,
+        "ASK_TOP_K": settings.ask_top_k,
+    }
+    assert set(_NUMERIC_UPPER_BOUNDS) == set(checked), "两张表必须覆盖同一组字段"
+    # 上界必须有限且为正（float("inf") 当上界等于没设）
+    for name, bound in _NUMERIC_UPPER_BOUNDS.items():
+        assert 0 < bound < float("inf"), name
+
+
+def test_openai_whitespace_only_values_rejected():
+    """threads15 P2（config.py:228）/ INV-10.1：纯空白值不算「已设置」——
+    `"   "` 能过非空检查（bootstrap 报 provider ready），落到请求里才是
+    空 key/空 model。三个字段一律 strip 后判空，报「缺项」固定文案。"""
+    for field in ("llm_api_key", "llm_base_url", "llm_model"):
+        name = {"llm_api_key": "LLM_API_KEY", "llm_base_url": "LLM_BASE_URL", "llm_model": "LLM_MODEL"}[field]
+        for blank in ("   ", "\t\n "):
+            kwargs = dict(_OPENAI_COMPLETE, **{field: blank})
+            with pytest.raises(ValidationError, match=name):
+                Settings(database_url="sqlite+aiosqlite:///./app.sqlite3", **kwargs)
+        with pytest.raises(ValidationError, match=name):
+            _pg_settings(**kwargs)
+
+
+def test_openai_api_key_control_chars_rejected():
+    """threads15 P2（config.py:228）/ INV-10.1：LLM_API_KEY 原样进
+    Authorization 头，含 C0 控制字符（换行=头拆分/注入面）或 DEL 的值
+    要到每次请求发送时才失败。启动期拒绝；错误文案只报问题不报值
+    （INV-14——断言消息里不出现 key 原文）。"""
+    for bad in ("sk-test\nX-Extra: 1", "sk\x00test", "sk-test\x7f", "sk\ttest"):
+        kwargs = dict(_OPENAI_COMPLETE, llm_api_key=bad)
+        with pytest.raises(ValidationError, match="LLM_API_KEY 含 HTTP header 非法控制字符") as ei:
+            Settings(database_url="sqlite+aiosqlite:///./app.sqlite3", **kwargs)
+        assert "sk" not in str(ei.value), "错误消息不得回显 key 原文（INV-14）"
+    # 合法可见 ASCII/非 ASCII 不受影响
+    ok = dict(_OPENAI_COMPLETE, llm_api_key="sk-test-π München")
+    assert Settings(database_url="sqlite+aiosqlite:///./app.sqlite3", **ok).llm_api_key
+
+
+def test_postgres_url_from_env_brackets_ipv6_host():
+    """threads15 P2（config.py:395）/ INV-16：PGHOST 是 IPv6 字面量时必须
+    加方括号再拼 URL——不加括号 make_url 把地址里的冒号当 host:port
+    分隔符，解析直接 ValueError（部署错误拖到建连才炸）。已带括号的
+    不重复加；普通主机名不变。"""
+    from sqlalchemy.engine import make_url
+
+    from app.config import postgres_url_from_env
+
+    url = postgres_url_from_env(
+        {
+            "PGHOST": "2001:db8::10",
+            "PGPORT": "5433",
+            "PGUSER": "personal",
+            "PGPASSWORD": "pa-test-only",
+            "PGDATABASE": "agent_db",
+        }
+    )
+    assert url is not None
+    assert "@[2001:db8::10]:5433/" in url
+    assert make_url(url).host == "2001:db8::10"  # 未加括号时这里就 ValueError
+
+    already = postgres_url_from_env(
+        {"PGHOST": "[2001:db8::10]", "PGPASSWORD": "pa", "PGPORT": "5432"}
+    )
+    assert already == "postgresql+asyncpg://personal:pa@[2001:db8::10]:5432/personal_agent"
+
+    plain = postgres_url_from_env({"PGHOST": "db.internal", "PGPASSWORD": "pa"})
+    assert plain == "postgresql+asyncpg://personal:pa@db.internal:5432/personal_agent"

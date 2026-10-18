@@ -177,3 +177,38 @@ async def test_aware_datetime_boundary_rejected_before_extraction_no_500(client,
     assert detail.json()["status"] == "organized", (
         f"边界内 aware 时间应走完抽取不炸：{detail.json()['status']}"
     )
+
+
+async def test_asr_size_measured_in_utf8_bytes_cjk_rejected(client, user):
+    """threads12 P2（schemas.py:199）/ INV-7：asr 体积上限按 **UTF-8 字节**
+    量测。旧行为 len(json.dumps(...)) 数码点——约 1400 个 CJK 字符的 asr
+    只有 ~1400 个码点却占 ~4.2KB 字节，落库/日志的实际负担翻三倍不被
+    拦截。对照：接近上限但按字节仍在界内的 ASCII asr 正常 202。"""
+    import json as jsonlib
+
+    headers = auth_headers(user)
+
+    # 1400 个 CJK 字符：码点数 < 4096，但 UTF-8 字节数（含 JSON 括号）> 4096
+    cjk_text = "超" * 1400
+    assert len(jsonlib.dumps({"v": cjk_text}, ensure_ascii=False)) < 4096
+    assert len(jsonlib.dumps({"v": cjk_text}, ensure_ascii=False).encode("utf-8")) > 4096
+    over = await client.post(
+        "/v1/notes",
+        content=jsonlib.dumps(
+            {"client_note_id": str(uuid.uuid4()), "text": "hi", "asr": {"v": cjk_text}}
+        ).encode("utf-8"),
+        headers={**headers, "content-type": "application/json"},
+    )
+    assert over.status_code in _4XX, (over.status_code, over.text)
+
+    # 边界对照：接近 4096 字节的纯 ASCII asr 正常通过
+    ascii_pad = "a" * 4060
+    assert len(jsonlib.dumps({"v": ascii_pad}).encode("utf-8")) > 4000
+    ok = await client.post(
+        "/v1/notes",
+        content=jsonlib.dumps(
+            {"client_note_id": str(uuid.uuid4()), "text": "hi", "asr": {"v": ascii_pad}}
+        ).encode("utf-8"),
+        headers={**headers, "content-type": "application/json"},
+    )
+    assert ok.status_code == 202, (ok.status_code, ok.text)

@@ -45,3 +45,45 @@ async def test_cors_enabled_when_origins_configured(monkeypatch):
             },
         )
     assert resp.headers.get("access-control-allow-origin") == "https://notes.example.com"
+
+
+# ---------------------------------------------------------------------------
+# threads13 P1 / INV-17（main.py:106）：/healthz 曾挂在模块级 singleton 上
+# （`app = create_app()` 之后的装饰器）——工厂返回后装饰器才执行，
+# uvicorn --factory / 测试用 create_app() 另建的 app 对 /healthz 是 404。
+# ---------------------------------------------------------------------------
+
+
+async def test_healthz_registered_on_factory_created_app():
+    """工厂另建的 app 必须自带探针：GET /healthz → 200（DB 可达时）。"""
+    app = create_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.get("/healthz")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["db"] is True
+
+
+def test_factory_and_module_apps_expose_identical_routes():
+    """类扫（threads13）：模块级 app 与工厂另建 app 的路由面必须完全一致
+    ——未来任何「挂在模块级 singleton」上的路由/探针都会在这里掉出来。"""
+    from app import main
+
+    def route_face(a) -> list:
+        # FastAPI >= 0.143 的 include_router 保留为 _IncludedRouter 包装
+        # （顶层 routes 不再平铺），effective_candidates() 展开成带最终
+        # path/methods 的路由；旧版平铺形态走 fallback
+        def expand(routes):
+            for r in routes:
+                candidates = getattr(r, "effective_candidates", None)
+                if callable(candidates):
+                    yield from expand(candidates())
+                else:
+                    yield (r.path, tuple(sorted(getattr(r, "methods", None) or ())))
+
+        return sorted(expand(a.routes))
+
+    module_face = route_face(main.app)
+    assert any(path == "/healthz" for path, _ in module_face), "模块级 app 必须有 /healthz"
+    assert route_face(create_app()) == module_face

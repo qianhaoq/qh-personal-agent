@@ -14,6 +14,10 @@ from app.models import Device, User
 class AuthContext:
     user_id: str
     device_id: str
+    # 请求 access JWT 的 gen claim（get_auth 已校验它等于校验时刻的设备代）。
+    # 持锁写路径（logout）据此在锁内复验代际是否仍然成立（threads15 P1 /
+    # INV-8/13）：get_auth 是独立短会话，等锁期间设备可能已被吊销/复活换代
+    credential_generation: int
 
 
 async def get_auth(request: Request) -> AuthContext:
@@ -44,7 +48,16 @@ async def get_auth(request: Request) -> AuthContext:
         device = await session.get(Device, device_id)
         if device is None or device.revoked_at is not None:
             raise ApiError(401, "unauthorized", "device revoked")
-    return AuthContext(user_id=user_id, device_id=device_id)
+        # INV-8 陈述 4（threads12 P1）：吊销后同设备再登录会复活设备并把
+        # 代 +1——吊销前签发的 access（gen 落后于当前代）不得随之回魂。
+        # 与 revoked 校验同型：只做等值比对、无吊销副作用
+        if payload.get("gen") != device.credential_generation:
+            raise ApiError(401, "unauthorized", "stale device credentials")
+    return AuthContext(
+        user_id=user_id,
+        device_id=device_id,
+        credential_generation=payload["gen"],
+    )
 
 
 async def get_current_user_id(auth: AuthContext = Depends(get_auth)) -> str:

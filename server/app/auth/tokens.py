@@ -15,13 +15,19 @@ def hash_refresh_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-def create_access_token(user_id: str, device_id: str) -> tuple[str, int]:
+def create_access_token(
+    user_id: str, device_id: str, credential_generation: int
+) -> tuple[str, int]:
+    """gen claim 携带签发时的设备凭证代（INV-8 陈述 4，threads12 P1）：
+    get_auth 校验它与 devices.credential_generation 一致——吊销后同设备
+    再登录（复活 +1 代），吊销前签发的 access 不得随之回魂。"""
     settings = get_settings()
     now = datetime.now(UTC)
     expires_in = settings.access_token_ttl_seconds
     payload = {
         "sub": user_id,
         "did": device_id,
+        "gen": credential_generation,
         "iat": now,
         "exp": now + timedelta(seconds=expires_in),
         "typ": "access",

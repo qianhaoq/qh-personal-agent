@@ -1,4 +1,5 @@
 """FastAPI 入口。"""
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -15,7 +16,19 @@ from app.errors import (
     unhandled_exception_handler,
     validation_exception_handler,
 )
-from app.middleware import NulRejectMiddleware
+from app.logs import harden_third_party_loggers
+from app.middleware import (
+    AccessLogMiddleware,
+    NulRejectMiddleware,
+    SafeErrorFallbackMiddleware,
+)
+
+# healthz DB 探测的应用层超时（threads14 P2，main.py:118）：连接建立或
+# SELECT 1 卡住（而非立即抛错）时，驱动自身的超时远长于探针周期——
+# compose 健康检查 5s 放弃、10s 一轮，挂起的服务端探测请求会跨轮累积
+# 占住连接尝试。上界必须短于探针超时，到点即按 db_ok=False 降级 503
+# （wait_for 同时取消被卡的探测协程）
+_HEALTHZ_DB_TIMEOUT_SECONDS = 2.5
 
 
 @asynccontextmanager
@@ -36,6 +49,9 @@ def create_app() -> FastAPI:
       全部接口面（含鉴权细节）公开给扫描器）；本地开发设 true 查看；
     - CORS_ALLOW_ORIGINS 为空时不挂 CORS 中间件：原生 App 不走浏览器
       跨域，默认多开一个来源就多一分配置出错的面。
+
+    一切注册（路由含 /healthz 探针、中间件、exception handler、lifespan）
+    都在本工厂内完成（INV-17，threads13）；模块级只保留 `app = create_app()`。
     """
     settings = get_settings()
     docs_enabled = settings.enable_docs
@@ -55,6 +71,16 @@ def create_app() -> FastAPI:
     app.add_exception_handler(RecursionError, recursion_error_handler)
     app.add_exception_handler(Exception, unhandled_exception_handler)
 
+    # 中间件（add 顺序 = 由外到内；INV-14 框架层，threads9）：
+    # - AccessLog 最外：模板级访问日志（uvicorn access log 已在 compose/
+    #   Dockerfile 关闭——请求行含完整 query），兜底 500 的响应也经过
+    #   它的 send 包装，status/耗时照常记录
+    # - SafeErrorFallback 次外：未处理异常最后防线——ServerErrorMiddleware
+    #   调完 Exception handler 后总是 re-raise（traceback 原文进
+    #   uvicorn.error），这里在它内侧把异常吞掉，uvicorn 永远收不到
+    # - NulReject / CORS 保持原有内外关系
+    app.add_middleware(AccessLogMiddleware)
+    app.add_middleware(SafeErrorFallbackMiddleware)
     # NUL 拒绝中间件（INV-7）：path/query 解码后含 \x00 → 422，不进路由
     app.add_middleware(NulRejectMiddleware)
 
@@ -78,30 +104,48 @@ def create_app() -> FastAPI:
     app.include_router(notes.router)
     app.include_router(sync.router)
     app.include_router(ask.router)
+
+    # 第三方 HTTP 客户端库的 logger 钉 >= WARNING（INV-14 框架层，threads9）；
+    # worker 进程在 app/jobs/worker.py 的 basicConfig 之后另行调用
+    harden_third_party_loggers()
+
+    # 探针（threads13 P1 / INV-17，main.py:106）：/healthz 必须在工厂内注册
+    # ——此前挂在模块级 singleton 上（`app = create_app()` 之后的装饰器），
+    # create_app() 返回时装饰器尚未执行，uvicorn --factory 或测试用工厂
+    # 另建的 app 只有 404，而其余路由齐全
+    @app.get("/healthz", tags=["health"])
+    async def healthz():
+        from fastapi.responses import JSONResponse
+
+        db_ok = True
+        try:
+            # threads14 P2（main.py:118）：探测整体套应用层超时——卡住
+            # （连接挂起/查询无响应）与抛错同按 db_ok=False 降级 503，
+            # 不等驱动的长超时
+            await asyncio.wait_for(_db_probe(), timeout=_HEALTHZ_DB_TIMEOUT_SECONDS)
+        except Exception:  # noqa: BLE001 健康检查必须兜住一切异常（含超时），返回降级状态而不是 500
+            db_ok = False
+        body = {"ok": db_ok, "db": db_ok, "llm": _llm_status()}
+        if not db_ok:
+            # 依赖数据库健康检查的负载均衡器据此摘除实例
+            return JSONResponse(status_code=503, content=body)
+        return body
+
     return app
 
 
 app = create_app()
 
 
-@app.get("/healthz", tags=["health"])
-async def healthz():
-    from fastapi.responses import JSONResponse
+async def _db_probe() -> None:
+    """healthz 的数据库探测（threads14 P2 拆出：整段连接+查询作为一个
+    可等待单元，供 healthz 套 wait_for 应用层超时）。"""
     from sqlalchemy import text
 
     from app.db import get_engine
 
-    db_ok = True
-    try:
-        async with get_engine().connect() as conn:
-            await conn.execute(text("SELECT 1"))
-    except Exception:  # noqa: BLE001 健康检查必须兜住一切异常，返回降级状态而不是 500
-        db_ok = False
-    body = {"ok": db_ok, "db": db_ok, "llm": _llm_status()}
-    if not db_ok:
-        # 依赖数据库健康检查的负载均衡器据此摘除实例
-        return JSONResponse(status_code=503, content=body)
-    return body
+    async with get_engine().connect() as conn:
+        await conn.execute(text("SELECT 1"))
 
 
 def _llm_status() -> str:

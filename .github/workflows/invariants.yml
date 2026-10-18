@@ -20,7 +20,7 @@ permissions:
 jobs:
   invariants:
     name: Invariant Check (non-required)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 5
     permissions:
       contents: read
@@ -30,13 +30,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
+      - name: Ensure python3
+        run: python3 --version && which python3
 
       - name: Checker unit tests
-        run: python -m unittest discover -s scripts/tests -v
+        run: python3 -m unittest discover -s scripts/tests -v
 
       - name: check-invariants
-        run: python scripts/check-invariants.py .
+        run: python3 scripts/check-invariants.py .

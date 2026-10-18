@@ -1,6 +1,6 @@
 # Agent 反复踩的坑（server）
 
-> **事实来源**：服务端不变量以 [docs/server-invariants.md](server-invariants.md)（INV-1..INV-10，随 PR #2 落地，#2 head `a220dd4` 起已有）为准。与本文冲突时以它为准，并回来改本文。本文只收集“同一类问题被 Codex 反复提出”的模式和正反例，**不另立新的不变量**。
+> **事实来源**：服务端不变量以 [docs/server-invariants.md](server-invariants.md)（全部 INV，当前 INV-1..INV-17，随 PR #2 起逐轮扩写）为准。与本文冲突时以它为准，并回来改本文。本文只收集“同一类问题被 Codex 反复提出”的模式和正反例，**不另立新的不变量**。
 >
 > `scripts/check-invariants.py` 是 **best-effort 启发式，精确优先于召回**：只标少数高置信度的写法，不证明代码满足不变量。CI 里的 check 名是 **`Invariant Check (non-required)`**（独立的 `Invariants` workflow，不是必需检查）。
 > - 漏检按 `P2: defer — heuristic checker; PG concurrency tests + human/Codex review are the backstop` Resolve。
@@ -49,15 +49,28 @@ res = await session.execute(update(InviteCode)
 
 怎么被发现的：Codex 第 1、3、4、5 轮在 notes、auth 的不同函数里各提了一次。**修一个就把同类全修**：`rg "session.get\(|scalar_one_or_none" server/app` 逐个看有没有“读后写”。
 
+「读到行」不等于「锁到行」的子类（threads11 P1，auth.py:394 logout）：无锁普通读（`session.get(Device)`）只建立**快照**，不与并发写串行化——随后的 `DELETE FROM refresh_tokens` 沿用读时刻快照，看不到同设备并发 login/refresh **已插入未提交**的新 token 行，204 返回后新签发的 token 仍有效。删除/作废一批从属行之前，先按锁序取父行锁（`_lock_device`，device → refresh_tokens，INV-1/8），DELETE 才必然看到先行事务已提交的全部行。
+
+```python
+# 错：无锁读 + 快照内 DELETE，漏掉并发登录未提交的新行
+device = await session.get(Device, auth.device_id)
+await session.execute(delete(RefreshToken).where(RefreshToken.device_id == auth.device_id))
+# 对：先锁父行（PG FOR UPDATE），与同设备 login/refresh 串行化后再删
+device = await _lock_device(session, auth.device_id)
+await session.execute(delete(RefreshToken).where(RefreshToken.device_id == auth.device_id))
+```
+
 ## 2. Job 收尾带租约（INV-2、INV-6） <a id="jobs"></a>
 
-收尾必须带租约条件 `status='running' AND locked_by=:me AND locked_at=:claimed`，被换主的旧 worker 一律放弃收尾。判死条件是 `attempts >= max_attempts`（attempts 是已经用掉的次数），`max_attempts` 从配置读取。extract 与 memory_sync 两种 job 的收尾差异见 INV-6，本文不另作规定。
+收尾必须带租约条件 `status='running' AND locked_by=:me AND locked_at=:claimed`，被换主的旧 worker 一律放弃收尾。**「收尾」不只是 finalize**：长外部调用（LLM/记忆后端）之后把结果写回数据库的事务（threads15 P1，extract 的 `_apply_extraction`）同样要先原子复核这一三元组（`queue.lease_still_held`）——判死路径**不动 note rev**，业务行版本栅栏（rev）挡不住「复活慢 worker 的迟到写回」：判死把 note 标 failed 后，旧 worker 迟到的有效结果照样把 note 写回 organized、建提醒、入队 memory_sync。判死条件是 `attempts >= max_attempts`（attempts 是已经用掉的次数），`max_attempts` 从配置读取。extract 与 memory_sync 两种 job 的收尾差异见 INV-6，本文不另作规定。
 
-怎么被发现的：第 2~5 轮在 queue/runner 里连续出现。
+怎么被发现的：第 2~5 轮在 queue/runner 里连续出现；threads15 是第 12 轮（写回栅栏缺失，rev 栅栏的盲区）。
 
 ## 3. 外部输入在边界校验（INV-7、INV-10；机检 INV-NUL） <a id="inv-nul"></a>
 
 所有外部字符串（body、query、path、header 派生值）都拒绝 `\x00`，在 schema 层返回 422。时区用 `ZoneInfo` 校验并限制长度。配置项（DEFAULT_TIMEZONE、LLM 配置、JWT 密钥）在启动时校验，不对就拒绝启动。
+
+确定性实现的内部解析面同一原则（threads8 数量上界、threads9 位数上界、threads11 时分秒范围）：MockLLM 这类**确定性**实现里，任何「解析外部自然语言」的分支（数量、位数、时钟时分秒）遇病态值一律返回 None（不出提醒/派生物），绝不让异常上抛——重试是确定性的，每次都炸，最后把本来有效的笔记标 failed。越界判定写在 `replace(hour=/minute=/second=)` 之前，而不是靠钳位把垃圾值圆成一条错误提醒（`min(hour, 23)` 会把「99点」当 23:00）。
 
 ```python
 # 错：/v1/notes/n%00x 触发 PG 编码错误，返回 500
@@ -114,6 +127,8 @@ await s.execute(update(Note).where(Note.id == nid).values(change_seq=seq))
 - `allocate_seq` 嵌在 `update(...).values()` 里，且这个 `.values()` 还写了其他业务列。
 - 只按源码顺序判断、不做控制流分析：在调用 `allocate_seq(sess)` 的同一事务里，之后又出现同一 session 的 `sess.add/add_all/merge/delete/execute(DML)`（只写 change_seq/updated_at 的 UPDATE 除外）或 `enqueue(sess, …)`。遇到 `sess.commit()/rollback()` 或离开 `with … begin()` 块就停止检查。
 
+「之后又出现 DML」在循环里的形态（threads11 P1，queue.py:182）：claim 循环判死一个过期 job（`_fail_expired`：job → note → **allocate_seq**）后不提交、继续找下一个候选——同一事务里拿着 sequences 锁再去锁下一个 job/note，与并发 PATCH（先持 note 锁、正等 sequences）构成 AB-BA。**拿了 sequences 锁的事务就该去提交了**；循环里每完成一次「判死转移」立即 commit 再进下一轮。
+
 ## 8. sync：单快照 + 前缀 cursor（依赖 INV-1；无单独 INV） <a id="sync"></a>
 
 一页的选择用一条语句完成（UNION ALL），PG 上用 REPEATABLE READ 并另开会话；cursor 只取页尾记录的 seq；依赖 #7（提交顺序 = 分配顺序）。
@@ -125,3 +140,147 @@ await s.execute(update(Note).where(Note.id == nid).values(change_seq=seq))
 ## 10. 并发相关的改动必须在 PG 上测（server-invariants.md §5 测试计划） <a id="pg"></a>
 
 SQLite 是单写者，行锁、SKIP LOCKED、快照隔离在 SQLite 上都“自动正确”。PR #2 里 sync 快照、回收卡死 job、收尾 rev 这三个 P1 都只在 PG 上成立。并发敏感的改动必须有能在 `PG Tests` job 中真正并发跑的测试，缺失按 P1 报。
+
+## 11. 异常原文与用户内容不落**任何**日志面（INV-14；机检 INV-NO-RAW-EXC） <a id="no-raw-exc"></a>
+
+应用代码里 `str(exc)` / f-string 插值 / `exc_info=True` 不进日志、DB 错误字段、错误响应——只记类型名 + 错误码（`app/errors.py::safe_error_text`）。**框架层同样会替你打日志**，这些口子应用代码看不见，必须专门收口（threads9 三个 P1 都出在这里）：
+
+```python
+# 错：消息文本可能内嵌 SQL 绑定参数（StatementError 的 str() 带笔记正文）或用户输入
+logger.error("organize failed: %s", exc)                    # str(exc) 整段进日志
+last_error = f"job failed: {exc}"                            # 原文落 jobs.last_error
+# 对：类型名 + 粗粒度错误码
+logger.error("organize failed: %s", safe_error_text(exc))
+job.last_error = safe_error_text(exc)
+```
+
+框架层的口子与收口：
+
+- **uvicorn access log**（默认开）：请求行含完整 query——`GET /v1/search?q=<笔记正文>` 整行进 stdout。收口：compose 与 Dockerfile 的 uvicorn 命令一律 `--no-access-log`，**README/docs 的文档示例命令同口径**（threads10 P1：照文档起步的本地开发照样把 query 打进终端）；请求级日志用 `app/middleware.py::AccessLogMiddleware`，只记 method、路由模板、status、耗时，不记 query 与路径参数原值。
+- **ServerErrorMiddleware 必 re-raise**：注册 `Exception` handler 只消毒响应体，Starlette 调完 handler 后总是 re-raise，原始 traceback 进 uvicorn.error 日志。收口：最外层 `SafeErrorFallbackMiddleware` 吞掉异常——记 `safe_error_text`、回固定 500、**永不 re-raise**。
+- **SQLAlchemy echo / 第三方 logger**：`DATABASE_URL` 的 URL query 带 `echo=true` 会让引擎把 SQL+绑定参数打进 sqlalchemy.engine 日志（config 启动即拒）；httpx/httpcore/openai 的 logger 钉 >= WARNING（`app/logs.py::harden_third_party_loggers`，create_app 与 worker main 都要调）。
+- **422 的 msg 本身也是回显面**（threads10 P1）：`validation_exception_handler` 剥掉 `input`/`ctx`，但返回的 `msg` 若在校验器里 f-string 插了用户输入原值，照样回显。校验器 ValueError 一律固定文案：
+
+  ```python
+  # 错：用户提交的 timezone 原值进 422 msg
+  raise ValueError(f"timezone 必须是合法 IANA 时区名：{value}")
+  # 对：固定文案，不插值
+  raise ValueError("timezone 必须是合法 IANA 时区名")
+  ```
+
+- **启动校验异常带密钥明文**（threads10 P1）：`get_settings()` 在模块 import 期跑（api/worker），中间件还没挂上；pydantic ValidationError 的 `input_value` 截断 repr 会露出**尾部**字段的值（实测消息末尾原样出现 `'jwt_secret': '<密钥尾部明文>'` 形态的片段——不要把任何类密钥形态的示例串写进文档/代码/输出，哪怕是编造的），traceback 整段落 uvicorn/进程日志。收口：`get_settings`/`get_db_settings` 边界捕获 ValidationError → 转只含 loc/msg/type 的 `ConfigError`，`from None` 抑制隐式 `__context__` 链（否则原 ValidationError 仍随链式 traceback 打出）。SecretStr 只护 repr、不覆盖 `database_url` 的 password 部分，不采用（决策见 server-invariants.md「为什么」表）。
+- **构建上下文也是泄漏面**：无 `.dockerignore` 时 `server/.env`（密钥）与本地 SQLite 笔记库会整体发给 builder——Dockerfile 不 COPY 也拦不住上下文传输。
+
+机检 `INV-NO-RAW-EXC`：`except ... as e` 绑定的名字裸流进 logger 调用（含 `str(e)`/`repr(e)`/f-string 插值/`'%s' % e`/切片）、`logger.exception(...)`、`exc_info=<真值>`、或赋给 *error* 命名的属性（`last_error` 等）。`safe_error_text(e)` 这类 sanitizer 包装放行。
+
+## 12. 等锁之后重算派生值（INV-13） <a id="recompute-after-lock"></a>
+
+拿到锁才做的判定，不能用等锁**之前**算好的值。两个被 Codex 抓到的真实形态（threads9 P1，都在 auth.py 的 login）：
+
+```python
+# 错 1：邀请码抢占输方 rollback 重读后，仍拿等锁前的 now 判过期
+#       → 等待期间跨过 expires_at 的邀请被接受、登录赢家账号
+invite = await session.get(InviteCode, code)     # rollback 后重读，行值是新的
+if invite.expires_at <= now:                     # 错：now 是等锁前取的
+    raise ApiError(403, ...)
+# 对：重读之后重取
+now = utcnow()
+if invite.expires_at <= now: ...
+
+# 错 2：_token_pair 在 device upsert（行锁等待窗口）之前调用
+#       → 短 ACCESS_TOKEN_TTL + 长等锁，返回的 access token 到手即过期
+result = _token_pair(user_id, device_id)         # iat/exp 在锁前定下
+await session.execute(_device_upsert(...))       # 在这里等锁
+# 对：先 upsert（锁落定 + rowcount 复查），再 now = utcnow()、再 _token_pair、
+#     再 _append_refresh_token（refresh 路径一直是这个顺序）
+
+# 错 3：只信条件 UPDATE 的 rowcount==1 就认为时间谓词仍然成立
+#       → PG READ COMMITTED 等锁后用等待前绑定的 now 参数重评谓词，
+#         等待期间跨过 expires_at 的邀请码照样抢占成功（threads10 P1）
+claimed = await session.execute(update(InviteCode).where(...))
+if claimed.rowcount == 1:
+    return True                                   # 错：谓词里的 now 是等锁前绑定的
+# 对：rowcount==1（仍持行锁）后标量列重读 expires_at + 重取 utcnow() 复验，
+#     过期 → rollback 本次 claim + 403；行值谓词（used/owner/rev）由 UPDATE
+#     原子判定无此问题，只有墙钟绑定参数会陈旧
+
+# 错 4：先锁设备再签凭证的路径，上游过期只在上游锁点验过一次
+#       → login 的 invite 过期判定全部发生在等 device 行锁之前（首用的
+#         claim 复验也恰好在其后的 device 等锁之前），等锁期间跨过
+#         expires_at 的邀请码照样发证（threads14 P1，首用/既有 owner 双路径）
+upserted = await session.execute(_device_upsert(...))  # 在这里等锁
+now = utcnow()
+result = _token_pair(user_id, device_id, gen)     # 错：invite 没用新 now 复验
+# 对：锁落定、now 重取之后、_token_pair 之前，标量列重读 invite.expires_at
+#     用新 now 复验；过期 → rollback 本次登录事务（upsert/claim/建号一并
+#     撤销）+ 403——「上游验证过」不豁免「本锁点签发前」的最后一验
+
+# 错 5：鉴权在独立短会话里验过、持锁写入时不复验凭证代际/吊销态
+#       → logout 的 get_auth 过了 gen=N，等 device 行锁期间 reuse 吊销
+#         + 再登录复活换代（N→N+2），持锁后直接 DELETE 会删掉新代会话
+#         的全部 refresh 行（threads15 P1，auth.py:465）
+device = await _lock_device(session, auth.device_id)
+await session.execute(delete(RefreshToken).where(...))   # 错：代际/吊销没复验
+# 对：AuthContext 携带 JWT 的 gen claim，锁内复验
+#     device.credential_generation == auth.credential_generation 且
+#     device.revoked_at is None 才删；跨代/已吊销 → 不删、幂等 204
+```
+
+签发类时间戳同属此类（threads10）：租约 `locked_at` 是签发时刻，取写入时刻的 `utcnow()` 而非 claim 循环起点——等锁消耗的时间等量缩短租约，活 worker 越早被误判失灵。
+
+排查手法：`rg "with_for_update|pg_advisory|on_conflict|rowcount" server/app` 列出全部等待窗口，逐点问「锁后用于决策的 now / 计数 / 过期判定 / iat·exp，是锁内取的还是等锁前的？claim **成功之后**还要不要用成功时刻的 now 再验一次过期？**先锁设备再签凭证的路径，发证前要不要用锁后新 now 再验一次上游过期（invite）**？**鉴权/claim 在别的会话或等锁前验过的状态（凭证代际、吊销态、租约），本锁点写入前要不要锁内重读复验**？签发的时间戳（locked_at、iat/exp）取的是写入时刻还是请求/循环起点？」纯展示时间戳与方向保守的判定可以豁免但必须注释论证；全仓锁点表见 server-invariants.md INV-13。
+
+## 13. 密钥拼进 URL 必须先 percent-encode（INV-16） <a id="url-encode"></a>
+
+密码不是合法的 URL 字符。`@ : / # % ?` 与空格在 URL 里都是分隔符/保留字——原样插值后解析器拆错组件，认证用错凭据，连接失败且报错不指向真实原因（threads12 P1：compose 三个服务 `${POSTGRES_PASSWORD}` 原样进 DATABASE_URL，密码含 `@` 时 migrate 连不上、api/worker 永不启动）。
+
+```yaml
+# 错：密码含 @ : / # 时，SQLAlchemy 把主机/库名拆进密码、密码拆错位置
+environment:
+  DATABASE_URL: postgresql+asyncpg://personal:${POSTGRES_PASSWORD}@postgres:5432/personal_agent
+```
+
+```yaml
+# 对（本仓形态）：compose 只透传分项变量，应用侧统一 quote(safe="") 拼接
+environment:
+  PGUSER: personal
+  PGPASSWORD: ${POSTGRES_PASSWORD}   # 原值，不进 URL
+  PGHOST: postgres
+  PGPORT: "5432"
+  PGDATABASE: personal_agent
+```
+
+```python
+# 对：唯一拼接点（app/config.py::postgres_url_from_env），可单测
+from urllib.parse import quote
+url = f"postgresql+asyncpg://{quote(user, safe='')}:{quote(password, safe='')}@{host}:{port}/{db}"
+# 注意用 quote(safe="") 而不是 quote_plus：quote_plus 把空格编成 "+"，
+# 而 SQLAlchemy make_url 只按百分号解码、不把 "+" 还原成空格——含空格的密码往返就错
+```
+
+规则（INV-16）：任何把密钥拼进 DATABASE_URL/REDIS_URL/DSN/connection string 的代码（compose、脚本、文档示例）都适用——优先分项环境变量 + 应用侧拼接；必须拼时 userinfo 先 `quote(x, safe="")`（不是 `quote_plus`：`+` 与空格的往返差异见上）。反过来写的对照测试用 `make_url(url).password == 原值` 断言往返。分项变量**须成套**（threads14 P2）：触发拼接的键在而密码缺时，别让默认值表替操作者「猜」一个空密码——明确 ConfigError 报缺（静默把忘配的密码当 trust 放行会掩盖部署错误）；trust 无密码连接是合法形态，显式设 `PGPASSWORD=""` 即可。密码永远不进日志/错误消息（INV-14）。
+
+## 14. 吊销/复活的凭证要有代际 fence（INV-8 陈述 4） <a id="generation-fence"></a>
+
+「吊销」一旦可以被后续登录**复活**，只清 revoked 位是不够的：吊销前签发的凭证会整体回魂，而被吊销的旧凭证重放还会把新会话再吊销一遍（threads12 P1，auth.py:82）。
+
+```python
+# 错：复活 = 无条件清吊销位
+set_={"revoked_at": None, ...}
+# 后果 1：吊销前签发、未过期的 access JWT 重新通过 get_auth（只看 revoked_at）
+# 后果 2：保留作重放证据的旧 refresh 行被重放 → 复用吊销分支 → 新会话又被吊销，
+#         连环发生直到旧行自然过期——被盗 token 可以无限 DoS 该设备的每次重新登录
+```
+
+```python
+# 对：整型代际（credential_generation），只在吊销与真复活时 +1
+set_={"revoked_at": None,
+      "credential_generation": case(
+          (Device.revoked_at.is_not(None), Device.credential_generation + 1),  # 真复活才换代
+          else_=Device.credential_generation), ...}   # 普通再登录不动代（并发 200 的 token 不得互相失效）
+# access JWT 带 gen claim；refresh 行带签发时的代（创建后不可变）
+# get_auth / refresh 校验 token 的代 == 设备当前代：
+#   不一致 → 普通 401，不轮换、不吊销 —— 旧代凭证不复活、也不能连环吊销新会话
+```
+
+要点：+1 的位置必须**原子**（在 upsert 的 DO UPDATE / 持 device 锁的事务里判定 `revoked_at` 非空），否则并发复活登录会多次换代或漏换；签发要绑的代在锁内重读（INV-13）。logout 不动代（登出本就删全部行、access 自然过期，是既有语义不是漏修）。
