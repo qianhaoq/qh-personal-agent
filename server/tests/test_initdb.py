@@ -140,13 +140,13 @@ async def test_init_db_pg_with_mem0_backend_bootstraps_mem0_schema(monkeypatch):
     from app.db import init_db
 
     monkeypatch.setenv("MEMORY_BACKEND", "mem0")
-    monkeypatch.setenv("MEM0_EMBEDDING_DIMS", "3072")
+    monkeypatch.setenv("MEM0_EMBEDDING_DIMS", "1024")
     engine = _fake_initdb_engine(monkeypatch, "postgresql+asyncpg://u:p@db/x")
     await init_db()
     joined = "\n".join(engine.log)
     assert any("pg_advisory_xact_lock" in s for s in engine.log)
     assert "CREATE EXTENSION IF NOT EXISTS vector" in joined
-    assert "vector(3072)" in joined, "建表维度须与 MEM0_EMBEDDING_DIMS 一致"
+    assert "vector(1024)" in joined, "建表维度须与 MEM0_EMBEDDING_DIMS 一致"
     assert "vector_cosine_ops" in joined  # HNSW
     assert "to_tsvector('simple', payload->>'text_lemmatized')" in joined  # GIN
     create_all_at = next(i for i, s in enumerate(engine.log) if s.startswith("run_sync:"))
@@ -185,3 +185,23 @@ async def test_init_db_sqlite_with_mem0_env_skips_schema_and_does_not_crash(
     monkeypatch.setenv("MEMORY_BACKEND", "mem0")
     await init_db()  # 真实 SQLite 引擎
     assert "personal_agent_memories" not in await _table_names()
+
+async def test_init_db_bootstraps_mem0_from_dotenv_without_os_environ(
+    monkeypatch, tmp_path
+):
+    """P1：仅 .env 有 MEMORY_BACKEND=mem0 / MEM0_EMBEDDING_DIMS，os.environ
+    未灌入时，init-db 仍须 bootstrap（Mem0MigrateSettings 读 .env）。"""
+    from app.db import init_db
+
+    monkeypatch.delenv("MEMORY_BACKEND", raising=False)
+    monkeypatch.delenv("MEM0_EMBEDDING_DIMS", raising=False)
+    (tmp_path / ".env").write_text(
+        "MEMORY_BACKEND=mem0\nMEM0_EMBEDDING_DIMS=768\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+    engine = _fake_initdb_engine(monkeypatch, "postgresql+asyncpg://u:p@db/x")
+    await init_db()
+    joined = "\n".join(engine.log)
+    assert "CREATE EXTENSION IF NOT EXISTS vector" in joined
+    assert "vector(768)" in joined, "须从 .env 读到 MEM0_EMBEDDING_DIMS=768"
+    assert "vector_cosine_ops" in joined

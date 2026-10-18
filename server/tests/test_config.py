@@ -193,16 +193,23 @@ def test_mem0_without_embedding_credentials_rejected(monkeypatch):
 
 
 def test_mem0_embedding_dims_positive_and_bounded(monkeypatch):
-    """P2：MEM0_EMBEDDING_DIMS 必须为正且有有限上界（pgvector 单列维度
-    上限 16000），与既有数值配置同口径。"""
+    """P1：MEM0_EMBEDDING_DIMS 必须为正且 ≤2000（pgvector HNSW opclass
+    上限），与既有数值配置同口径。"""
     monkeypatch.setattr("app.config._mem0ai_installed", lambda: True)
-    for bad in (0, -1, 16001, 10**9):
+    for bad in (0, -1, 2001, 3072, 16001, 10**9):
         with pytest.raises(ValidationError, match="有限上界|必须为正"):
             _pg_settings(
                 memory_backend="mem0",
                 llm_api_key="sk-test-only",
                 mem0_embedding_dims=bad,
             )
+    # 边界合法值仍接受
+    ok = _pg_settings(
+        memory_backend="mem0",
+        llm_api_key="sk-test-only",
+        mem0_embedding_dims=2000,
+    )
+    assert ok.mem0_embedding_dims == 2000
 
 
 def test_production_inmemory_rejection_mentions_mem0():

@@ -53,8 +53,9 @@ _NUMERIC_UPPER_BOUNDS = {
     "WORKER_BATCH_SIZE": 1000,
     # /v1/ask 检索条数：100 封顶（更大无意义且拖慢问答）
     "ASK_TOP_K": 100,
-    # pgvector 单列维度上界（超界建表/检索即失败）；缺省 1536
-    "MEM0_EMBEDDING_DIMS": 16000,
+    # pgvector vector 类型的 HNSW opclass 最多 2000 维（超界建 HNSW 即失败）；
+    # 缺省 1536。pgvector 单列 vector 理论上限更高，但本项目建 HNSW，故封顶 2000。
+    "MEM0_EMBEDDING_DIMS": 2000,
 }
 
 
@@ -148,7 +149,8 @@ class Settings(BaseSettings):
     # 缺省回落 LLM_API_KEY（共用 OpenAI 兼容源时不用重复填）
     mem0_embedding_api_key: str = ""
     # mem0 的 embedding 维度（pgvector 列维度 / embedding 请求 dimensions）；
-    # 缺省 1536 = mem0ai 2.2.1 默认，也与 init-db 建的 vector(1536) 一致
+    # 缺省 1536 = mem0ai 2.2.1 默认，也与 init-db 建的 vector(1536) 一致。
+    # 上界 2000：pgvector HNSW opclass 上限（见 _NUMERIC_UPPER_BOUNDS）。
     mem0_embedding_dims: int = 1536
 
     # 流水线
@@ -611,3 +613,29 @@ def get_db_settings() -> DbSettings:
         return DbSettings()
     except ValidationError as exc:
         raise _sanitized_config_error(exc) from None
+
+
+class Mem0MigrateSettings(BaseSettings):
+    """init-db 专用：从 .env / 环境变量读 MEMORY_BACKEND 与 MEM0_EMBEDDING_DIMS。
+
+    不触发完整 Settings 的 LLM/JWT/mem0ai/生产拓扑校验（INV-9 分层）。
+    pydantic-settings 默认：进程环境变量优先于 .env，故 compose 注入的
+    MEMORY_BACKEND=mem0 仍生效；直接 `python -m app.cli init-db` 时也能
+    读到仓库 .env 里的值（不再依赖 os.environ 是否已被灌入）。
+    """
+
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+    # 用 str 而非 Literal：非法值只让 bootstrap 条件不成立，不挡建表
+    memory_backend: str = "inmemory"
+    mem0_embedding_dims: int = 1536
+
+
+def get_mem0_migrate_settings() -> Mem0MigrateSettings:
+    """加载 migrate 侧 mem0 引导配置；校验失败回落缺省（不挡业务表建表）。"""
+    try:
+        return Mem0MigrateSettings()
+    except ValidationError:
+        return Mem0MigrateSettings.model_construct(
+            memory_backend="inmemory", mem0_embedding_dims=1536
+        )
