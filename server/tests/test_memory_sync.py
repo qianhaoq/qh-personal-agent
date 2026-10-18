@@ -797,6 +797,66 @@ async def test_memory_sync_recheck_fences_reclaimed_lease_deletes_own_ids(
     assert not [j for j in jobs if j.status in ("pending", "running")]
 
 
+async def test_memory_sync_mark_status_skipped_when_lease_lost_before_update(
+    client, user, run_jobs, monkeypatch
+):
+    """threads8 P2 / INV-5/6/13（memory_sync.py:131）：复查会话看到租约
+    仍在、状态未变，但置位事务开启前协程暂停、租约被回收换主（job 回
+    pending 等待新认领）→ 置位必须与租约复核**同事务原子**：迟到的
+    worker 不得写下 synced 掩盖「换主后尚未收敛」的状态，静默让位给
+    后继任务；排空后由新持有者正常置位。"""
+    from app.db import get_sessionmaker
+    from app.jobs.queue import enqueue
+    from app.pipeline import memory_sync
+    from app.pipeline.runner import run_pending_jobs
+    from app.timeutil import utcnow
+
+    note_id = await _create_note(client, user, "置位前一刻丢租约的笔记")
+    await run_jobs()  # organized + 初次收敛（memory_status=synced）
+
+    # 复位 memory_status：若置位没被租约栅栏拦下，迟到的 worker 会把它
+    # 覆盖成 synced（模拟期间一次不动 rev 的内部推进，同上例手法）
+    maker = get_sessionmaker()
+    async with maker() as session, session.begin():
+        await session.execute(
+            update(Note).where(Note.id == note_id).values(memory_status="pending")
+        )
+    async with maker() as session, session.begin():
+        await enqueue(session, "memory_sync", {"note_id": note_id}, note_id=note_id)
+
+    real_mark = memory_sync._mark_memory_status
+
+    async def mark_after_lease_reclaim(maker_, note_id_, rev_, *, failed, **lease):
+        # 注入「复查通过 → 置位事务开启」之间的暂停窗口：回收者把租约
+        # 换主（status 回 pending；真实并发发生在别的连接上，等价）
+        async with maker() as session, session.begin():
+            await session.execute(
+                update(Job)
+                .where(Job.id == lease["job_id"])
+                .values(
+                    status="pending", run_after=utcnow(), locked_by=None, locked_at=None
+                )
+            )
+        return await real_mark(maker_, note_id_, rev_, failed=failed, **lease)
+
+    monkeypatch.setattr(memory_sync, "_mark_memory_status", mark_after_lease_reclaim)
+    assert await run_pending_jobs(limit=1, worker_id="wkr_stale") == 1
+
+    note = await _note(note_id)
+    assert note.memory_status == "pending", "丢租约的迟到置位必须被拦下"
+    jobs = await _memsync_jobs(note_id)
+    running_or_pending = [j.status for j in jobs if j.status in ("pending", "running")]
+    assert running_or_pending == ["pending"], (
+        f"被回收的任务应回到 pending 等后继：{[j.status for j in jobs]}"
+    )
+
+    # 排空：换主后的新持有者按当前状态正常置位
+    monkeypatch.undo()
+    await run_jobs()
+    note = await _note(note_id)
+    assert note.memory_status == "synced"
+
+
 class StalledDeleteStore(InMemoryStore):
     """目标笔记的**第一次** delete_by_note 先挂起：模拟 mem0 清理调用本身
     耗过锁超时（threads6 P1-1 的交错源头），放行后照常执行删除。"""

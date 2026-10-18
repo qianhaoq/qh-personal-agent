@@ -19,7 +19,11 @@ MemoryStore.add / delete / delete_by_note 调用方。
    locked_by=:worker_id AND locked_at=:claimed）。租约仍在且与第 1 步相同 →
    条件 UPDATE memory_status（'synced'；note 已 failed 且记忆为空则
    'failed'——该状态下不可能再有记忆），条件 id+rev+未删除，不占 seq、
-   不碰 updated_at/change_seq（INV-2.6）；租约仍在但状态已变 → **只删本次
+   不碰 updated_at/change_seq（INV-2.6）；**置位事务内再原子复核一次租约**
+   （threads8 P2 / INV-13：本步的复核会话已提交，若协程在两步之间暂停、
+   任务被回收换主，迟到的 worker 仍会写下 synced 掩盖未同步状态——置位
+   与租约判定必须同事务原子完成，复核不过不置位、静默让位给后继任务）；
+   租约仍在但状态已变 → **只删本次
    add 产生的 memory id**（按 id 删，绝不 delete_by_note，修 C9：不误删
    并发新 rev 任务刚写入的记忆）+ INSERT memory_sync … ON CONFLICT DO
    NOTHING 再入队（与变更事务已入队的 pending 去重合并），job 仍算 done；
@@ -43,11 +47,11 @@ INV-5 的评估）；但正确性不依赖串行化——复查/删己/再入队
 """
 from datetime import datetime
 
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.db import get_sessionmaker
-from app.jobs.queue import enqueue
+from app.jobs.queue import enqueue, is_postgres
 from app.memory.base import MemoryItem, get_memory_store
 from app.models import Job, Note
 from app.timeutil import as_utc
@@ -128,7 +132,16 @@ async def sync_note_memory(
 
     if unchanged:
         # 已删除的终态：条件更新自然不命中（deleted_at IS NULL），记忆已清
-        await _mark_memory_status(maker, note_id, rev, failed=again.status == "failed")
+        # 置位事务内自带原子租约复核（见 _mark_memory_status）
+        await _mark_memory_status(
+            maker,
+            note_id,
+            rev,
+            failed=again.status == "failed",
+            job_id=job_id,
+            worker_id=worker_id,
+            locked_at=locked_at,
+        )
         return
 
     # 状态已变：只删本次 add 产生的 memory id（修 C9），再入队（pending
@@ -160,12 +173,41 @@ async def _mark_memory_status(
     rev: int,
     *,
     failed: bool,
-) -> None:
+    job_id: str | None = None,
+    worker_id: str | None = None,
+    locked_at: datetime | None = None,
+) -> bool:
     """置 memory_status（服务端内部状态，不进 API 响应）：不占 change_seq、
     也不碰 updated_at（INV-2.6——`updated_at=Note.updated_at` 自赋值抑制
     列级 onupdate，否则会产生客户端永远观察不到的时间戳）。条件 id + rev +
-    未删除：期间又被 PATCH/DELETE 时不置位，交给重新入队的任务。"""
+    未删除：期间又被 PATCH/DELETE 时不置位，交给重新入队的任务。
+
+    threads8 P2 / INV-5/6/13：置位必须与租约复核**同事务原子**——调用方的
+    复查会话在到达这里之前已提交，若协程在两步之间暂停、租约被回收换主，
+    只比 (id, rev, 未删除) 的迟到 worker 仍会写下 synced 掩盖未同步状态。
+    本事务内先锁 job 行（PG FOR UPDATE；锁序 = 队列路径 jobs → note，见
+    INV-1 表，业务路径对 jobs 只 INSERT 不 UPDATE，无 AB-BA），锁内复核
+    租约——取行后在 Python 里比 as_utc(locked_at)：SQLite 以字符串存
+    datetime，SQL 等值比较对 aware 参数不可靠。复核不过**不置位、静默
+    让位**（回收者必有后继：换主执行或回收后 pending 再入队都会再收敛，
+    同 finalize_claim 的语义）；无租约上下文（测试/账户级路径）按无栅栏
+    处理。返回是否实际置位。"""
     async with maker() as session, session.begin():
+        if job_id is not None:
+            stmt = select(Job).where(Job.id == job_id)
+            if is_postgres():
+                stmt = stmt.with_for_update()
+            job_row = (await session.execute(stmt)).scalar_one_or_none()
+            lease_ok = (
+                job_row is not None
+                and job_row.status == "running"
+                and worker_id is not None
+                and job_row.locked_by == worker_id
+                and locked_at is not None
+                and as_utc(job_row.locked_at) == locked_at
+            )
+            if not lease_ok:
+                return False
         await session.execute(
             update(Note)
             .where(Note.id == note_id, Note.rev == rev, Note.deleted_at.is_(None))
@@ -175,3 +217,4 @@ async def _mark_memory_status(
             )
             .execution_options(synchronize_session=False)
         )
+    return True

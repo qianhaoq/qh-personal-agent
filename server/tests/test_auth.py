@@ -528,6 +528,71 @@ async def test_refresh_race_revoked_while_waiting_device_lock_detected_as_reuse(
     assert device.revoked_at is not None
 
 
+async def test_refresh_token_expires_while_waiting_device_lock_401(
+    client, invite_code, monkeypatch
+):
+    """threads8 P1 / INV-13（auth.py:294）：refresh 首读时 token 有效，
+    等待 device 行锁期间跨过 expires_at → 锁内重取 now 后，轮换条件
+    UPDATE（WHERE 对行内当前 expires_at 原子判定）不命中，锁内重读
+    归因为「过期」普通 401：token 不被轮换成新凭证、不追加行、不吊销
+    设备。旧行为沿用请求起始的 now，过期 token 照常轮换出 200（「等锁
+    跨过期」归因分支对该场景永不可达）。"""
+    from datetime import timedelta
+
+    from app.api import auth as auth_api
+    from app.auth.tokens import hash_refresh_token
+    from app.db import get_sessionmaker
+    from app.models import Device, RefreshToken
+    from app.timeutil import as_utc
+
+    device_id = "dev_race_expiry"
+    login = await client.post(
+        "/v1/auth/login", json={"invite_code": invite_code, "device_id": device_id}
+    )
+    assert login.status_code == 200, login.text
+    token = login.json()["refresh_token"]
+
+    async with get_sessionmaker()() as session:
+        expires_at = as_utc(
+            (
+                await session.execute(
+                    select(RefreshToken.expires_at).where(
+                        RefreshToken.token_hash == hash_refresh_token(token)
+                    )
+                )
+            ).scalar_one()
+        )
+
+    real_utcnow = auth_api.utcnow
+    clock = {"now": real_utcnow()}
+    real_lock_device = auth_api._lock_device
+
+    async def lock_device_after_expiry_window(session, device_id):
+        # 模拟「首读有效 → 等锁跨过 expires_at」：可控时钟，拿到 device
+        # 行锁的瞬间 token 已过期，避免真实 sleep 的抖动
+        clock["now"] = expires_at + timedelta(seconds=1)
+        return await real_lock_device(session, device_id)
+
+    monkeypatch.setattr(auth_api, "utcnow", lambda: clock["now"])
+    monkeypatch.setattr(auth_api, "_lock_device", lock_device_after_expiry_window)
+
+    resp = await client.post("/v1/auth/refresh", json={"refresh_token": token})
+    assert resp.status_code == 401, resp.text
+    assert resp.json()["error"]["code"] == "unauthorized"
+
+    async with get_sessionmaker()() as session:
+        device = await session.get(Device, device_id)
+        rows = (
+            await session.execute(
+                select(RefreshToken).where(RefreshToken.device_id == device_id)
+            )
+        ).scalars().all()
+    assert device.revoked_at is None, "过期 401 不吊销设备"
+    assert len(rows) == 1, "未轮换：不追加新 refresh 行"
+    assert rows[0].revoked_at is None, "过期 token 不作废（留给修剪清理）"
+    assert as_utc(rows[0].expires_at) == expires_at
+
+
 async def test_refresh_reuse_row_deleted_under_lock_401_no_revoke(
     client, invite_code, monkeypatch
 ):

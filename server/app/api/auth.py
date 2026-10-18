@@ -282,6 +282,11 @@ async def refresh(body: RefreshRequest, session: AsyncSession = Depends(get_db_s
         device = await _lock_device(session, row.device_id)
         if device is None or device.revoked_at is not None:
             raise ApiError(401, "unauthorized", "device revoked")
+        # INV-13（threads8 P1，auth.py:294）：开头的 now 是无锁首读时刻，
+        # 等锁期间 token 可能已跨过 expires_at——锁内重取 now，让下面的
+        # 条件 UPDATE 用行内当前 expires_at 原子判定（条件 UPDATE 的 WHERE
+        # 即「锁内重读」）；过期的 token 不得被轮换成新凭证
+        now = utcnow()
         # 轮换只作废被轮换的那一枚：条件 UPDATE 原子完成，同一枚 token
         # 并发刷新时只有一个能命中
         device_id, token_user_id = row.device_id, row.user_id
@@ -321,8 +326,9 @@ async def refresh(body: RefreshRequest, session: AsyncSession = Depends(get_db_s
             # 行已不存在（被挤出/登出删除）：普通 401，不吊销设备
             raise ApiError(401, "unauthorized", "invalid refresh token")
         if current.revoked_at is None:
-            # 未作废却没轮换成功：UPDATE 里的 now 是请求起始时刻，只可能是
-            # 等锁期间跨过了过期时刻 → 按过期 401（不吊销设备）
+            # 未作废却没轮换成功：UPDATE 判定时行内 expires_at 已不大于判定
+            # 时刻（等锁跨过期——now 已在锁内重取，只剩语句求值到重读之间
+            # 的微秒级窗口）→ 按过期 401（不吊销设备）
             raise ApiError(401, "unauthorized", "refresh token 已过期")
         # revoked_at 非空：确系被轮换/吊销后的重放 → 复用检测吊销整台设备
         # （_revoke_device_for_reuse 内部会再按锁内重读复核一次）
