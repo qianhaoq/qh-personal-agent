@@ -213,7 +213,10 @@ class NoteCreate(BaseModel):
         # 容器内任何层级的字符串（键/值）都不允许 NUL / lone surrogate，
         # 且嵌套深度受限
         _reject_invalid_unicode_everywhere(value)
-        if len(json.dumps(value, ensure_ascii=False)) > _MAX_ASR_JSON_BYTES:
+        # 体积按 **UTF-8 字节数**量测（INV-7，threads12 P2，schemas.py:199）：
+        # len() 数的是码点——CJK/emoji 每字符 3-4 字节，4096 个码点的中文
+        # 实际近 12KB，落库/日志的实际负担是字节数不是码点数
+        if len(json.dumps(value, ensure_ascii=False).encode("utf-8")) > _MAX_ASR_JSON_BYTES:
             raise ValueError(f"asr 序列化后超过 {_MAX_ASR_JSON_BYTES} 字节")
         return value
 
