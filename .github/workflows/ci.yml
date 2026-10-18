@@ -10,7 +10,8 @@ name: CI
 
 on:
   pull_request:
-    # edited: base retarget re-runs CI (not filtered: a skipped required check counts as passing).
+    # edited: only a base retarget re-runs CI; title/body edits are skipped at
+    # job level (see `if:` below), so no runner starts and no required check changes.
     types: [opened, synchronize, reopened, ready_for_review, edited]
   push:
     branches: [main]
@@ -25,10 +26,10 @@ permissions:
 jobs:
   ci:
     # `edited` fires on every title/body edit; only a base retarget needs CI.
-    # Caller-level skip: the skipped check is named after this job, never
-    # the required "ci / Build & Test" (whose last result stays in force).
+    # Caller-level skip: the skipped check carries this job's own name, never
+    # a required "ci / …" name, so the last real result stays in force.
     if: github.event.action != 'edited' || github.event.changes.base != null
-    uses: qianhaoq/devflow-gates/.github/workflows/ci.yml@3853cc9dedbf1ffd8b10def841ed4c822dae7906  # devflow-gates main @ 3853cc9 (pinned; bump deliberately)
+    uses: qianhaoq/devflow-gates/.github/workflows/ci.yml@37aef857960dd425a1d48ef781818c89d889db2c  # devflow-gates main @ 37aef85 (pinned; bump deliberately)
     with:
       python_version: '3.12'
       setup_command: ''
@@ -53,8 +54,8 @@ jobs:
   # always exercised.
   pg-detect:
     # `edited` fires on every title/body edit; only a base retarget needs CI.
-    # Caller-level skip: the skipped check is named after this job, never
-    # the required "ci / Build & Test" (whose last result stays in force).
+    # Caller-level skip: the skipped check carries this job's own name, never
+    # a required "ci / …" name, so the last real result stays in force.
     if: github.event.action != 'edited' || github.event.changes.base != null
     name: PG Tests (detect)
     runs-on: ubuntu-latest

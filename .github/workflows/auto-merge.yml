@@ -64,7 +64,7 @@ jobs:
       (github.event_name != 'pull_request_review' ||
       github.event.review.state == 'approved' ||
       github.event.review.user.login == 'copilot-pull-request-reviewer[bot]')
-    uses: qianhaoq/devflow-gates/.github/workflows/auto-merge.yml@3853cc9dedbf1ffd8b10def841ed4c822dae7906  # devflow-gates main @ 3853cc9 (pinned; bump deliberately)
+    uses: qianhaoq/devflow-gates/.github/workflows/auto-merge.yml@37aef857960dd425a1d48ef781818c89d889db2c  # devflow-gates main @ 37aef85 (pinned; bump deliberately)
     with:
       # Exact check-run names = "<caller job name> / <called job name>"
       # from YOUR ci.yml / codex-gate.yml / qa-gate.yml callers. "ci / Secret Scan"
@@ -78,3 +78,6 @@ jobs:
       # Copilot quota is exhausted (2026-10): no Copilot dependency. Same switch as
       # ai-devflow-weekly: set repo var DISABLE_COPILOT_REVIEW=false to require it again.
       require_copilot: ${{ vars.DISABLE_COPILOT_REVIEW == 'false' }}
+      # When required: one Copilot review on any commit is enough (no per-push
+      # re-review exists); head freshness = Codex gate + CI + QA.
+      copilot_scope: any
