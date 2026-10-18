@@ -80,6 +80,8 @@ concurrency:
 
 jobs:
   codex:
+    # Removing `no-auto-merge` re-evaluates so the gate's completion
+    # starts an Auto Merge sweep (its workflow_run is not 'skipped').
     # Caller-level filter: irrelevant events skip WITHOUT booting a runner
     # and attach a check named "codex" (not the required one).
     if: >-
@@ -91,7 +93,8 @@ jobs:
         (github.event.action == 'edited' || github.event.comment.in_reply_to_id)) ||
       (github.event_name == 'pull_request_target' &&
         ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
-         github.event.label.name == 'skip-codex-gate'))
+         github.event.label.name == 'skip-codex-gate' ||
+         (github.event.action == 'unlabeled' && github.event.label.name == 'no-auto-merge')))
     # GitHub checks EVERY job of the called file against this job's
     # ceiling (incl. the refresh job, which needs actions: write); the
     # evaluator's own token stays read-only.
