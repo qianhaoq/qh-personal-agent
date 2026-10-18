@@ -463,3 +463,72 @@ def test_database_url_echo_query_rejected():
     ):
         assert Settings(database_url=ok).database_url == ok
         assert DbSettings(database_url=ok).database_url == ok
+
+
+def test_get_settings_validation_failure_does_not_leak_secret_values(monkeypatch, caplog):
+    """threads10 P1（config.py:68）/ INV-14：启动校验失败的 ConfigError、
+    全链 traceback、uvicorn.error 式日志记录都不含密钥明文——pydantic
+    ValidationError 的 input_value 截断 repr 会露出尾部字段值（jwt_secret
+    / database_url 密码），而 get_settings 跑在中间件挂载之前（api 模块级
+    create_app、worker 模块级 basicConfig），traceback 会整段落进程日志。
+    字段名（MEMORY_BACKEND）与校验文案保留，排障不受损。"""
+    import logging
+    import traceback
+
+    from app.config import ConfigError, get_settings
+
+    secret = "sk-LEAK-MARKER-" + secrets.token_hex(24)
+    monkeypatch.setenv("DATABASE_URL", PG_URL)
+    monkeypatch.setenv("JWT_SECRET", secret)
+    # 让某个 mode="after" 校验失败：生产拓扑拒绝 inmemory。两个放行标志
+    # 必须显式摘掉——PG 测试套件的 conftest 会设置它们（否则行为随运行
+    # 方式漂移）
+    monkeypatch.setenv("MEMORY_BACKEND", "inmemory")
+    monkeypatch.delenv("ALLOW_INMEMORY_IN_TESTS", raising=False)
+    get_settings.cache_clear()
+    try:
+        with pytest.raises(ConfigError) as exc_info:
+            get_settings()
+        exc = exc_info.value
+
+        # 1) 异常消息本身：不含密钥原值，保留字段名/校验文案可排障
+        assert secret not in str(exc)
+        assert PG_URL.split("://", 1)[1] not in str(exc), "database_url 原值不进消息"
+        assert "MEMORY_BACKEND" in str(exc)
+
+        # 2) from None 抑制隐式 __context__：全链 traceback 也没有原
+        #    ValidationError（其 input_value repr 含全部已加载字段值）
+        formatted = "".join(traceback.format_exception(exc))
+        assert secret not in formatted
+        assert "input_value" not in formatted
+
+        # 3) 进程日志出口（uvicorn.error 的 exc_info 记录形态）
+        caplog.clear()
+        with caplog.at_level(logging.ERROR, logger="uvicorn.error"):
+            logging.getLogger("uvicorn.error").error("Application startup failed", exc_info=exc)
+        fmt = logging.Formatter()
+        for record in caplog.records:
+            rendered = fmt.format(record)
+            assert secret not in rendered
+            assert "input_value" not in rendered
+    finally:
+        get_settings.cache_clear()
+
+
+def test_get_db_settings_validation_failure_does_not_leak_database_url(monkeypatch):
+    """同一脱敏边界覆盖 init-db 入口（cli 只走 DbSettings）：URL query 开
+    echo 被拒时，ConfigError 消息只含固定校验文案，不含 URL 原值（内嵌
+    的 PG 密码）。"""
+    from app.config import ConfigError, get_db_settings
+
+    marker = "pa-db-leak-marker"
+    monkeypatch.setenv("DATABASE_URL", f"postgresql+asyncpg://u:{marker}@localhost/db?echo=true")
+    get_db_settings.cache_clear()
+    try:
+        with pytest.raises(ConfigError) as exc_info:
+            get_db_settings()
+        assert marker not in str(exc_info.value)
+        assert "localhost" not in str(exc_info.value), "URL 任何部分都不进消息"
+        assert "echo" in str(exc_info.value), "校验文案保留"
+    finally:
+        get_db_settings.cache_clear()

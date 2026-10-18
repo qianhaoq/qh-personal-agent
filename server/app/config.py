@@ -6,7 +6,7 @@ from functools import lru_cache
 from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import model_validator
+from pydantic import ValidationError, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # 明显的占位符，只允许配合 SQLite 开发/测试使用
@@ -250,9 +250,39 @@ class Settings(BaseSettings):
         return self
 
 
+class ConfigError(RuntimeError):
+    """配置校验失败（INV-14，threads10 P1，config.py:68）：消息只含字段
+    位置（loc）与校验文案（msg/type），不含任何配置原值——pydantic
+    ValidationError 的 `input_value` 截断 repr 会露出**尾部**字段的值
+    （jwt_secret / database_url 里的密码，实测复现），而 get_settings 跑
+    在一切中间件之前（api 模块级 create_app、worker 模块级 basicConfig），
+    traceback 会整段落 uvicorn/进程日志。有意不用 SecretStr：只护 repr、
+    不覆盖 database_url 的 password 部分、且要改所有取值点与既有测试；
+    边界收口一次覆盖全部入口（api import / worker / cli），评估见
+    docs/server-invariants.md 第 2 节表。"""
+
+
+def _sanitized_config_error(exc: ValidationError) -> ConfigError:
+    """ValidationError → 只含 loc/msg/type 的 ConfigError（strip input/ctx）。
+
+    msg 的来源是本仓校验器的固定文案或 pydantic 内置模板，均不含输入值；
+    有意保留的两处非密钥插值（DEFAULT_TIMEZONE、数值配置值）只出现在
+    操作者自己的控制台，不是跨用户回显面（INV-14 边界，文档载明）。"""
+    lines = []
+    for err in exc.errors():
+        loc = ".".join(str(part) for part in err.get("loc") or ()) or "<settings>"
+        lines.append(f"{loc}: {err.get('msg') or err.get('type')}")
+    return ConfigError("配置校验失败：\n" + "\n".join(lines))
+
+
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    try:
+        return Settings()
+    except ValidationError as exc:
+        # from None 抑制隐式 __context__：否则原 ValidationError 仍随
+        # 「During handling of…」链式 traceback 打出，脱敏白做
+        raise _sanitized_config_error(exc) from None
 
 
 def _reject_echo_in_url(database_url: str) -> None:
@@ -300,4 +330,8 @@ class DbSettings(BaseSettings):
 
 @lru_cache
 def get_db_settings() -> DbSettings:
-    return DbSettings()
+    # 同 get_settings 的脱敏边界（database_url 内嵌 PG 密码）
+    try:
+        return DbSettings()
+    except ValidationError as exc:
+        raise _sanitized_config_error(exc) from None

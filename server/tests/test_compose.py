@@ -203,6 +203,7 @@ def test_dockerignore_excludes_secrets_and_local_data():
     for required in (
         ".env",  # 生产密钥（README 生产部署在 server/ 创建）
         ".env.*",
+        "!.env.example",  # 模板保留进上下文（threads10）；真实 .env 仍被上面两条排除
         "*.db",
         "*.sqlite",  # 本地 SQLite 笔记库（含 tests/_test.sqlite3）
         "*.sqlite-*",
