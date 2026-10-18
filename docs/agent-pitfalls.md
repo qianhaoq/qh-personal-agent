@@ -62,9 +62,9 @@ await session.execute(delete(RefreshToken).where(RefreshToken.device_id == auth.
 
 ## 2. Job 收尾带租约（INV-2、INV-6） <a id="jobs"></a>
 
-收尾必须带租约条件 `status='running' AND locked_by=:me AND locked_at=:claimed`，被换主的旧 worker 一律放弃收尾。判死条件是 `attempts >= max_attempts`（attempts 是已经用掉的次数），`max_attempts` 从配置读取。extract 与 memory_sync 两种 job 的收尾差异见 INV-6，本文不另作规定。
+收尾必须带租约条件 `status='running' AND locked_by=:me AND locked_at=:claimed`，被换主的旧 worker 一律放弃收尾。**「收尾」不只是 finalize**：长外部调用（LLM/记忆后端）之后把结果写回数据库的事务（threads15 P1，extract 的 `_apply_extraction`）同样要先原子复核这一三元组（`queue.lease_still_held`）——判死路径**不动 note rev**，业务行版本栅栏（rev）挡不住「复活慢 worker 的迟到写回」：判死把 note 标 failed 后，旧 worker 迟到的有效结果照样把 note 写回 organized、建提醒、入队 memory_sync。判死条件是 `attempts >= max_attempts`（attempts 是已经用掉的次数），`max_attempts` 从配置读取。extract 与 memory_sync 两种 job 的收尾差异见 INV-6，本文不另作规定。
 
-怎么被发现的：第 2~5 轮在 queue/runner 里连续出现。
+怎么被发现的：第 2~5 轮在 queue/runner 里连续出现；threads15 是第 12 轮（写回栅栏缺失，rev 栅栏的盲区）。
 
 ## 3. 外部输入在边界校验（INV-7、INV-10；机检 INV-NUL） <a id="inv-nul"></a>
 
