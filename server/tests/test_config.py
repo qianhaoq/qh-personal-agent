@@ -629,6 +629,34 @@ def test_settings_builds_pg_url_from_pg_env_vars(monkeypatch):
     assert make_url(settings.database_url).password == fake_password
 
 
+def test_postgres_url_from_env_missing_password_is_config_error(monkeypatch):
+    """threads14 P2（config.py:357）/ INV-16：PGHOST 在而 PGPASSWORD 缺时
+    不再 KeyError（裸 traceback）——受控 ConfigError 明确报缺（PG 默认值
+    表没有密码项可兜底）；确需 trust 无密码连接时显式 PGPASSWORD="" 合法
+    （空密码段照常拼出、make_url 解析回空串）。"""
+    from sqlalchemy.engine import make_url
+
+    from app.config import ConfigError, DbSettings, postgres_url_from_env
+
+    # 纯函数：只有 PGHOST（触发键）无 PGPASSWORD
+    with pytest.raises(ConfigError, match="PGPASSWORD"):
+        postgres_url_from_env({"PGHOST": "db.internal"})
+
+    # Settings/DbSettings 的 before-validator 同路径：pydantic 不吞非
+    # ValueError，ConfigError 直接出界（与 get_settings 的脱敏出口同型）
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    for key in ("PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE"):
+        monkeypatch.delenv(key, raising=False)
+    with pytest.raises(ConfigError, match="PGPASSWORD"):
+        DbSettings(pghost="db.internal")
+
+    # 显式空串 = 明确的 trust 形态：合法，拼出空密码段
+    url = postgres_url_from_env({"PGHOST": "db.internal", "PGPASSWORD": ""})
+    assert url is not None
+    assert make_url(url).password == ""
+    assert make_url(url).host == "db.internal"
+
+
 # ---------------------------------------------------------------------------
 # threads13 P2（config.py:188）/ INV-10.1：LLM_BASE_URL 必须是绝对的
 # http/https URL——非空但畸形的值此前能过「三元组齐备」检查，/healthz

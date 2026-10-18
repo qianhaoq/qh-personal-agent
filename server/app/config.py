@@ -372,9 +372,24 @@ def postgres_url_from_env(env: Mapping[str, str]) -> str | None:
     空格（userinfo 里 ``+`` 就是字面加号），含空格的密码会轮换失败。
     无 PGPASSWORD/PGHOST 时返回 None（调用方沿用 DATABASE_URL /
     默认值）。密码绝不进日志/错误消息（INV-14）。
+
+    threads14 P2（config.py:357）：PGHOST 在而 PGPASSWORD 缺失时抛受控
+    ConfigError，不再 KeyError（_PG_DEFAULTS 只兜底 PGUSER/PGHOST/
+    PGPORT/PGDATABASE，没有密码默认值可兜）。有意选「明确报缺」而不是
+    默认空密码：静默把「忘配密码」当 trust 放行会掩盖部署错误（与
+    INV-16「密钥不静默进错位置」同向）；确需无密码的 trust 连接时显式
+    设 PGPASSWORD=""（空串合法，编码后 userinfo 密码段为空）。
     """
     if not any(key in env for key in _PG_TRIGGER_KEYS):
         return None
+    if "PGPASSWORD" not in env:
+        raise ConfigError(
+            "配置校验失败：\n"
+            "PGHOST: 触发了分项 PG 变量拼接（PGHOST/PGPASSWORD）但缺少 "
+            "PGPASSWORD——分项变量须成套提供（PGUSER/PGHOST/PGPORT/"
+            "PGDATABASE 有缺省回落，密码没有）。确需无密码（trust）连接"
+            "请显式设置 PGPASSWORD 为空串"
+        )
     merged = {**_PG_DEFAULTS, **{k: str(v) for k, v in env.items() if k in _PG_ENV_KEYS}}
     userinfo = f"{quote(merged['PGUSER'], safe='')}:{quote(merged['PGPASSWORD'], safe='')}"
     return f"postgresql+asyncpg://{userinfo}@{merged['PGHOST']}:{merged['PGPORT']}/{merged['PGDATABASE']}"
