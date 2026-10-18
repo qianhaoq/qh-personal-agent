@@ -209,6 +209,14 @@ async def patch_note(
             text=body.text,
             rev=Note.rev + 1,
             status="uploaded",
+            # INV-15（threads8 P1，notes.py:215）：源字段（text）一变，旧 rev
+            # 的派生字段全部失效——title/tags/todos 同事务清空（不能只置
+            # status：PATCH 响应与 /v1/sync 会把旧抽取产物当当前元数据返回，
+            # 新抽取重试耗尽时旧产物与 failed 永久并存），新值由重新入队的
+            # extract 写回
+            title=None,
+            tags=None,
+            todos=None,
             # 旧 rev 的记忆已作废：由本次入队的 memory_sync 清掉（extract
             # 成功后再写新 rev 的记忆）
             memory_status="pending",
