@@ -135,7 +135,11 @@ def parse_datetime(text: str, now: datetime, tzname: str = DEFAULT_TZ) -> dateti
             period == "中午" and hour < 11
         ):
             hour += 12
-        hour = min(hour, 23)
+        # INV-7（threads11 P2，mock.py:139）：时分越界（“99 点”“3 点 99 分”）
+        # 不钳位也不上抛——min(hour, 23) 会把“99 点”变成错误的 23:00 提醒，
+        # ValueError 会 500。视为没解析出时间，返回 None（无提醒）。
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            return None
         dt = base.replace(hour=hour, minute=minute, second=0, microsecond=0) + timedelta(days=day_off)
         return resolve(dt) if day_off == 0 else dt
 

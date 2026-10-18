@@ -170,6 +170,27 @@ def test_parse_datetime_overlong_digit_quantity_returns_none():
     assert parse_datetime("三十分钟后开会", _now()) is not None
 
 
+def test_parse_datetime_clock_out_of_range_returns_none():
+    """threads11 P2 / INV-7（mock.py:139）：时钟字段的时/分越界（“99 点”
+    “3 点 99 分”）不钳位也不上抛——旧 `min(hour, 23)` 会把“99 点”变成
+    错误的 23:00 提醒，越界分钟直接 ValueError；越界视为没解析出时间，
+    返回 None（该短语不出提醒），合法边界值（23:59、0 点半）照常解析。"""
+    # 时越界：不钳位成 23:00，直接 None
+    assert parse_datetime("99点提醒我喝水", _now()) is None
+    assert parse_datetime("九十点开会", _now()) is None
+    assert parse_datetime("明天99点提醒我喝水", _now()) is None
+    # 24 点：[0,23] 之外（“24 点”应是次日 0 点，语义不明，不出提醒）
+    assert parse_datetime("24点提醒我喝水", _now()) is None
+    # 分越界：不 replace(minute=99) 炸 ValueError，也不截断成 39 分
+    assert parse_datetime("下午3点99分提醒我喝水", _now()) is None
+    assert parse_datetime("三点九十九分出发", _now()) is None
+    # 合法边界值照常解析（时分与解析结果恒等，日期由“已过顺延”决定）
+    dt = parse_datetime("23点59分睡觉", _now())
+    assert (dt.hour, dt.minute) == (23, 59)
+    assert parse_datetime("凌晨0点半起床", _now()) is not None
+    assert parse_datetime("下午15点开会", _now()) is not None
+
+
 async def test_mockllm_overlong_digit_quantity_no_reminder_no_500(client, user, run_jobs):
     """threads9 P2 端到端：一条 5000 字符内的合法笔记含 4990 位数字 +
     「天后提醒我喝水」→ MockLLM 不抛 int() 的 ValueError（4300 位上限），
@@ -200,3 +221,33 @@ async def test_mockllm_overlong_digit_quantity_no_reminder_no_500(client, user, 
         ).scalars().all()
     assert note.status == "organized", "超长数字只影响这条提醒，不影响整理本身"
     assert reminders == []
+
+
+async def test_mockllm_out_of_range_clock_no_reminder_no_500(client, user, run_jobs):
+    """threads11 P2 端到端 / INV-7：笔记含越界时钟（“明天下午3点99分”）
+    → MockLLM 不抛 base.replace(minute=99) 的 ValueError，笔记照常
+    organized，只是这条越界时间不出提醒（也不钳位成错误时刻）。"""
+    import uuid
+
+    from sqlalchemy import select
+
+    from app.db import get_sessionmaker
+    from app.models import Note, Reminder
+    from tests.conftest import auth_headers
+
+    created = await client.post(
+        "/v1/notes",
+        json={"client_note_id": str(uuid.uuid4()), "text": "明天下午3点99分提醒我喝水"},
+        headers=auth_headers(user),
+    )
+    assert created.status_code == 202, created.text
+    note_id = created.json()["note_id"]
+    await run_jobs()
+
+    async with get_sessionmaker()() as session:
+        note = await session.get(Note, note_id)
+        reminders = (
+            await session.execute(select(Reminder).where(Reminder.note_id == note_id))
+        ).scalars().all()
+    assert note.status == "organized", "越界时间只影响这条提醒，不影响整理本身"
+    assert reminders == [], "越界时分不得钳位成错误时刻的提醒"
