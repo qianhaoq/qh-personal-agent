@@ -1,6 +1,6 @@
 # 合入门禁 | Merge gates
 
-与 dota2.ai / pinhaoyun / ai-devflow-weekly 对齐：CI、Codex、QA 都调用 `qianhaoq/devflow-gates` 的 reusable workflow（固定到 commit `3853cc9`，即 3853cc9dedbf1ffd8b10def841ed4c822dae7906；升级要单独开 PR）。
+与 dota2.ai / pinhaoyun / ai-devflow-weekly 对齐：CI、Codex、QA 都调用 `qianhaoq/devflow-gates` 的 reusable workflow（固定到 commit `37aef85`，即 37aef857960dd425a1d48ef781818c89d889db2c；升级要单独开 PR）。
 
 ## 必需检查（branch protection）
 
@@ -21,7 +21,7 @@
 
 `auto-merge.yml` 在上述检查全绿后 squash 合入，以下情况不合：draft、标签 `no-auto-merge`、`skip-codex-gate`。
 
-**Copilot**：配额已用完，`require_copilot` 默认关闭（仓库变量 `DISABLE_COPILOT_REVIEW` 未设置或不为 `false` 时不要求 Copilot review）；配额恢复后把变量设为 `false` 即可重新要求。仓库没有任何必需检查依赖 Copilot。
+**Copilot**：配额已用完，`require_copilot` 默认关闭（仓库变量 `DISABLE_COPILOT_REVIEW` 未设置或不为 `false` 时不要求 Copilot review）；配额恢复后把变量设为 `false` 即可重新要求；重新要求时只需 PR 上任一提交有过一条 Copilot review（`copilot_scope: any`，最新一条非 `CHANGES_REQUESTED`），不会因后续 push 卡住。仓库没有任何必需检查依赖 Copilot。
 
 ## 评审严重度
 
