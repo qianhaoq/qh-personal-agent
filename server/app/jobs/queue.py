@@ -138,7 +138,15 @@ async def claim_next(session: AsyncSession, worker_id: str | None = None):
 
     worker_id 写入 jobs.locked_by 作为租约持有者；缺省时每次生成一次性
     id（等价于“领取后即失联”的 worker，回收语义不受影响）。调用方负责
-    在同一个事务里完成领取，并用 finalize_claim 做带租约校验的收尾。
+    提交领取写入，并用 finalize_claim 做带租约校验的收尾。
+
+    **判死路径会中途 commit（INV-1，threads11）**：循环判死一个锁过期
+    且次数用尽的 job 后先提交该转移（释放 note/sequences 行锁）再找下
+    一个候选。因此调用方**不得**把本调用包在 `session.begin()` 上下文
+    管理器里继续用同一事务（commit 后上下文内再发语句会
+    InvalidRequestError）——正确形态是 claim 上下文退出后自行
+    commit/rollback（见 runner._claim_one）；只走 pending/回收路径的调用
+    不触发中途 commit，两种包法都兼容。
     """
     now = utcnow()
     wid = worker_id or new_worker_id()
@@ -180,6 +188,11 @@ async def _claim_postgres(session: AsyncSession, now: datetime, worker_id: str) 
             await _fail_expired(
                 session, job_id, kind=kind, note_id=note_id, note_rev=note_rev
             )
+            # INV-1（threads11 P1，queue.py:182）：_fail_expired 已按队列锁序
+            # 拿了 note 与 sequences 行锁——判死转移立即提交（释放全部行锁）
+            # 再找下一个候选；同一事务继续锁下一个 job/note 会与并发 PATCH
+            # （先持 note 行锁、正等 sequences）构成 AB-BA 死锁
+            await session.commit()
             job = None
         else:
             job = await _reclaim_running(session, job_id, cutoff, worker_id)
@@ -226,6 +239,9 @@ async def _claim_sqlite(session: AsyncSession, now: datetime, worker_id: str) ->
             continue
         if attempts >= max_attempts:
             await _fail_expired(session, job_id, kind=kind, note_id=note_id, note_rev=note_rev)
+            # 同 _claim_postgres（INV-1，threads11）：判死转移提交后再继续扫；
+            # SQLite 单写者虽无 AB-BA，转移也不得挂在后续领取的事务里
+            await session.commit()
             continue
         job = await _reclaim_running(session, job_id, cutoff, worker_id)
         if job is not None:

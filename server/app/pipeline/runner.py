@@ -81,24 +81,29 @@ async def run_pending_jobs(
 
 
 async def _claim_one(maker: async_sessionmaker[AsyncSession], worker_id: str) -> _Claimed | None:
-    """事务 1：认领一个到期 job（None 表示队列空）。"""
-    async with (
-        maker() as session,
-        session.begin(),
-        claim_next(session, worker_id=worker_id) as job,
-    ):
-        if job is None:
-            return None
-        return _Claimed(
-            id=job.id,
-            kind=job.kind,
-            payload=json.loads(job.payload_json or "{}"),
-            attempts=job.attempts,
-            max_attempts=job.max_attempts,
-            locked_by=job.locked_by or worker_id,
-            # SQLite 读回 naive、PG 读回 aware：统一成 aware UTC 再比较
-            locked_at=as_utc(job.locked_at),
-        )
+    """事务 1：认领一个到期 job（None 表示队列空）。
+
+    不用 session.begin() 上下文管理器：claim_next 的判死路径会中途
+    commit（INV-1，threads11——判死转移（note/sequences 行锁）提交后才
+    找下一个候选），上下文管理器里 commit 后无法继续发语句；这里在
+    claim 上下文退出后自行提交领取写入（判死转移已由 queue 内部提交）。
+    """
+    async with maker() as session:
+        async with claim_next(session, worker_id=worker_id) as job:
+            if job is None:
+                return None
+            claimed = _Claimed(
+                id=job.id,
+                kind=job.kind,
+                payload=json.loads(job.payload_json or "{}"),
+                attempts=job.attempts,
+                max_attempts=job.max_attempts,
+                locked_by=job.locked_by or worker_id,
+                # SQLite 读回 naive、PG 读回 aware：统一成 aware UTC 再比较
+                locked_at=as_utc(job.locked_at),
+            )
+        await session.commit()
+        return claimed
 
 
 async def _finalize(

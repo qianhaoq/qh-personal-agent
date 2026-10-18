@@ -128,6 +128,85 @@ async def test_expired_running_job_last_allowed_attempt_still_executes(client, u
     assert note.status == "organized"
 
 
+async def test_claim_commits_dead_job_transition_before_next_candidate(
+    client, user, monkeypatch
+):
+    """threads11 P1 / INV-1（queue.py:182）：claim 循环判死过期 job
+    （_fail_expired 锁 note + allocate_seq）后必须先提交再找下一个候选。
+    钩子在领取下一个候选（置 running）的瞬间从独立会话读第一个 job：
+    判死转移必须已提交可见——否则转移挂在后续领取的事务里，同一事务
+    还会继续锁下一个 job/note，与并发 PATCH 构成 AB-BA（PG 真并发回归
+    见 test_concurrency.py::test_claim_dead_jobs_commit_between_candidates_no_deadlock）。
+    两后端都跑；调用方式按 claim_next 新契约（上下文退出后自行提交）。"""
+    from app.jobs import queue as queue_mod
+
+    headers = auth_headers(user)
+    # 笔记 A 先建（其 extract job 是判死候选），笔记 B 的 job 是活候选
+    note_a = (
+        await client.post(
+            "/v1/notes",
+            json={"client_note_id": str(uuid.uuid4()), "text": "判死转移的笔记"},
+            headers=headers,
+        )
+    ).json()["note_id"]
+    note_b = (
+        await client.post(
+            "/v1/notes",
+            json={"client_note_id": str(uuid.uuid4()), "text": "下一个候选的笔记"},
+            headers=headers,
+        )
+    ).json()["note_id"]
+
+    maker = get_sessionmaker()
+    async with maker() as session:
+        jobs = (
+            await session.execute(select(Job).where(Job.kind == "extract"))
+        ).scalars().all()
+    jobs = {j.note_id: j for j in jobs}
+    job_a, job_b = jobs[note_a], jobs[note_b]
+
+    # job_a 判死（running + 锁过期 + 次数用尽）；run_after 显式错开保证
+    # 扫描顺序确定（a 先于 b，不依赖 created_at 的秒级精度）
+    timeout = get_settings().job_lock_timeout_seconds
+    async with maker() as session, session.begin():
+        await session.execute(
+            update(Job)
+            .where(Job.id == job_a.id)
+            .values(
+                status="running",
+                attempts=get_settings().job_max_attempts,
+                locked_by="wkr_dead",
+                locked_at=utcnow() - timedelta(seconds=timeout + 60),
+                run_after=utcnow() - timedelta(hours=2),
+            )
+        )
+        await session.execute(
+            update(Job).where(Job.id == job_b.id).values(run_after=utcnow() - timedelta(hours=1))
+        )
+
+    observed = {}
+    real_mark_running = queue_mod._mark_running
+
+    async def mark_running_probe_first(session, job_id, worker_id):
+        # 领取活候选（job_b）的瞬间：独立会话读判死转移是否已提交
+        if job_id == job_b.id:
+            async with maker() as other:
+                observed["job_status"] = (await other.get(Job, job_a.id)).status
+                observed["note_status"] = (await other.get(Note, note_a)).status
+        return await real_mark_running(session, job_id, worker_id)
+
+    monkeypatch.setattr(queue_mod, "_mark_running", mark_running_probe_first)
+
+    async with maker() as session:
+        async with claim_next(session, worker_id="wkr_scan11") as job:
+            assert job is not None
+            assert job.id == job_b.id, "判死的 job_a 不执行，领取的是活候选 job_b"
+        await session.commit()
+
+    assert observed["job_status"] == "failed", "判死转移必须在领取下一个候选之前提交"
+    assert observed["note_status"] == "failed"
+
+
 async def test_claim_lease_issued_at_update_moment_not_loop_start(client, user, monkeypatch):
     """threads10 / INV-13（queue.py 租约签发时刻）：locked_at 是**租约签发
     时间**，必须取置 running 语句写入时刻的 utcnow()，而不是 claim_next
