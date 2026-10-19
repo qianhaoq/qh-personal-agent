@@ -1,0 +1,91 @@
+# Diff Quiz Gate caller — pin to qianhaoq/devflow-gates@430987e
+# Required check name: "understand / Diff Quiz Gate"
+#
+# Secrets: set GLM_API_KEY (preferred) or ZHIPU_API_KEY in repo Actions secrets.
+# No labeled/unlabeled triggers (avoid expected ghost checks).
+# No skip-understanding-gate label — use "## Diff Quiz Override" comment.
+
+name: Diff Quiz Gate
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created, edited]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to evaluate (dispatch on the PR branch to attach the check)'
+        required: true
+        type: string
+  workflow_run:
+    workflows: ["Diff Quiz Gate"]
+    types: [completed]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: >-
+    understand-gate-pr-${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pr_number || 'none' }}-${{
+    (github.event_name == 'pull_request_target' && github.run_attempt == '1' && contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action)) && 'push' ||
+    (github.event_name == 'issue_comment' && 'refresh') ||
+    format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request_target' && github.run_attempt == '1' && contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action) }}
+
+jobs:
+  understand:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'pull_request_target'
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      actions: write
+    uses: qianhaoq/devflow-gates/.github/workflows/understand-gate.yml@430987e75c8ccc4b87e56cc58ccab2d9bbc378df  # devflow-gates main @ 430987e (pinned; bump deliberately)
+    with:
+      runs_on: '["self-hosted", "linux", "x64"]'
+      glm_model: 'glm-5.3-flash'
+    secrets:
+      GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
+      ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
+
+  understand-refresh:
+    if: >-
+      github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+      (contains(github.event.comment.body, '## Diff Quiz Answer') ||
+       contains(github.event.comment.body, '## Diff Quiz Override') ||
+       startsWith(github.event.comment.body, '/recheck'))
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      actions: write
+    uses: qianhaoq/devflow-gates/.github/workflows/understand-gate.yml@430987e75c8ccc4b87e56cc58ccab2d9bbc378df  # devflow-gates main @ 430987e (pinned; bump deliberately)
+    with:
+      runs_on: '["self-hosted", "linux", "x64"]'
+      glm_model: 'glm-5.3-flash'
+    secrets:
+      GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
+      ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
+
+  understand-cancel-heal:
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'cancelled' &&
+      github.event.workflow_run.event != 'push'
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      actions: write
+    uses: qianhaoq/devflow-gates/.github/workflows/understand-gate.yml@430987e75c8ccc4b87e56cc58ccab2d9bbc378df  # devflow-gates main @ 430987e (pinned; bump deliberately)
+    with:
+      runs_on: '["self-hosted", "linux", "x64"]'
+      glm_model: 'glm-5.3-flash'
+    secrets:
+      GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
+      ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}

@@ -31,7 +31,7 @@ name: Auto Merge
 
 on:
   workflow_run:
-    workflows: ["CI", "Codex Review Gate", "QA Gate"]
+    workflows: ["CI", "Codex Review Gate", "QA Gate", "Diff Quiz Gate"]
     types: [completed]
   pull_request_review:
     types: [submitted]
@@ -75,6 +75,7 @@ jobs:
         codex / Codex Review Gate
         ci / Secret Scan
         qa / QA Gate
+        understand / Diff Quiz Gate
       merge_method: squash
       # Copilot quota is exhausted (2026-10): no Copilot dependency. Same switch as
       # ai-devflow-weekly: set repo var DISABLE_COPILOT_REVIEW=false to require it again.
