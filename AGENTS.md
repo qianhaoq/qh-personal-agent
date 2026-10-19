@@ -13,8 +13,8 @@
 ## 写代码
 
 - 写代码默认用本机 **Codex CLI**（ChatGPT 登录），模型 **`gpt-6.1-sol`**。
-- Codex 剩余额度 **≤ 20%**（5h / 周窗口取更紧者）时切回本地 **`coding glm`**（一般代码）/ **`coding kimi`**（前端、交互、UI）。
-- 查额度：`/home/box/.coding-plans/codex-quota.sh`（退出码 0=codex，1=切 glm/kimi，2=未知），或 Codex TUI 内 `/status`。
+- **周额度用完后继续用 credits** 跑 Codex；**credits 也用完**再切本地 **`coding glm`**（一般代码）/ **`coding kimi`**（前端、交互、UI）。
+- 查额度：`/home/box/.coding-plans/codex-quota.sh`（退出码 0=继续 Codex，1=切 glm/kimi，2=未知），或 Codex TUI 内 `/status`。
 - 凭证 `~/.codex/auth.json` 与任何 API key 绝不打印、外传或提交；`.codex/`、`auth.json` 已在 `.gitignore`。
 - 每个改动一个分支、一个 PR；不直接推 `main`（受保护）。
 - 改服务端前先读 [docs/server-invariants.md](docs/server-invariants.md)，改动不得违反其中不变量；新增状态变更需同步更新该文档与对应测试。
