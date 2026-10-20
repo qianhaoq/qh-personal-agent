@@ -102,7 +102,8 @@ jobs:
         (github.event.action == 'edited' || github.event.comment.in_reply_to_id)) ||
       (github.event_name == 'pull_request_target' &&
         ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
-         github.event.label.name == 'skip-codex-gate'))
+         github.event.label.name == 'skip-codex-gate' ||
+         (github.event.action == 'unlabeled' && github.event.label.name == 'no-auto-merge')))
     # GitHub checks EVERY job of the called file against this job's
     # ceiling (incl. the refresh job, which needs actions: write); the
     # evaluator's own token stays read-only.
@@ -124,7 +125,8 @@ jobs:
     if: >-
       github.event_name == 'pull_request_target' &&
       (github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
-      github.event.label.name != 'skip-codex-gate'
+      github.event.label.name != 'skip-codex-gate' &&
+      !(github.event.action == 'unlabeled' && github.event.label.name == 'no-auto-merge')
     permissions:
       contents: read
       checks: write
