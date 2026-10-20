@@ -4,6 +4,11 @@
 # Secrets: set GLM_API_KEY (preferred) or ZHIPU_API_KEY in repo Actions secrets.
 # No labeled/unlabeled triggers (avoid expected ghost checks).
 # No skip-understanding-gate label — use "## Diff Quiz Override" comment.
+#
+# ⛔ 禁止自监听（P0 根治）：本文件 name 为 "Diff Quiz Gate"，不得再写
+#   on.workflow_run.workflows: ["Diff Quiz Gate"]。GitHub 不允许 → 整份
+#   workflow silent 失效，不出 understand / Diff Quiz Gate。cancel-heal
+#   见同目录 understand-gate-cancel-heal.yml（name 必须不同）。
 
 name: Diff Quiz Gate
 
@@ -18,9 +23,6 @@ on:
         description: 'PR number to evaluate (dispatch on the PR branch to attach the check)'
         required: true
         type: string
-  workflow_run:
-    workflows: ["Diff Quiz Gate"]
-    types: [completed]
 
 permissions:
   contents: read
@@ -54,29 +56,12 @@ jobs:
       ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
 
   understand-refresh:
+    # reusable @430987e needs issues+pull-requests: write; read → startup_failure
     if: >-
       github.event_name == 'issue_comment' && github.event.issue.pull_request &&
       (contains(github.event.comment.body, '## Diff Quiz Answer') ||
        contains(github.event.comment.body, '## Diff Quiz Override') ||
        startsWith(github.event.comment.body, '/recheck'))
-    permissions:
-      contents: read
-      pull-requests: read
-      issues: read
-      actions: write
-    uses: qianhaoq/devflow-gates/.github/workflows/understand-gate.yml@430987e75c8ccc4b87e56cc58ccab2d9bbc378df  # devflow-gates main @ 430987e (pinned; bump deliberately)
-    with:
-      runs_on: '["self-hosted", "linux", "x64"]'
-      glm_model: 'glm-5.3-flash'
-    secrets:
-      GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
-      ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
-
-  understand-cancel-heal:
-    if: >-
-      github.event_name == 'workflow_run' &&
-      github.event.workflow_run.conclusion == 'cancelled' &&
-      github.event.workflow_run.event != 'push'
     permissions:
       contents: read
       pull-requests: write
