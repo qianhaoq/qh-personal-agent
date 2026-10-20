@@ -1,42 +1,11 @@
-# Example caller for the reusable QA Gate — copy to
-# YOUR_REPO/.github/workflows/qa-gate.yml.
-#
-# Required-check name produced by this example (job id `qa`):
-#   - "qa / QA Gate"
-#
-# pull_request_target keeps the workflow YAML on the trusted base branch.
-#
-# IMPORTANT: the gate REMOVES the QA label on every new push
-# (synchronize) and whenever it finds a stale label, which needs write
-# access — the caller must grant pull-requests: write and issues: write
-# (a reusable workflow can only restrict permissions further, never
-# elevate them).
-#
-# Triggers (PR-only): every QA input change — push, label, draft/ready —
-# is itself a pull_request_target event, so there is NO schedule (each
-# scheduled run boots a runner; the old */15 refresh re-ran legitimately
-# red gates forever). labeled/unlabeled for the QA label (`qa-passed`) →
-# real evaluate (job `qa`). Any OTHER label → job `qa-label-ack` mirrors
-# the latest "qa / QA Gate" conclusion via Checks API (avoids "is
-# expected" ghost without burning a full QA evaluate + write ceiling on
-# triage labels). synchronize is NEVER filtered.
-# Cancel-heal requires upstream devflow-gates companion workflow support; do not self-listen.
-#
-# Concurrency (a label event can never cancel a push evaluation):
-#   - push-class runs (opened / synchronize / reopened) share one group per
-#     PR with cancel-in-progress: a newer commit cancels only the
-#     evaluation of the OLDER head (whose check sits on the old SHA; the
-#     newer run strips the label anyway).
-#   - labeled/unlabeled MUST share label-{head.sha} + cancel-in-progress
-#     (Plan B) across evaluate + ack: this is the primary TOCTOU lock.
-#     Mirror revalidation is defense only. A later triage label
-#     may cancel unfinished qa-passed evaluate; reapply it or /recheck.
-#   - every other run (ready / draft / dispatch /
-#     skipped) gets its own group: never cancelled, never cancels.
-# The gate itself does not rely on this: the sign-off is bound to the head
-# SHA via server-side run records and a stale label is stripped on ANY
-# event (fail closed), even if a push run was cancelled.
-
+# Example caller: copy to .github/workflows/qa-gate.yml.
+# Required check: "qa / QA Gate".
+# pull_request_target uses trusted base YAML; never check out or execute PR code.
+# Also install qa-gate-cancel-heal.yml: self-listening workflow_run is invalid.
+# Irrelevant labels mirror only a same-named real gate verdict; success requires
+# current relevant-label state to match the source verdict's event history.
+# Evaluate and ack share label-{sha}; unrelated-label ack never cancels evaluation.
+# Push, refresh, and heal runs remain isolated; reruns never cancel new pushes.
 name: QA Gate
 
 on:
@@ -58,25 +27,26 @@ permissions:
 # cancelling push group: a re-run of an OLD head's synchronize run would
 # otherwise cancel the newest head's evaluation.
 concurrency:
-  # Plan B: serialize label evaluate + ack by PR + SHA to close mirror TOCTOU.
-  # A later triage label can cancel an unfinished relevant-label evaluate;
-  # accepted tradeoff: reapply the relevant label or use /recheck to evaluate.
+  # Shared label-{sha} is the main lock: evaluate and ack cannot run concurrently.
+  # Only relevant-label evaluate cancels running work; unrelated-label ack never does.
+  # Ack may replace a pending evaluate; mirror label-event time validation then
+  # rejects stale success with failure, rather than bypassing that evaluation.
   group: >-
     qa-gate-pr-${{ github.event.pull_request.number || github.event.inputs.pr_number || 'none' }}-${{
     (github.event_name == 'pull_request_target' && github.run_attempt == '1' && contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action)) && 'push' ||
     (github.event_name == 'pull_request_target' && contains(fromJSON('["labeled","unlabeled"]'), github.event.action)) && format('label-{0}', github.event.pull_request.head.sha) ||
     format('run-{0}', github.run_id) }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request_target' && ((github.run_attempt == '1' && contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action)) || contains(fromJSON('["labeled","unlabeled"]'), github.event.action)) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request_target' && ((github.run_attempt == '1' && contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action)) || (contains(fromJSON('["labeled","unlabeled"]'), github.event.action) && contains(fromJSON('["qa-passed","no-auto-merge"]'), github.event.label.name))) }}
 
 jobs:
   qa:
     # Real evaluate: non-label PRT events, or labeled/unlabeled for the
-    # QA label only. Irrelevant labels go to qa-label-ack (anti-ghost).
+    # QA label / no-auto-merge. Irrelevant labels go to qa-label-ack (anti-ghost).
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request_target' &&
         ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
-         github.event.label.name == 'qa-passed'))
+         (github.event.label.name == 'qa-passed' || github.event.label.name == 'no-auto-merge')))
     # GitHub checks EVERY job of the called file against this job's
     # ceiling (incl. the skipped refresh job, which needs actions: write);
     # the evaluator itself narrows to actions: read.
@@ -85,7 +55,7 @@ jobs:
       pull-requests: write
       issues: write
       actions: write
-    uses: qianhaoq/devflow-gates/.github/workflows/qa-gate.yml@42fdd49f44c69f4e748c6f8e9bf1ac2b0ffb18e2  # devflow-gates main @ 42fdd49 (方案 B; bump deliberately)
+    uses: qianhaoq/devflow-gates/.github/workflows/qa-gate.yml@7e029a2c7d549e86e80331267928281f53ba180b # devflow-gates main @ 7e029a2
     with:
       runs_on: '["self-hosted", "linux", "x64"]'
       qa_label: 'qa-passed'
@@ -97,14 +67,15 @@ jobs:
     if: >-
       github.event_name == 'pull_request_target' &&
       (github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
-      github.event.label.name != 'qa-passed'
+      github.event.label.name != 'qa-passed' && github.event.label.name != 'no-auto-merge'
     permissions:
       contents: read
       checks: write
       actions: write
       issues: write
-    uses: qianhaoq/devflow-gates/.github/workflows/mirror-required-check.yml@42fdd49f44c69f4e748c6f8e9bf1ac2b0ffb18e2  # devflow-gates main @ 42fdd49 (方案 B; bump deliberately)
+    uses: qianhaoq/devflow-gates/.github/workflows/mirror-required-check.yml@7e029a2c7d549e86e80331267928281f53ba180b # devflow-gates main @ 7e029a2
     with:
+      relevant_labels: 'qa-passed,no-auto-merge'
       check_name: 'qa / QA Gate'
       runs_on: '["self-hosted", "linux", "x64"]'
 
@@ -118,6 +89,6 @@ jobs:
   #     pull-requests: read
   #     issues: read
   #     actions: write
-  #   uses: qianhaoq/devflow-gates/.github/workflows/qa-gate.yml@42fdd49f44c69f4e748c6f8e9bf1ac2b0ffb18e2  # devflow-gates main @ 42fdd49 (方案 B; bump deliberately)
+  #   uses: qianhaoq/devflow-gates/.github/workflows/qa-gate.yml@7e029a2c7d549e86e80331267928281f53ba180b # devflow-gates main @ 7e029a2
   #   with:
   #     runs_on: '["self-hosted", "linux", "x64"]'   # keep in sync with qa job above

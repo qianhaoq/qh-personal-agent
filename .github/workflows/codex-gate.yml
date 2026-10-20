@@ -1,54 +1,11 @@
-# Example caller for the reusable Codex Review Gate — copy to
-# YOUR_REPO/.github/workflows/codex-gate.yml.
-#
-# Required-check name produced by this example (job id `codex`):
-#   - "codex / Codex Review Gate"
-#
-# pull_request_target keeps the workflow YAML on the trusted base branch
-# while evaluating untrusted PRs; the reusable gate is read-only and
-# never checks out the PR head.
-#
-# Triggers (PR-only, deduplicated to save Actions minutes):
-#   - pull_request_target: push / open / ready / draft, plus labeled /
-#     unlabeled. Gate-relevant label (`skip-codex-gate`) → real evaluate
-#     (job `codex`). Any OTHER label → job `codex-label-ack` mirrors the
-#     latest "codex / Codex Review Gate" conclusion via Checks API (no
-#     runner on the reusable gate; no "is expected" ghost). A run whose
-#     jobs all skip would hang the required check — never do that.
-#   - pull_request_review (submitted) by Codex only. One Codex review with
-#     N inline comments = ONE run.
-#   - pull_request_review_comment by Codex only, and only when it is an
-#     EDIT or a thread REPLY (e.g. a finding edited into P0/P1). New
-#     top-level inline comments are part of a submitted review, which
-#     already evaluates — the old unfiltered trigger fired N more runs.
-#   - issue_comment → the REFRESH job, only for comments by Codex (summary
-#     created/edited, "no major issues") or a "/recheck" comment. Its
-#     conclusion would land on the default branch, so it does not
-#     evaluate: it re-runs the latest failed head gate run only if the
-#     gate would now pass (else at most the newest cancelled one; one
-#     re-run per PR; never past run_attempt 3).
-#   - workflow_dispatch(pr_number): evaluates; attaches to the PR head only
-#     when dispatched ON the PR branch (e.g. GITHUB_TOKEN-created PRs).
-#   - No schedule: thread resolution (webhook-only, cannot trigger
-#     Actions) is picked up by the next Codex comment, a push, or a
-#     "/recheck" comment on the PR. Add an hourly-or-slower cron only if
-#     you really need it (each scheduled run boots a runner).
-# Cancel-heal requires upstream devflow-gates companion workflow support; do not self-listen.
-#
-# Concurrency (never lets one event class cancel another):
-#   - push-class runs (opened / synchronize / reopened) share one group per
-#     PR with cancel-in-progress: a new commit cancels the evaluation of
-#     the OLDER head only (that cancelled check sits on the old SHA).
-#   - relevant refresh runs (Codex / "/recheck" comments) queue per PR
-#     (a running one is never cancelled).
-#   - labeled/unlabeled MUST share label-{head.sha} + cancel-in-progress
-#     (Plan B) across evaluate + ack: this is the primary TOCTOU lock.
-#     Mirror revalidation is defense only. A later triage label
-#     may cancel unfinished skip-codex-gate evaluate; reapply it or /recheck.
-#   - every other run (Codex reviews, dispatch, skipped events)
-#     gets its own group: never cancelled, never cancels. Gate runs are
-#     ~15 s, read live state, and are idempotent.
-
+# Example caller: copy to .github/workflows/codex-gate.yml.
+# Required check: "codex / Codex Review Gate".
+# pull_request_target uses trusted base YAML; never check out or execute PR code.
+# Also install codex-gate-cancel-heal.yml: self-listening workflow_run is invalid.
+# Irrelevant labels mirror only a same-named real gate verdict; success requires
+# current relevant-label state to match the source verdict's event history.
+# Evaluate and ack share label-{sha}; unrelated-label ack never cancels evaluation.
+# Push, refresh, and heal runs remain isolated; reruns never cancel new pushes.
 name: Codex Review Gate
 
 on:
@@ -76,9 +33,10 @@ permissions:
 # cancelling push group: a re-run of an OLD head's synchronize run would
 # otherwise cancel the newest head's evaluation.
 concurrency:
-  # Plan B: serialize label evaluate + ack by PR + SHA to close mirror TOCTOU.
-  # A later triage label can cancel an unfinished relevant-label evaluate;
-  # accepted tradeoff: reapply the relevant label or use /recheck to evaluate.
+  # Shared label-{sha} is the main lock: evaluate and ack cannot run concurrently.
+  # Only relevant-label evaluate cancels running work; unrelated-label ack never does.
+  # Ack may replace a pending evaluate; mirror label-event time validation then
+  # rejects stale success with failure, rather than bypassing that evaluation.
   group: >-
     codex-gate-pr-${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pr_number || 'none' }}-${{
     (github.event_name == 'pull_request_target' && github.run_attempt == '1' && contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action)) && 'push' ||
@@ -87,12 +45,12 @@ concurrency:
        startsWith(github.event.comment.body, '/recheck'))) && 'refresh' ||
     (github.event_name == 'pull_request_target' && contains(fromJSON('["labeled","unlabeled"]'), github.event.action)) && format('label-{0}', github.event.pull_request.head.sha) ||
     format('run-{0}', github.run_id) }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request_target' && ((github.run_attempt == '1' && contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action)) || contains(fromJSON('["labeled","unlabeled"]'), github.event.action)) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request_target' && ((github.run_attempt == '1' && contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action)) || (contains(fromJSON('["labeled","unlabeled"]'), github.event.action) && contains(fromJSON('["skip-codex-gate","no-auto-merge"]'), github.event.label.name))) }}
 
 jobs:
   codex:
     # Real evaluate: non-label PRT events, or labeled/unlabeled for
-    # skip-codex-gate only. Irrelevant labels go to codex-label-ack.
+    # skip-codex-gate / no-auto-merge. Irrelevant labels go to codex-label-ack.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request_review' &&
@@ -102,8 +60,7 @@ jobs:
         (github.event.action == 'edited' || github.event.comment.in_reply_to_id)) ||
       (github.event_name == 'pull_request_target' &&
         ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
-         github.event.label.name == 'skip-codex-gate' ||
-         (github.event.action == 'unlabeled' && github.event.label.name == 'no-auto-merge')))
+         (github.event.label.name == 'skip-codex-gate' || github.event.label.name == 'no-auto-merge')))
     # GitHub checks EVERY job of the called file against this job's
     # ceiling (incl. the refresh job, which needs actions: write); the
     # evaluator's own token stays read-only.
@@ -112,7 +69,7 @@ jobs:
       pull-requests: read
       issues: read
       actions: write
-    uses: qianhaoq/devflow-gates/.github/workflows/codex-gate.yml@42fdd49f44c69f4e748c6f8e9bf1ac2b0ffb18e2  # devflow-gates main @ 42fdd49 (方案 B; bump deliberately)
+    uses: qianhaoq/devflow-gates/.github/workflows/codex-gate.yml@7e029a2c7d549e86e80331267928281f53ba180b # devflow-gates main @ 7e029a2
     with:
       runs_on: '["self-hosted", "linux", "x64"]'
       wait_minutes: 20
@@ -125,15 +82,15 @@ jobs:
     if: >-
       github.event_name == 'pull_request_target' &&
       (github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
-      github.event.label.name != 'skip-codex-gate' &&
-      !(github.event.action == 'unlabeled' && github.event.label.name == 'no-auto-merge')
+      github.event.label.name != 'skip-codex-gate' && github.event.label.name != 'no-auto-merge'
     permissions:
       contents: read
       checks: write
       actions: write
       issues: write
-    uses: qianhaoq/devflow-gates/.github/workflows/mirror-required-check.yml@42fdd49f44c69f4e748c6f8e9bf1ac2b0ffb18e2  # devflow-gates main @ 42fdd49 (方案 B; bump deliberately)
+    uses: qianhaoq/devflow-gates/.github/workflows/mirror-required-check.yml@7e029a2c7d549e86e80331267928281f53ba180b # devflow-gates main @ 7e029a2
     with:
+      relevant_labels: 'skip-codex-gate,no-auto-merge'
       # Keep in sync with the required-check name this caller produces.
       check_name: 'codex / Codex Review Gate'
       runs_on: '["self-hosted", "linux", "x64"]'
@@ -151,7 +108,7 @@ jobs:
       pull-requests: read
       issues: read
       actions: write
-    uses: qianhaoq/devflow-gates/.github/workflows/codex-gate.yml@42fdd49f44c69f4e748c6f8e9bf1ac2b0ffb18e2  # devflow-gates main @ 42fdd49 (方案 B; bump deliberately)
+    uses: qianhaoq/devflow-gates/.github/workflows/codex-gate.yml@7e029a2c7d549e86e80331267928281f53ba180b # devflow-gates main @ 7e029a2
     with:
       runs_on: '["self-hosted", "linux", "x64"]'
       wait_minutes: 20

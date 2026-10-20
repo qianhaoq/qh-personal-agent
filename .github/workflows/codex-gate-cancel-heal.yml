@@ -1,0 +1,33 @@
+# Copy alongside codex-gate.yml on the default branch.
+# A workflow cannot listen to itself; this companion heals the source gate.
+name: Codex Review Gate Cancel Heal
+
+on:
+  workflow_run:
+    workflows: ["Codex Review Gate"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-cancel-heal-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  codex-cancel-heal:
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'cancelled' &&
+      github.event.workflow_run.event != 'push'
+    permissions:
+      # Same ceiling as codex-refresh: the reusable refresh job needs
+      # actions: write to re-run the cancelled run.
+      contents: read
+      pull-requests: read
+      issues: read
+      actions: write
+    uses: qianhaoq/devflow-gates/.github/workflows/codex-gate.yml@7e029a2c7d549e86e80331267928281f53ba180b # devflow-gates main @ 7e029a2
+    with:
+      runs_on: '["self-hosted", "linux", "x64"]'
+      wait_minutes: 20
