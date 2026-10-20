@@ -12,9 +12,10 @@
 
 ## 写代码
 
-- 写代码默认用本机 **Codex CLI**（ChatGPT 登录），模型 **`gpt-6.1-sol`**。
+- **适用范围（写死）**：Codex / `coding` / `/home/box/.../codex-quota.sh` **仅**本机或 `/home/box`；Copilot cloud / 仅 Node·npm / 无 Codex 环境按该环境可用工具，**严禁**强制 box 路径或本机工具序。
+- （本机/box）写代码默认用 **Codex CLI**（ChatGPT 登录），模型 **`gpt-6.1-sol`**。
 - **周额度用完后继续用 credits** 跑 Codex；**credits 也用完**再切本地 **`coding glm`**（一般代码）/ **`coding kimi`**（前端、交互、UI）。
-- 查额度：`/home/box/.coding-plans/codex-quota.sh`（退出码 0=继续 Codex，1=切 glm/kimi，2=未知），或 Codex TUI 内 `/status`。
+- 查额度（仅本机/box）：`/home/box/.coding-plans/codex-quota.sh`（退出码 0=继续 Codex，1=切 glm/kimi，2=未知），或 Codex TUI 内 `/status`；云端无此脚本时跳过。
 - 凭证 `~/.codex/auth.json` 与任何 API key 绝不打印、外传或提交；`.codex/`、`auth.json` 已在 `.gitignore`。
 - 每个改动一个分支、一个 PR；不直接推 `main`（受保护）。
 - 改服务端前先读 [docs/server-invariants.md](docs/server-invariants.md)，改动不得违反其中不变量；新增状态变更需同步更新该文档与对应测试。
@@ -96,6 +97,6 @@ Codex / 评审 bot 评审本仓 PR 时：
 
 ## PR 证据与自动修上限（2026-10-20）
 
-- **不要求人类 approve**；Gate 仍只挡 **P0/P1**（P2 不挡）。
+- **不要求人类 approve**；Gate 仍只挡 **P0/P1（及未标注）**（纯 P2 不挡）。
 - **PR 必须贴证据**：正文写清「跑了什么测试 + 关键输出」（命令与摘要即可）；口头 done / 只勾 checkbox 不算。
-- **同类 P1 自动修超 3 轮仍未清**：停自动循环；改开跟进 issue/PR，或降级为观察（observe），不得继续盲推。
+- **同类 P1 自动修超 3 轮仍未清（写死）**：三轮上限**只**停止自动修循环（不得继续盲推）。**未 Resolve 的 P1 永远挡合入**——重试次数不改变严重度、不降级门禁。交给人/产品开跟进 issue/PR 继续修。**严禁**因重试次数把 P1 标成 observe、won't-fix、或 Resolve 后放行合入。
