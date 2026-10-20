@@ -14,3 +14,6 @@ local.properties
 *.jks
 .idea/
 .DS_Store
+# Codex CLI 凭证，勿提交
+.codex/
+auth.json

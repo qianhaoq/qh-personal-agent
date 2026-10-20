@@ -12,8 +12,10 @@
 
 ## 写代码
 
-- 代码改动默认交给本地 **`coding glm`**，模型用用户指定的 **GLM 5.3**。
-- 前端 / UI（Android 界面、交互、样式）交给 **`coding kimi`**。
+- 写代码默认用本机 **Codex CLI**（ChatGPT 登录），模型 **`gpt-6.1-sol`**。
+- **周额度用完后继续用 credits** 跑 Codex；**credits 也用完**再切本地 **`coding glm`**（一般代码）/ **`coding kimi`**（前端、交互、UI）。
+- 查额度：`/home/box/.coding-plans/codex-quota.sh`（退出码 0=继续 Codex，1=切 glm/kimi，2=未知），或 Codex TUI 内 `/status`。
+- 凭证 `~/.codex/auth.json` 与任何 API key 绝不打印、外传或提交；`.codex/`、`auth.json` 已在 `.gitignore`。
 - 每个改动一个分支、一个 PR；不直接推 `main`（受保护）。
 - 改服务端前先读 [docs/server-invariants.md](docs/server-invariants.md)，改动不得违反其中不变量；新增状态变更需同步更新该文档与对应测试。
 
@@ -84,3 +86,16 @@ Codex / 评审 bot 评审本仓 PR 时：
 
 - 密钥只放在 `/home/box/.coding-plans/`（以及服务端运行时的 `.env`），**绝不**写进仓库、PR、issue、日志或聊天。
 - 仓库里只提交 `.env.example` 这类不含真值的模板；CI 的 Secret Scan（gitleaks）会拦截泄露。
+
+## 测试与门禁（禁止弱化凑绿）
+
+- **禁止**为过 CI / Gate 而弱化、删改断言，或用 `skip` / `xit` / `.only`、改 fixture、放宽阈值等方式凑绿；也禁止让测试迁就错误实现。
+- 红灯时优先修产品代码，或按真实意图**加强**测试；若断言本身写错，须在 PR 写明「原断言为何错、新断言覆盖什么」再改测试。
+- AI 同时写代码与测试时，须用独立评审（Codex Gate / 人工）或既有回归交叉验证，勿代码与测试互相迁就。
+
+
+## PR 证据与自动修上限（2026-10-20）
+
+- **不要求人类 approve**；Gate 仍只挡 **P0/P1**（P2 不挡）。
+- **PR 必须贴证据**：正文写清「跑了什么测试 + 关键输出」（命令与摘要即可）；口头 done / 只勾 checkbox 不算。
+- **同类 P1 自动修超 3 轮仍未清**：停自动循环；改开跟进 issue/PR，或降级为观察（observe），不得继续盲推。
