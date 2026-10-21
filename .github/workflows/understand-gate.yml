@@ -47,7 +47,7 @@ jobs:
       pull-requests: write
       issues: write
       actions: write
-    uses: qianhaoq/devflow-gates/.github/workflows/understand-gate.yml@1335569ba86645df8be423e42c136a2625aaeebb # devflow-gates main @ 1335569
+    uses: qianhaoq/devflow-gates/.github/workflows/understand-gate.yml@1f36c8aa40e288a7154a8aa9f6077c45d826857f # devflow-gates main @ 1335569
     with:
       runs_on: '["self-hosted", "linux", "x64"]'
       glm_model: 'glm-5.3-flash'
@@ -67,7 +67,7 @@ jobs:
       pull-requests: write
       issues: write
       actions: write
-    uses: qianhaoq/devflow-gates/.github/workflows/understand-gate.yml@1335569ba86645df8be423e42c136a2625aaeebb # devflow-gates main @ 1335569
+    uses: qianhaoq/devflow-gates/.github/workflows/understand-gate.yml@1f36c8aa40e288a7154a8aa9f6077c45d826857f # devflow-gates main @ 1335569
     with:
       runs_on: '["self-hosted", "linux", "x64"]'
       glm_model: 'glm-5.3-flash'
