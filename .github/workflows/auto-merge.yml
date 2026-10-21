@@ -64,7 +64,7 @@ jobs:
       (github.event_name != 'pull_request_review' ||
       github.event.review.state == 'approved' ||
       github.event.review.user.login == 'copilot-pull-request-reviewer[bot]')
-    uses: qianhaoq/devflow-gates/.github/workflows/auto-merge.yml@1f36c8aa40e288a7154a8aa9f6077c45d826857f # devflow-gates main @ 1f36c8a
+    uses: qianhaoq/devflow-gates/.github/workflows/auto-merge.yml@647105c2e3eae7f428b2219dd2c16b369ae235b5 # devflow-gates main @ 647105c
     with:
       runs_on: '["self-hosted", "linux", "x64"]'
       # Exact check-run names = "<caller job name> / <called job name>"
