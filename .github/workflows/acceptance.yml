@@ -22,6 +22,6 @@ jobs:
       contents: read
       pull-requests: write   # sticky report comment
       checks: read           # read the Codex gate result
-    uses: qianhaoq/devflow-gates/.github/workflows/acceptance.yml@7e029a2c7d549e86e80331267928281f53ba180b # devflow-gates main @ 7e029a2
+    uses: qianhaoq/devflow-gates/.github/workflows/acceptance.yml@1335569ba86645df8be423e42c136a2625aaeebb # devflow-gates main @ 1335569
     with:
       runs_on: '["self-hosted", "linux", "x64"]'
