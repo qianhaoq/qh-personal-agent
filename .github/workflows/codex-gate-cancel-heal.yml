@@ -27,7 +27,7 @@ jobs:
       pull-requests: read
       issues: read
       actions: write
-    uses: qianhaoq/devflow-gates/.github/workflows/codex-gate.yml@647105c2e3eae7f428b2219dd2c16b369ae235b5 # devflow-gates main @ 647105c
+    uses: qianhaoq/devflow-gates/.github/workflows/codex-gate.yml@fe7cf651ef515f165041738dc285b03ce3817bb9 # devflow-gates main @ fe7cf65
     with:
       runs_on: '["self-hosted", "linux", "x64"]'
       wait_minutes: 20

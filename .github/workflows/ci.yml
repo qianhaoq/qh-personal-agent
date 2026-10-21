@@ -28,7 +28,7 @@ jobs:
     # Caller-level skip: the skipped check is named after this job, never
     # the required "ci / Build & Test" (whose last result stays in force).
     if: github.event.action != 'edited' || github.event.changes.base != null
-    uses: qianhaoq/devflow-gates/.github/workflows/ci.yml@647105c2e3eae7f428b2219dd2c16b369ae235b5 # devflow-gates main @ 647105c
+    uses: qianhaoq/devflow-gates/.github/workflows/ci.yml@fe7cf651ef515f165041738dc285b03ce3817bb9 # devflow-gates main @ fe7cf65
     with:
       runs_on: '["self-hosted", "linux", "x64"]'
       python_version: ''  # self-hosted Debian: skip setup-python; python3.12 on PATH via uv
