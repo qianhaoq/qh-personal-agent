@@ -69,7 +69,7 @@ jobs:
       pull-requests: read
       issues: read
       actions: write
-    uses: qianhaoq/devflow-gates/.github/workflows/codex-gate.yml@7e029a2c7d549e86e80331267928281f53ba180b # devflow-gates main @ 7e029a2
+    uses: qianhaoq/devflow-gates/.github/workflows/codex-gate.yml@fe7cf651ef515f165041738dc285b03ce3817bb9 # devflow-gates main @ fe7cf65
     with:
       runs_on: '["self-hosted", "linux", "x64"]'
       wait_minutes: 20
@@ -79,20 +79,26 @@ jobs:
   # latest same-named conclusion via Checks API instead — no false green
   # (refuses to invent a conclusion when none exists).
   codex-label-ack:
+    # Job name = required prefix: this job IS "codex / Codex Review Gate"
+    # (conclusion = latest real verdict; no checks.create).
+    name: codex
     if: >-
       github.event_name == 'pull_request_target' &&
       (github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
       github.event.label.name != 'skip-codex-gate' && github.event.label.name != 'no-auto-merge'
     permissions:
       contents: read
-      checks: write
+      checks: read
       actions: write
       issues: write
-    uses: qianhaoq/devflow-gates/.github/workflows/mirror-required-check.yml@7e029a2c7d549e86e80331267928281f53ba180b # devflow-gates main @ 7e029a2
+      pull-requests: read   # private repos: mirror label validation (issues.get/listEvents)
+    uses: qianhaoq/devflow-gates/.github/workflows/mirror-required-check.yml@fe7cf651ef515f165041738dc285b03ce3817bb9 # devflow-gates main @ fe7cf65
     with:
       relevant_labels: 'skip-codex-gate,no-auto-merge'
       # Keep in sync with the required-check name this caller produces.
       check_name: 'codex / Codex Review Gate'
+      job_name: 'Codex Review Gate'
+      wait_minutes: 30   # > real gate max runtime + runner queue
       runs_on: '["self-hosted", "linux", "x64"]'
 
   # Refresh path — Codex comments and "/recheck" only (see header).
@@ -108,7 +114,7 @@ jobs:
       pull-requests: read
       issues: read
       actions: write
-    uses: qianhaoq/devflow-gates/.github/workflows/codex-gate.yml@7e029a2c7d549e86e80331267928281f53ba180b # devflow-gates main @ 7e029a2
+    uses: qianhaoq/devflow-gates/.github/workflows/codex-gate.yml@fe7cf651ef515f165041738dc285b03ce3817bb9 # devflow-gates main @ fe7cf65
     with:
       runs_on: '["self-hosted", "linux", "x64"]'
       wait_minutes: 20
