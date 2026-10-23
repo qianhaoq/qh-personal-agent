@@ -55,3 +55,5 @@
 - `integrity / Skip Guard` — 拦 skip/xit/optional/continue-on-error 逃避
 
 **暂不**加入 branch protection / auto-merge `required_checks`（等 2026-11-02 理解门禁验收前再定是否升必需）。逃生：`## Test Integrity Override` + 理由。
+
+<!-- probe 20261023T054516Z: confirm integrity Assertion/Skip Guard checks appear; close after -->
