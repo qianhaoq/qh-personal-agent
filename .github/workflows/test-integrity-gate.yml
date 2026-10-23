@@ -1,0 +1,37 @@
+# Test Integrity Gate caller — pin to qianhaoq/devflow-gates@5b668c5
+# Trial check names (NOT required yet — Diff Quiz trial thru 2026-11-02):
+#   - "integrity / Assertion Guard"
+#   - "integrity / Skip Guard"
+#
+# Do NOT add to branch protection / auto-merge required_checks until
+# checks are stable and the understand-gate acceptance decides.
+# Escape: PR comment "## Test Integrity Override" + 理由（authorized only）.
+
+name: Test Integrity Gate
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number (dispatch on PR branch for head-attached checks)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  integrity:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'pull_request_target'
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: qianhaoq/devflow-gates/.github/workflows/test-integrity-gate.yml@5b668c522aa5404877fa62ec7ee9db2c2894c9b5 # devflow-gates main @ 5b668c5
+    with:
+      runs_on: '["self-hosted", "linux", "x64"]'
+      mode: enforce
