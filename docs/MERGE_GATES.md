@@ -46,3 +46,12 @@
 
 - Gate 仍只挡 **P0/P1（及未标注）**；**不要求人类 approve**。
 - **同类 P1** 自动修复超过 **3 轮**仍未清零（写死）：三轮上限**只**停自动修循环。**未 Resolve 的 P1 永远挡合入**；重试次数不改变严重度。开跟进 issue/PR 交给人/产品继续修。**严禁**因重试次数 observe / won't-fix / Resolve 放行。禁止为凑绿弱化测试。
+
+## Test Integrity Gate（试验观察，暂非必需）
+
+与 Diff Quiz 并排：调用 `devflow-gates` 的 Assertion Guard / Skip Guard，检查名：
+
+- `integrity / Assertion Guard` — 拦删/削弱监控与测试断言
+- `integrity / Skip Guard` — 拦 skip/xit/optional/continue-on-error 逃避
+
+**暂不**加入 branch protection / auto-merge `required_checks`（等 2026-11-02 理解门禁验收前再定是否升必需）。逃生：`## Test Integrity Override` + 理由。
