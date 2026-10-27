@@ -25,6 +25,8 @@ if [ -f android/settings.gradle.kts ] || [ -f android/settings.gradle ]; then
     echo "android/ has a Gradle project but no executable gradlew" >&2
     exit 1
   fi
+  source "$(dirname "${BASH_SOURCE[0]}")/ci-android-setup.sh"
+  setup_android_build
   (cd android && ./gradlew --no-daemon assembleDebug testDebugUnitTest)
   ran=1
 else
