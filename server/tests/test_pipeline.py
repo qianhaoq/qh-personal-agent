@@ -40,9 +40,7 @@ async def _create_and_extract(client, user, text, run_jobs) -> Note:
 
 
 async def _post_note_without_schedule(client, user, text: str, **extra) -> str:
-    import app.workers.dispatch as dispatch
-    from app.jobs.queue import enqueue
-    from app.db import get_sessionmaker
+    from app.workers import dispatch
 
     prev = dispatch.schedule_organize
     dispatch.schedule_organize = lambda work_item: None  # type: ignore[assignment]
@@ -240,7 +238,7 @@ async def test_extract_skips_when_rev_moved_marks_done(client, user, monkeypatch
     await _enqueue_extract(note_id, rev=1)
 
     # 抽取跑之前先 PATCH（rev 1→2）；再手动入队新 rev 的 extract job
-    import app.workers.dispatch as dispatch
+    from app.workers import dispatch
     prev = dispatch.schedule_organize
     dispatch.schedule_organize = lambda work_item: None  # type: ignore[assignment]
     try:
@@ -351,7 +349,7 @@ async def test_extract_finalize_skips_note_patched_after_enqueue(client, user, m
             # 第 3 次（最后一次）失败收尾前，用户 PATCH：rev+1；再手动入队
             # 新 rev extract（API 已不 enqueue extract），并恢复 LLM
             monkeypatch.undo()
-            import app.workers.dispatch as dispatch
+            from app.workers import dispatch
             prev = dispatch.schedule_organize
             dispatch.schedule_organize = lambda work_item: None  # type: ignore[assignment]
             try:
@@ -699,3 +697,4 @@ async def test_llm_non_list_collection_fields_discarded_not_failed(client, user,
     assert note.title == "标题照常"
     assert note.tags == [] and note.todos == [], "非 list 集合字段整字段丢弃"
     assert reminders == []
+    assert note.llm_calls >= 1

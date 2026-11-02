@@ -23,7 +23,7 @@ async def _create_note_with_job(client, user) -> tuple[str, str]:
 
     屏蔽 schedule_organize，避免 Ticket Worker 与 jobs 测的 extract 双跑。
     """
-    import app.workers.dispatch as dispatch
+    from app.workers import dispatch
 
     prev = dispatch.schedule_organize
     dispatch.schedule_organize = lambda work_item: None  # type: ignore[assignment]
@@ -58,7 +58,7 @@ async def _create_note_with_job(client, user) -> tuple[str, str]:
 
 async def _post_note_without_schedule(client, user, text: str) -> str:
     """POST /v1/notes 但屏蔽 Ticket Worker，返回 note_id。"""
-    import app.workers.dispatch as dispatch
+    from app.workers import dispatch
 
     prev = dispatch.schedule_organize
     dispatch.schedule_organize = lambda work_item: None  # type: ignore[assignment]
@@ -196,10 +196,9 @@ async def test_claim_commits_dead_job_transition_before_next_candidate(
     两后端都跑；调用方式按 claim_next 新契约（上下文退出后自行提交）。"""
     from app.jobs import queue as queue_mod
 
-    headers = auth_headers(user)
     # 笔记 A 先建（其 extract job 是判死候选），笔记 B 的 job 是活候选
     note_a, job_a_id = await _create_note_with_job(client, user)
-    note_b, job_b_id = await _create_note_with_job(client, user)
+    _note_b, job_b_id = await _create_note_with_job(client, user)
 
     maker = get_sessionmaker()
     async with maker() as session:

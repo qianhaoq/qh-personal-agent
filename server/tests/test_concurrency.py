@@ -20,12 +20,12 @@ from tests.conftest import auth_headers, requires_postgres
 
 async def _post_note_with_manual_extract(client, user, text: str, *, rev: int = 1) -> tuple[str, str]:
     """屏蔽 Ticket 调度，POST 后手动 enqueue extract；返回 (note_id, job_id)。"""
-    import app.workers.dispatch as dispatch
     from sqlalchemy import select
 
     from app.db import get_sessionmaker
     from app.jobs.queue import enqueue
     from app.models import Job
+    from app.workers import dispatch
 
     prev = dispatch.schedule_organize
     dispatch.schedule_organize = lambda work_item: None  # type: ignore[assignment]
@@ -59,7 +59,7 @@ async def _post_note_with_manual_extract(client, user, text: str, *, rev: int = 
 
 async def test_concurrent_patch_same_rev_exactly_one_success(client, user, monkeypatch):
     """同 rev 并发 PATCH：恰好一个 200、一个 409。"""
-    import app.workers.dispatch as dispatch
+    from app.workers import dispatch
 
     # 屏蔽 create 的 Ticket 调度，避免 extract 抢先 bump rev 导致双 409
     monkeypatch.setattr(dispatch, "schedule_organize", lambda work_item: None)
@@ -240,7 +240,6 @@ async def test_other_user_writes_during_llm_and_memory_sync(client, user, monkey
     from app.pipeline.runner import run_pending_jobs
     from tests.conftest import make_invite
 
-    headers = auth_headers(user)
     user1_note_id, _jid = await _post_note_with_manual_extract(client, user, "user1 的笔记")
 
     in_llm, release_llm = asyncio.Event(), asyncio.Event()
@@ -292,6 +291,9 @@ async def test_other_user_writes_during_llm_and_memory_sync(client, user, monkey
 
     release_memory.set()
     await asyncio.wait_for(worker, timeout=10)
+    from app.workers.dispatch import drain_organize_tasks
+
+    await drain_organize_tasks()
 
     # 两个用户的笔记最终都抽取完成、记忆同步
     async with get_sessionmaker()() as session:
@@ -421,6 +423,7 @@ async def test_patch_delete_organize_three_way_overlap_no_deadlock(client, user,
         note_id, _jid = await _post_note_with_manual_extract(
             client, user, f"第 {i} 轮三方重叠"
         )
+        assert note_id and _jid
         note_ids.append(note_id)
 
         worker = asyncio.create_task(run_pending_jobs(limit=1))
@@ -564,7 +567,7 @@ async def test_claim_dead_jobs_commit_between_candidates_no_deadlock(client, use
     的条件更新只等 PATCH 提交——无环。"""
     from datetime import timedelta
 
-    from sqlalchemy import select, update
+    from sqlalchemy import update
 
     from app.config import get_settings
     from app.db import get_sessionmaker

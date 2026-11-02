@@ -262,8 +262,8 @@ async def test_extract_json_object_bad_json_marks_note_failed(client, user, monk
 
     monkeypatch.setattr("app.pipeline.extract.get_llm_client", fake_get_llm)
 
-    import app.workers.dispatch as dispatch
     from app.jobs.queue import enqueue
+    from app.workers import dispatch
 
     prev = dispatch.schedule_organize
     dispatch.schedule_organize = lambda work_item: None  # type: ignore[assignment]

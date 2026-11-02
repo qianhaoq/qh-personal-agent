@@ -297,9 +297,9 @@ async def test_memory_sync_on_unorganized_note_clears_stale_memory_without_add(
     headers = auth_headers(user)
     rev = (await client.get(f"/v1/notes/{note_id}", headers=headers)).json()["rev"]
     # 屏蔽 Ticket 调度，手动入队 extract 以测 jobs 耗尽标 failed
-    import app.workers.dispatch as dispatch
     from app.db import get_sessionmaker
     from app.jobs.queue import enqueue
+    from app.workers import dispatch
 
     prev = dispatch.schedule_organize
     dispatch.schedule_organize = lambda work_item: None  # type: ignore[assignment]
@@ -431,7 +431,7 @@ async def test_memory_sync_requeues_and_deletes_only_own_ids_on_rev_change(
     )
     # 窗口内：用户 PATCH（rev 2→3 + memory_sync pending）。
     # 屏蔽 Ticket 调度，避免 organize 在竞态窗口内抢先 bump rev。
-    import app.workers.dispatch as dispatch
+    from app.workers import dispatch
 
     prev_sched = dispatch.schedule_organize
     dispatch.schedule_organize = lambda work_item: None  # type: ignore[assignment]
@@ -645,6 +645,7 @@ async def test_memory_sync_worker_killed_mid_run_reclaimed_converges(client, use
 
     maker = get_sessionmaker()
     await drain_organize_tasks()
+    assert (await _note(note_id)).status == "organized"
 
     # 模拟 worker 认领 memory_sync 后立刻崩溃（job 留在 running）
     from sqlalchemy import update
@@ -733,15 +734,19 @@ async def test_memory_sync_attempts_exhausted_marks_failed_only_without_newer_jo
         await real_finalize(maker, claimed, error, retry_delay_seconds, worker_id)
 
     monkeypatch.setattr(runner, "_finalize", finalize_with_mid_race_patch)
+    from app.workers.dispatch import drain_organize_tasks
+
     for _ in range(10):
+        await drain_organize_tasks()
         if await run_pending_jobs(retry_delay_seconds=0) == 0:
             break
 
     note = await _note(note_id)
     assert note.memory_status != "failed", "还有更新的任务在途时不得落 failed"
 
-    # 排空：最终按最新状态收敛为 synced
+    # 排空：最终按最新状态收敛为 synced（含竞态 PATCH 开的 Ticket 整理）
     for _ in range(10):
+        await drain_organize_tasks()
         if await run_pending_jobs(retry_delay_seconds=0) == 0:
             break
     note = await _note(note_id)

@@ -4,9 +4,8 @@ import uuid
 from tests.conftest import auth_headers
 
 
-
 def _silence_schedule(monkeypatch):
-    import app.workers.dispatch as dispatch
+    from app.workers import dispatch
     monkeypatch.setattr(dispatch, "schedule_organize", lambda work_item: None)
 
 def _note_body(text: str = "明天下午三点提醒我给张总回电话") -> dict:

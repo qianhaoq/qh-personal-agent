@@ -198,11 +198,11 @@ async def test_business_paths_job_rows_only_inserted_via_enqueue(client, user, m
     """行为层复核（双后端）：连续两次 PATCH 同一笔记（第二次 PATCH 时，
     第一次入队的 memory_sync 仍 pending）不产生 500/唯一约束冲突——
     pending 去重靠 ON CONFLICT DO NOTHING，而不是 UPDATE 既存行。"""
-    import app.workers.dispatch as dispatch
     from sqlalchemy import func, select
 
     from app.db import get_sessionmaker
     from app.models import Job
+    from app.workers import dispatch
 
     monkeypatch.setattr(dispatch, "schedule_organize", lambda work_item: None)
 

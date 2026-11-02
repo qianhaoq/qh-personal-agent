@@ -14,8 +14,8 @@ async def _create(client, user, text="明天早上九点提醒我交周报") -> 
 
 
 async def test_sync_returns_changes_since_cursor(client, user, run_jobs, monkeypatch):
-    import app.workers.dispatch as dispatch
     from app.sources import submit_note_uploaded
+    from app.workers import dispatch
     from app.workers.dispatch import drain_organize_tasks, schedule_organize
 
     # 屏蔽 create 的即时调度，保证两次 sync 之间不会被 Ticket extract 改写

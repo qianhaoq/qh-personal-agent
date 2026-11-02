@@ -51,10 +51,10 @@ async def test_job_exception_not_logged_nor_persisted_raw(client, user, caplog):
     """threads8 P1（runner.py:71）：任务异常消息含笔记正文与伪造密钥 →
     caplog 与 jobs.last_error 均不含原文、只含类型名/错误码；job 照常按
     重试/失败语义收尾（不因脱敏改变控制流）。"""
-    import app.workers.dispatch as dispatch
     from app.db import get_sessionmaker
     from app.jobs.queue import enqueue
     from app.pipeline import runner
+    from app.workers import dispatch
 
     prev = dispatch.schedule_organize
     dispatch.schedule_organize = lambda work_item: None  # type: ignore[assignment]

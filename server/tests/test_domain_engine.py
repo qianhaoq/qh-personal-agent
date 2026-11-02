@@ -14,6 +14,7 @@ import uuid
 import pytest
 from sqlalchemy import select
 
+from app.config import get_settings
 from app.db import get_sessionmaker
 from app.domain.engine import Engine, get_engine, reset_engine
 from app.models import Job
@@ -34,7 +35,7 @@ async def _clean_engine():
 
 def _silence_schedule(monkeypatch):
     """禁止 API 自动调度，便于单测显式调用 OrganizeNoteWorker。"""
-    import app.workers.dispatch as dispatch
+    from app.workers import dispatch
 
     monkeypatch.setattr(dispatch, "schedule_organize", lambda work_item: None)
 
@@ -185,7 +186,11 @@ async def test_organize_worker_facade_records_failure(client, user, monkeypatch)
     resp = await client.post("/v1/notes", json=_note_body(), headers=auth_headers(user))
     note_id = resp.json()["note_id"]
 
+    calls = 0
+
     async def boom(note_id, enqueued_rev=None, **kwargs):
+        nonlocal calls
+        calls += 1
         raise RuntimeError("llm down")
 
     monkeypatch.setattr("app.pipeline.extract.extract_note", boom)
@@ -197,6 +202,44 @@ async def test_organize_worker_facade_records_failure(client, user, monkeypatch)
     assert outcome["status"] == "failed"
     assert outcome["error"]  # 安全摘要（类型/错误码），非异常原文
     assert engine.get_work_item(item.id).status == "failed"
+    assert calls == get_settings().job_max_attempts
+    got = await client.get(f"/v1/notes/{note_id}", headers=auth_headers(user))
+    assert got.status_code == 200
+    assert got.json()["status"] == "failed"
+
+
+async def test_notes_ticket_llm_failure_exhausts_attempts(client, user, monkeypatch):
+    """真实 POST → Ticket → extract 的 LLM 持续失败，笔记最终可见 failed。"""
+    from app.workers.dispatch import drain_organize_tasks
+
+    calls = 0
+
+    class FailingLLM:
+        async def chat(self, messages, response_format=None):
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("private provider error")
+
+    async def failing_llm():
+        return FailingLLM()
+
+    monkeypatch.setattr("app.pipeline.extract.get_llm_client", failing_llm)
+    resp = await client.post("/v1/notes", json=_note_body(), headers=auth_headers(user))
+    assert resp.status_code == 202
+    note_id = resp.json()["note_id"]
+    await drain_organize_tasks()
+
+    assert calls == get_settings().job_max_attempts
+    items = get_engine().work_items_for_note(note_id)
+    assert len(items) == 1
+    assert items[0].status == "failed"
+    assert "private provider error" not in items[0].error
+    got = await client.get(f"/v1/notes/{note_id}", headers=auth_headers(user))
+    assert got.status_code == 200
+    assert got.json()["status"] == "failed"
+    async with get_sessionmaker()() as session:
+        jobs = (await session.execute(select(Job).where(Job.kind == "extract"))).scalars().all()
+    assert jobs == []
 
 # ------------------------------------------------- S2 第一刀 A：认领/报告 CAS
 

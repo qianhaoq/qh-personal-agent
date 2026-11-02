@@ -6,4 +6,4 @@ engine 记状态，由 Channel 侧（后续刀的 sync/actions[]）消费。
 from app.workers.dispatch import drain_organize_tasks, schedule_organize
 from app.workers.organize import OrganizeNoteWorker
 
-__all__ = ["OrganizeNoteWorker", "schedule_organize", "drain_organize_tasks"]
+__all__ = ["OrganizeNoteWorker", "drain_organize_tasks", "schedule_organize"]

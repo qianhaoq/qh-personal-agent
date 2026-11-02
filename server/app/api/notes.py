@@ -253,7 +253,7 @@ async def patch_note(
     await session.commit()
     # expire_on_commit=False：显式刷新让 note_to_dict 读到条件更新后的行
     await session.refresh(note)
-    receipt = submit_note_uploaded(user_id=user_id, note_id=note.id, rev=note.rev)
+    receipt = submit_note_uploaded(user_id=user_id, note_id=note.id, rev=body.rev + 1)
     _schedule_organize_from_receipt(receipt)
     return {"note": note_to_dict(note), "rev": note.rev}
 
