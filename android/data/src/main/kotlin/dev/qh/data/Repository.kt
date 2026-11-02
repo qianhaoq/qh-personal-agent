@@ -31,8 +31,8 @@ interface Repository {
     suspend fun confirmReminder(id: String, rev: Int, fireAt: String? = null,
         title: String? = null): ReminderConfirmResponse
 }
-fun noteDraft(text: String, id: String = UUID.randomUUID().toString()) = NoteCreate(
-    id, text.trim(), Instant.now().toString(), ZoneId.systemDefault().id)
+fun noteDraft(text: String, id: String = UUID.randomUUID().toString(), source: String = "app") = NoteCreate(
+    id, text.trim(), Instant.now().toString(), ZoneId.systemDefault().id, source)
 fun askBody(text: String) = AskRequest(text.trim(), Instant.now().toString(), ZoneId.systemDefault().id)
 fun validText(text: String, limit: Int) {
     require(text.isNotBlank() && text.codePointCount(0, text.length) <= limit && '\u0000' !in text) {

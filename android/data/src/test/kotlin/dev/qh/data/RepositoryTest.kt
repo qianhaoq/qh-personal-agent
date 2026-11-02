@@ -8,6 +8,16 @@ import org.junit.Test
 import com.google.gson.JsonParser
 
 class RepositoryTest {
+    @Test fun draftSourceDefaultsToAppAndSupportsVoice() {
+        assertEquals("app", noteDraft("文字").source)
+        val voice = noteDraft("  语音内容  ", "voice-id", source = "voice_asr")
+        assertEquals("voice_asr", voice.source)
+        assertEquals("语音内容", voice.text)
+        assertEquals("voice-id", voice.client_note_id)
+        assertTrue(!voice.recorded_at.isNullOrBlank())
+        assertTrue(!voice.timezone.isNullOrBlank())
+    }
+
     @Test fun mockRequiresLoginAndKeepsIdempotentNotesUntilLogout() = runBlocking {
         val repo = MockRepository()
         try { repo.notes(); fail("Expected session error") } catch (_: SessionExpired) { }

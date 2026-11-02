@@ -35,6 +35,7 @@ android {
     kotlinOptions { jvmTarget = "17" }
 }
 dependencies {
+    testImplementation(libs.junit)
     implementation(project(":data")); implementation(project(":core-security"))
     implementation(platform(libs.compose.bom))
     implementation(libs.compose.ui); implementation(libs.compose.material)

@@ -1,8 +1,8 @@
-# Android S2 · 随记
+# Android S3 · 随记
 
 紧凑的 Kotlin / Compose 客户端：登录、时间线、文字记事、问答、提醒同步与确认；
 确认后的 `schedule_reminder` Channel action 会落到 AlarmManager，响铃时显示系统通知。
-录音按钮仅作占位。minSdk 26，compile/targetSdk 34，JDK 17，Gradle 8.7，AGP 8.5.2。
+系统 SpeechRecognizer 中文语音记事。minSdk 26，compile/targetSdk 34，JDK 17，Gradle 8.7，AGP 8.5.2。
 
 ## 安装与运行
 
@@ -51,6 +51,18 @@ api.useMock=false
 切回 mock：删除 `api.useMock=false` 或改为 `api.useMock=true`。
 `local.properties` 在构建时读取，改动后需重新构建安装。
 
+## S3 语音随手记
+
+进入「记一条」后点「语音记事」，首次使用申请 `RECORD_AUDIO`。使用系统默认
+SpeechRecognizer 引擎，语言为 `zh-CN`；设备需安装可用 RecognitionService。
+不保证离线识别，系统引擎可能联网处理音频；应用不保存或上传录音文件。
+无引擎、拒绝权限、网络异常或未听清时显示提示，可继续文字记事。
+听写时显示状态，可「停止并识别」或「取消」；离开页面、退出登录、Activity
+进入后台或销毁时取消听写，释放 recognizer，并忽略旧回调。
+识别成功直接复用 Repository.create / `POST /v1/notes`，`source="voice_asr"`；
+创建成功返回时间线。失败则保留识别文本供编辑、保存重试，未编辑重试沿用请求 ID。
+文字记事默认仍为 `source="app"`。不引入 Pipecat、自带模型或后台持续录音。
+
 ## S2 提醒闭环
 
 1. 进入时间线或点「同步」时调用 `GET /v1/sync?since=0&limit=100`，真实仓库遍历
@@ -71,18 +83,18 @@ api.useMock=false
    非精确闹钟。API 33+ 未授予通知权限时，系统闹钟仍会触发，但无法显示通知。
 
 声明权限：`INTERNET`、`POST_NOTIFICATIONS`、`RECEIVE_BOOT_COMPLETED`、
-`SCHEDULE_EXACT_ALARM`。Alarm receiver 不导出；boot receiver 仅处理
+`SCHEDULE_EXACT_ALARM`、`RECORD_AUDIO`。麦克风 feature 非必需；声明语音服务查询。Alarm receiver 不导出；boot receiver 仅处理
 `BOOT_COMPLETED`。Doze、厂商省电策略及用户强制停止仍可能影响实际触发。
 
 ## 模块与契约
 
 - `:app`：Compose Navigation、提醒列表与确认、AlarmManager、通知、开机重放、
-  ViewModel 保留旋转期间状态、手动 DI。
+  系统 SpeechRecognizer 语音记事、ViewModel 保留旋转期间状态、手动 DI。
 - `:data`：纯 JVM DTO、Retrofit、仓库、mock 和测试。接口核对自当前服务端
   `app/schemas.py` 与 `app/api/{auth,notes,ask,sync,reminders}.py`，未知响应字段由 Gson 忽略。
 - `:core-security`：Android Keystore MasterKey + EncryptedSharedPreferences。
   access/refresh 成对保存；稳定随机设备 UUID 在退出后保留。应用禁用备份。
-- 不为 S2 新建 `:sync`、`:feature-reminder` 等空壳模块。
+- 不为 S3 新建 `:sync`、`:feature-reminder` 等空壳模块。
 
 真实路由：`POST /v1/auth/login`、`POST /v1/auth/refresh`、
 `POST /v1/auth/logout`、`POST /v1/notes`、`GET /v1/notes`、`POST /v1/ask`、
@@ -113,7 +125,7 @@ scheduled rev 保持幂等。mock 还维护 action/reminder 删除墓碑供增�
 - 不修改 `server/`，不部署服务端；服务端只负责产生 sync action，不执行系统闹钟。
 - 没有自动轮询或常驻后台同步，只有进入/刷新时间线、confirm 后刷新和 boot 同步。
 - `rrule` 目前只解析不执行，闹钟均为一次性；没有提醒编辑、贪睡或重复提醒 UI。
-- 尚无编辑/删除记事、ASR、录音权限、推送或发布签名；后台提取完成后需手动同步。
+- 尚无编辑/删除记事、推送或发布签名；后台提取完成后需手动同步。
 - 同一份未修改草稿在失败重试时保留 `client_note_id`，但编辑草稿会生成新 ID；
   网络结果不确定时请先刷新时间线，避免编辑后重复记录。
 - 页面状态可跨旋转保留，不能跨进程恢复；不保存邀请码或草稿到磁盘。
@@ -133,12 +145,14 @@ JAR SHA-256：`cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8`
 使用 `/home/box/.local/jdk/jdk-17.0.16+8` 与 `/home/box/.local/android-sdk`。
 `./gradlew :data:test :app:assembleDebug`：`BUILD SUCCESSFUL`。
 `./gradlew --no-daemon assembleDebug testDebugUnitTest`：`BUILD SUCCESSFUL`；
-`:data` 的 RepositoryTest 共 10 tests，0 failures / 0 errors / 0 skipped；`:app` 与
+`:data` 的 RepositoryTest 共 11 tests，0 failures / 0 errors / 0 skipped；
+`:app` 的 AsrStateTest 共 4 tests，0 failures / 0 errors / 0 skipped；
 `:core-security` 没有本地 unit test source（对应任务 `NO-SOURCE`）。
-已核对合并后的 debug manifest：S2 标签、四项权限和两个 receiver 均已注册，
-debug 允许明文、应用禁用备份。未运行模拟器/真机、Keystore instrumentation
-或连接实际服务的端到端测试。
-
+`python3 scripts/check-invariants.py`：`0 error(s), 0 warning(s)`。
+已核对 debug manifest：S3 标签、`RECORD_AUDIO`、麦克风 feature optional、RecognitionService queries
+与既有四项权限/两个 receiver。未运行模拟器/真机、Keystore instrumentation
+或连接实际服务的端到端测试。语音权限拒绝、无引擎、中文听写、停止/取消、
+页面离开/旋转/后台与退出登录的设备行为仍需验收。
 会话与同步安全：前台与开机共用 `AppRepositories.real`（进程级单例仓库，同一 Mutex），
 并以 session generation 栅栏防止 logout 后在途 boot sync 再设闹钟。分页 sync 按 ID 合并，
 后页覆盖前页，并应用 deleted 墓碑剔除。
