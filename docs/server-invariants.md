@@ -31,7 +31,7 @@ Memory 写删仍只经 memory_sync，终态记忆 == f(note 终态)，metadata={
 
 - sa_threads/sa_triggers/sa_work_items 持久化；Mandate/Decision JSON 不可变快照，Assignment 嵌 worker_id/locked_at/attempts。Engine 是 Runtime 状态唯一写入口。
 - intake：Thread upsert 串行同 Thread Eval，Trigger dedupe 唯一键，原子建 Ticket。只在新 Trigger 上 Eval；重复返回原记录。此事务不锁 note/jobs/sequences、不调用 LLM/Memory。
-- claim：pending 条件 UPDATE rowcount=1；等锁成功后取 locked_at。每次 Assignment 使用唯一 execution worker_id（不可复用进程 id）。complete/fail：running+worker_id 条件 CAS；不命中仅 false，不猜测错误类别（INV-12 的因果封闭 boolean 操作）。
+- claim：pending 且 run_after <= claim 时新取的 utcnow() 条件 UPDATE rowcount=1；pending() 候选只是快照，其他 Runtime 可能已失败重试并推迟 run_after，claim 必须原子复验退避时间，拒绝时不得推进 attempts（INV-13）；等锁成功后取 locked_at。每次 Assignment 使用唯一 execution worker_id（不可复用进程 id）。complete/fail：running+worker_id 条件 CAS；不命中仅 false，不猜测错误类别（INV-12 的因果封闭 boolean 操作）。
 - complete 的 CAS 与 Channel 写回同事务，锁序 **sa_work_items → note → reminders → jobs INSERT → flush → sequences 最后**。API 写事务不碰既有 Ticket，避免 note→Ticket 逆向锁；只在提交后 intake。
 - Organize 输出受 Ticket owner fence 与 note rev/删除态双重保护；完成回滚则产物也回滚；done 不被迟到 fail 覆盖。耗尽失败/过期判死仅更新入单 rev 的未删除未 organized note，按 INV-1 分配 seq。每个回收候选独立提交，不能拿着 sequences 继续 claim 下一个。
 - 上传与 intake 两事务之间的中断由 Runtime 补扫稳定 note_id+rev dedupe_key 修复；已 Policy ignore 的 Trigger 不补开 Ticket。ask 在同请求 Worker 完成后经 Channel 返回持久 result；后台不重放已中断请求。

@@ -74,7 +74,8 @@ class Engine:
     async def claim(self, work_item_id: str, worker_id: str) -> bool:
         async with self.store.maker() as session, session.begin():
             result = await session.execute(update(SaWorkItem).where(
-                SaWorkItem.id == work_item_id, SaWorkItem.status == "pending"
+                SaWorkItem.id == work_item_id, SaWorkItem.status == "pending",
+                SaWorkItem.run_after <= utcnow(),
             ).values(status="running", worker_id=worker_id,
                      attempts=SaWorkItem.attempts + 1))
             if result.rowcount != 1:

@@ -21,7 +21,7 @@ from app.sources.base import build_note_uploaded_trigger
 from app.sources.voice_http import HttpApiSource, VoiceIngress
 from app.timeutil import utcnow
 from app.workers import OrganizeNoteWorker
-from tests.conftest import auth_headers
+from tests.conftest import auth_headers, requires_postgres
 
 
 def trigger(note_id="nte_1", rev=1):
@@ -124,6 +124,31 @@ async def test_cas_owner_and_terminal_state():
     assert not await engine.complete(item.id, {"ok": False}, worker_id="a")
     assert not await engine.claim(item.id, "c")
     assert (await Engine().get_work_item(item.id)).result == {"ok": True}
+
+
+async def test_claim_honors_retry_backoff_without_consuming_attempts():
+    engine = Engine()
+    item = (await engine.receive(trigger())).work_item
+    assert await engine.claim(item.id, "first-execution")
+    assert await engine.fail(item.id, RuntimeError(), worker_id="first-execution",
+                             retry=True, retry_delay_seconds=3600)
+    assert await engine.pending() == []
+    claims = await asyncio.gather(*[
+        Engine().claim(item.id, f"early-{i}") for i in range(8)
+    ])
+    assert not any(claims)
+    saved = await engine.get_work_item(item.id)
+    assert saved.status == "pending" and saved.attempts == 1
+    async with get_sessionmaker()() as session, session.begin():
+        await session.execute(update(SaWorkItem).where(SaWorkItem.id == item.id).values(
+            run_after=utcnow() - timedelta(seconds=1)))
+    assert [ready.id for ready in await engine.pending()] == [item.id]
+    claims = await asyncio.gather(*[
+        Engine().claim(item.id, f"ready-{i}") for i in range(8)
+    ])
+    assert sum(claims) == 1
+    saved = await engine.get_work_item(item.id)
+    assert saved.status == "running" and saved.attempts == 2
 
 
 async def test_pending_and_done_survive_pool_and_engine_restart():
@@ -266,3 +291,37 @@ async def test_channel_and_completion_rollback_together(client, user):
     async with get_sessionmaker()() as session:
         note = await session.get(Note, note_id)
         assert note.title is None and note.status == "uploaded" and note.rev == 1
+
+
+@requires_postgres
+async def test_stale_candidate_claim_rechecks_retry_backoff_pg():
+    """A's pending snapshot must not bypass B's committed retry backoff."""
+    engine_a, engine_b = Engine(Store()), Engine(Store())
+    item = (await engine_a.receive(trigger())).work_item
+    candidate_read, retry_committed = asyncio.Event(), asyncio.Event()
+
+    async def stale_claimant():
+        candidates = await engine_a.pending()
+        assert [candidate.id for candidate in candidates] == [item.id]
+        candidate_read.set()
+        await asyncio.wait_for(retry_committed.wait(), 5)
+        return await engine_a.claim(candidates[0].id, "worker-a")
+
+    async def retrying_worker():
+        await asyncio.wait_for(candidate_read.wait(), 5)
+        assert await engine_b.claim(item.id, "worker-b")
+        assert await engine_b.fail(item.id, RuntimeError(), worker_id="worker-b",
+                                  retry=True, retry_delay_seconds=3600)
+        saved = await engine_b.get_work_item(item.id)
+        assert saved.status == "pending" and saved.attempts == 1
+        assert saved.run_after > utcnow()
+        retry_committed.set()
+        return saved
+
+    claimed, retried = await asyncio.wait_for(
+        asyncio.gather(stale_claimant(), retrying_worker()), 15)
+    assert claimed is False
+    saved = await engine_a.get_work_item(item.id)
+    assert saved.status == "pending" and saved.worker_id is None
+    assert saved.attempts == retried.attempts == 1
+    assert saved.run_after == retried.run_after
