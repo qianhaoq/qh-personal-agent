@@ -9,6 +9,11 @@ from app.domain.model import WorkItem
 
 
 class Worker(Protocol):
-    """执行一个 WorkItem 并回报结果（不直出信道，结果回 Engine 记状态）。"""
+    """执行一个 WorkItem 并回报结果（不直出信道，结果回 Engine 记状态）。
+
+    契约：先经 engine.mark_running(work_item_id, worker_id=...) 认领
+    （仅 pending 可认领），再以同一 worker_id 调 complete/fail 回报；
+    认领或回报被拒（返回 False）时不得有进一步副作用。
+    """
 
     async def run(self, work_item: WorkItem) -> dict: ...

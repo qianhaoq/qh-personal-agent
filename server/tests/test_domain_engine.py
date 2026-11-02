@@ -8,6 +8,7 @@
 - organize worker facade 驱动现有 pipeline（不删 pipeline）。
 全部内存/MockLLM，不依赖外部密钥。
 """
+import asyncio
 import uuid
 
 import pytest
@@ -186,3 +187,81 @@ async def test_organize_worker_facade_records_failure(client, user, monkeypatch)
     assert outcome["status"] == "failed"
     assert outcome["error"]  # 安全摘要（类型/错误码），非异常原文
     assert engine.get_work_item(item.id).status == "failed"
+
+# ------------------------------------------------- S2 第一刀 A：认领/报告 CAS
+
+
+async def test_claim_only_pending_work_item_succeeds():
+    engine = Engine()
+    item = _receive_note(engine, note_id="nte_1").work_item
+
+    # pending → 认领成功：running + 持有者写入
+    assert engine.mark_running(item.id, worker_id="wrk_a") is True
+    assert item.status == "running"
+    assert item.worker_id == "wrk_a"
+
+    # 已 running：另一 worker 的二次认领被拒，原 holder 不变
+    assert engine.mark_running(item.id, worker_id="wrk_b") is False
+    assert item.status == "running"
+    assert item.worker_id == "wrk_a"
+
+    # 未知 work_item_id 仍 raise
+    with pytest.raises(ValueError):
+        engine.mark_running("wki_unknown", worker_id="wrk_a")
+
+
+async def test_concurrent_organize_worker_second_claim_rejected(client, user, monkeypatch):
+    resp = await client.post("/v1/notes", json=_note_body(), headers=auth_headers(user))
+    note_id = resp.json()["note_id"]
+
+    extract_calls: list[str] = []
+
+    async def stub_extract(note_id, enqueued_rev=None, **kwargs):
+        extract_calls.append(note_id)
+        await asyncio.sleep(0)  # 让出事件循环，放大两路 run 的竞争窗口
+
+    monkeypatch.setattr("app.pipeline.extract.extract_note", stub_extract)
+
+    engine = get_engine()
+    item = engine.work_items_for_note(note_id)[0]
+    outcomes = await asyncio.gather(
+        OrganizeNoteWorker(engine).run(item),
+        OrganizeNoteWorker(engine).run(item),
+    )
+
+    # 仅认领成功的一路进 extract；另一路被拒且不破坏终态
+    assert len(extract_calls) == 1
+    statuses = sorted(o["status"] for o in outcomes)
+    assert statuses == ["claim_failed", "done"]
+    assert engine.get_work_item(item.id).status == "done"
+
+
+async def test_late_fail_does_not_overwrite_done():
+    engine = Engine()
+    item = _receive_note(engine, note_id="nte_1").work_item
+
+    assert engine.mark_running(item.id, worker_id="wrk_a") is True
+    assert engine.complete(item.id, result={"note_id": "nte_1"}, worker_id="wrk_a") is True
+    assert item.status == "done"
+
+    # 迟到的 fail（worker B）：done 不可被覆盖、error 不写入
+    assert engine.fail(item.id, "late crash", worker_id="wrk_b") is False
+    assert item.status == "done"
+    assert item.error is None
+
+
+async def test_late_complete_ignored_when_not_holder():
+    engine = Engine()
+    item = _receive_note(engine, note_id="nte_1").work_item
+
+    assert engine.mark_running(item.id, worker_id="wrk_a") is True
+
+    # 非持有者 complete：no-op，仍 running、result 不写
+    assert engine.complete(item.id, result={"bogus": True}, worker_id="wrk_b") is False
+    assert item.status == "running"
+    assert item.result is None
+
+    # 持有者随后 complete 成功
+    assert engine.complete(item.id, result={"note_id": "nte_1"}, worker_id="wrk_a") is True
+    assert item.status == "done"
+    assert item.result == {"note_id": "nte_1"}

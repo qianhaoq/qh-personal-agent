@@ -21,8 +21,11 @@ from functools import lru_cache
 from app.common import new_id
 from app.domain.model import (
     TRIGGER_NOTE_UPLOADED,
+    WORK_ITEM_DONE,
+    WORK_ITEM_FAILED,
     WORK_ITEM_ORGANIZE_NOTE,
     WORK_ITEM_PENDING,
+    WORK_ITEM_RUNNING,
     DomainEvent,
     Receipt,
     Thread,
@@ -90,29 +93,52 @@ class Engine:
         return Receipt(trigger_id=trigger.id, duplicate=False, decision=decision, work_item=work_item)
 
     # ------------------------------------------------------- 生命周期
-    def mark_running(self, work_item_id: str, *, worker_id: str) -> None:
-        """Assignment：WorkItem 派给 worker 执行（pending → running）。"""
+    def mark_running(self, work_item_id: str, *, worker_id: str) -> bool:
+        """Assignment：WorkItem 派给 worker 执行（pending → running）。
+
+        CAS 认领：仅当 status==pending 才生效；已 running/done/failed 的
+        二次认领一律拒绝（返回 False，无副作用）。未知 id 仍 raise。
+        """
         item = self._require(work_item_id)
-        item.status = "running"
+        if item.status != WORK_ITEM_PENDING:
+            return False
+        item.status = WORK_ITEM_RUNNING
         item.worker_id = worker_id
         self._touch(item)
         self._record("work_item_running", item.id, f"worker {worker_id}")
+        return True
 
-    def complete(self, work_item_id: str, result: dict | None = None) -> None:
-        """Worker report ready：running → done。"""
+    def complete(
+        self, work_item_id: str, result: dict | None = None, *, worker_id: str
+    ) -> bool:
+        """Worker report ready：running → done（仅持牌 worker）。
+
+        CAS：status==running 且 worker_id 匹配才生效；否则 no-op 返回
+        False（done/failed 终态不可覆盖，非持有者不可回报）。
+        """
         item = self._require(work_item_id)
-        item.status = "done"
+        if item.status != WORK_ITEM_RUNNING or item.worker_id != worker_id:
+            return False
+        item.status = WORK_ITEM_DONE
         item.result = result
         self._touch(item)
         self._record("work_item_completed", item.id, item.kind)
+        return True
 
-    def fail(self, work_item_id: str, error: str) -> None:
-        """Worker report failed：running → failed（error 只存安全摘要）。"""
+    def fail(self, work_item_id: str, error: str, *, worker_id: str) -> bool:
+        """Worker report failed：running → failed（error 只存安全摘要）。
+
+        CAS：status==running 且 worker_id 匹配才生效；否则 no-op 返回
+        False（禁止 done → failed）。
+        """
         item = self._require(work_item_id)
-        item.status = "failed"
+        if item.status != WORK_ITEM_RUNNING or item.worker_id != worker_id:
+            return False
+        item.status = WORK_ITEM_FAILED
         item.error = error
         self._touch(item)
         self._record("work_item_failed", item.id, item.kind)
+        return True
 
     # ------------------------------------------------------------ 查询
     def get_work_item(self, work_item_id: str) -> WorkItem | None:
