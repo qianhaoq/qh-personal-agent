@@ -11,6 +11,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.widget.Toast
 import dev.qh.data.RealRepository
 import dev.qh.data.ReminderConfirmResponse
 import dev.qh.data.ReminderDto
@@ -128,7 +129,10 @@ class ReminderAlarmReceiver : BroadcastReceiver() {
         notifications.createNotificationChannel(NotificationChannel(NOTIFICATION_CHANNEL, "随记提醒",
             NotificationManager.IMPORTANCE_HIGH))
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            context.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return
+            context.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            Toast.makeText(context, title, Toast.LENGTH_LONG).show()
+            return
+        }
         val open = Intent(context, MainActivity::class.java)
             .setFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
             .setData(Uri.Builder().scheme("qh-agent").authority("reminder").appendPath(reminderId).build())
