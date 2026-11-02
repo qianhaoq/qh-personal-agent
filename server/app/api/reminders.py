@@ -13,7 +13,7 @@ from app.domain.model import TRIGGER_USER_CONFIRMED_REMINDER, Trigger
 from app.errors import ApiError
 from app.models import Reminder, SaChannelAction
 from app.schemas import NoNulStr, SafeDatetime, action_to_dict, reminder_to_dict
-from app.timeutil import utcnow
+from app.timeutil import to_iso, utcnow
 
 router = APIRouter(prefix="/v1/reminders", tags=["reminders"])
 
@@ -21,6 +21,7 @@ router = APIRouter(prefix="/v1/reminders", tags=["reminders"])
 class ReminderConfirmRequest(BaseModel):
     """Optional modifications applied atomically with confirm."""
 
+    rev: int = Field(ge=1, le=2_147_483_647)
     fire_at: SafeDatetime | None = None
     title: NoNulStr | None = Field(default=None, max_length=256)
 
@@ -28,21 +29,20 @@ class ReminderConfirmRequest(BaseModel):
 @router.post("/{reminder_id}/confirm")
 async def confirm_reminder(
     reminder_id: Annotated[NoNulStr, Path()],
-    body: ReminderConfirmRequest | None = None,
+    body: ReminderConfirmRequest,
     user_id: str = Depends(get_current_user_id),
 ):
     """Confirm a suggested reminder (or re-confirm / modify a scheduled one).
 
     Contract:
     - Auth: Bearer JWT (device-bound), same as other /v1 routes.
-    - Body (optional JSON): `{ "fire_at": <iso8601>, "title": <str> }`.
+    - Body: `{ "rev": <current rev>, "fire_at": <optional iso8601>, "title": <optional str> }`.
     - Effect: Trigger `user_confirmed_reminder` fans out via active Subscription
       on `note:{note_id}` to the original organize WorkItem — **no Policy Eval,
       no new Ticket**. Channel emits a sync-visible `schedule_reminder` action.
     - observe Policy: organize never emits schedule/alarm; only this confirm path does.
-    - Idempotent: same reminder + same body re-confirm returns 200 with existing action.
+    - Idempotent: current rev + unchanged values returns 200 with the existing action.
     """
-    body = body or ReminderConfirmRequest()
     maker = get_sessionmaker()
     async with maker() as session:
         reminder = (await session.execute(
@@ -58,18 +58,15 @@ async def confirm_reminder(
             raise ApiError(409, "conflict", "reminder not confirmable")
         note_id = reminder.note_id
 
-    payload: dict = {"reminder_id": reminder_id, "note_id": note_id}
+    payload: dict = {"reminder_id": reminder_id, "note_id": note_id, "rev": body.rev}
     if body.fire_at is not None:
-        payload["fire_at"] = body.fire_at
+        payload["fire_at"] = to_iso(body.fire_at)
     if body.title is not None:
         payload["title"] = body.title
 
-    mod = ""
-    if body.fire_at is not None:
-        mod += f":fire:{body.fire_at.isoformat()}"
-    if body.title is not None:
-        mod += f":title:{body.title}"
-    dedupe_key = f"reminder_confirm:{reminder_id}{mod}"
+    # Each HTTP attempt must reach the locked rev check, including retries.
+    # Action dedupe remains stable; Trigger dedupe must not bypass INV-11.
+    dedupe_key = f"reminder_confirm:{reminder_id}:{new_id('req')}"
 
     trigger = Trigger(
         id=new_id("trg"),
@@ -98,5 +95,5 @@ async def confirm_reminder(
         "reminder": reminder_to_dict(fresh),
         "action": action_to_dict(action_row) if action_row else None,
         "work_item_id": receipt.work_item.id if receipt.work_item else None,
-        "duplicate": receipt.duplicate,
+        "duplicate": fresh.rev == body.rev,
     }

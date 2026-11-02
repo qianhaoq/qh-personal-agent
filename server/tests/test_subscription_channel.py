@@ -1,6 +1,9 @@
 """Subscription + Channel: propose → subscribe → confirm → schedule action."""
+import json
 import uuid
+from datetime import timedelta
 
+import pytest
 from sqlalchemy import func, select
 
 from app.common import new_id
@@ -8,6 +11,7 @@ from app.db import get_sessionmaker
 from app.domain.engine import Engine
 from app.domain.model import CHANNEL_ACTION_SCHEDULE_REMINDER
 from app.models import Reminder, SaChannelAction, SaSubscription, SaTrigger, SaWorkItem
+from app.timeutil import to_iso, utcnow
 from app.workers import OrganizeNoteWorker
 from tests.conftest import auth_headers
 
@@ -56,14 +60,14 @@ async def test_confirm_fans_out_subscription_emits_channel_action(client, user):
             Reminder.deleted_at.is_(None),
         ))).first()
         assert rem is not None
-        reminder_id = rem.id
+        reminder_id, rev = rem.id, rem.rev
         triggers_before = await session.scalar(select(func.count()).select_from(SaTrigger))
         tickets_before = await session.scalar(select(func.count()).select_from(SaWorkItem))
 
     conf = await client.post(
         f"/v1/reminders/{reminder_id}/confirm",
         headers=auth_headers(user),
-        json={},
+        json={"rev": rev},
     )
     assert conf.status_code == 200, conf.text
     data = conf.json()
@@ -96,15 +100,17 @@ async def test_confirm_fans_out_subscription_emits_channel_action(client, user):
 async def test_confirm_idempotent_no_duplicate_action(client, user):
     note_id, item = await _upload_and_organize(client, user)
     async with get_sessionmaker()() as session:
-        reminder_id = (await session.scalars(select(Reminder.id).where(
+        rem = (await session.scalars(select(Reminder).where(
             Reminder.note_id == note_id, Reminder.status == "suggested",
         ))).first()
+        reminder_id, rev = rem.id, rem.rev
 
     first = await client.post(
-        f"/v1/reminders/{reminder_id}/confirm", headers=auth_headers(user), json={},
+        f"/v1/reminders/{reminder_id}/confirm", headers=auth_headers(user), json={"rev": rev},
     )
     second = await client.post(
-        f"/v1/reminders/{reminder_id}/confirm", headers=auth_headers(user), json={},
+        f"/v1/reminders/{reminder_id}/confirm", headers=auth_headers(user),
+        json={"rev": first.json()["reminder"]["rev"]},
     )
     assert first.status_code == second.status_code == 200
     assert second.json()["duplicate"] is True
@@ -126,6 +132,111 @@ async def test_confirm_missing_reminder_404(client, user):
     resp = await client.post(
         f"/v1/reminders/{new_id('rmd')}/confirm",
         headers=auth_headers(user),
-        json={},
+        json={"rev": 1},
     )
     assert resp.status_code == 404
+
+
+async def _suggested(client, user):
+    note_id, _ = await _upload_and_organize(client, user)
+    async with get_sessionmaker()() as session:
+        rem = (await session.scalars(select(Reminder).where(
+            Reminder.note_id == note_id, Reminder.deleted_at.is_(None),
+        ))).first()
+        return note_id, rem.id, rem.rev
+
+
+async def test_confirm_future_override_json_round_trip(client, user):
+    _, reminder_id, rev = await _suggested(client, user)
+    fire_at = to_iso(utcnow() + timedelta(days=2))
+    resp = await client.post(f"/v1/reminders/{reminder_id}/confirm",
+                             headers=auth_headers(user), json={"rev": rev, "fire_at": fire_at})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["reminder"]["status"] == "scheduled"
+    assert resp.json()["action"]["payload"]["fire_at"] == fire_at
+    async with get_sessionmaker()() as session:
+        trigger = (await session.scalars(select(SaTrigger).where(
+            SaTrigger.kind == "user_confirmed_reminder",
+        ))).one()
+        assert json.loads(json.dumps(trigger.payload))["fire_at"] == fire_at
+        assert trigger.payload["rev"] == rev
+
+
+async def test_confirm_stale_rev_even_for_idempotent_retry(client, user):
+    _, reminder_id, rev = await _suggested(client, user)
+    url = f"/v1/reminders/{reminder_id}/confirm"
+    first = await client.post(url, headers=auth_headers(user), json={"rev": rev})
+    assert first.status_code == 200
+    stale = await client.post(url, headers=auth_headers(user), json={"rev": rev})
+    assert stale.status_code == 409
+    assert set(stale.json()) == {"error"}
+    assert stale.json()["error"]["code"] == "conflict"
+    current = await client.post(url, headers=auth_headers(user),
+                                json={"rev": first.json()["reminder"]["rev"]})
+    assert current.status_code == 200
+    assert current.json()["reminder"]["rev"] == rev + 1
+    assert current.json()["action"]["id"] == first.json()["action"]["id"]
+
+
+@pytest.mark.parametrize("override", [False, True])
+async def test_confirm_past_effective_time_rejected(client, user, override):
+    _, reminder_id, rev = await _suggested(client, user)
+    past = utcnow() - timedelta(days=1)
+    body = {"rev": rev}
+    if override:
+        body["fire_at"] = to_iso(past)
+    else:
+        async with get_sessionmaker()() as session, session.begin():
+            reminder = await session.get(Reminder, reminder_id)
+            reminder.fire_at = past
+    resp = await client.post(f"/v1/reminders/{reminder_id}/confirm",
+                             headers=auth_headers(user), json=body)
+    assert resp.status_code == 409, resp.text
+    async with get_sessionmaker()() as session:
+        reminder = await session.get(Reminder, reminder_id)
+        assert reminder.status == "suggested" and reminder.rev == rev
+        assert await session.scalar(select(func.count()).select_from(SaChannelAction).where(
+            SaChannelAction.reminder_id == reminder_id, SaChannelAction.deleted_at.is_(None),
+        )) == 0
+
+
+async def test_delete_note_tombstones_schedule_action_in_sync(client, user):
+    note_id, reminder_id, rev = await _suggested(client, user)
+    resp = await client.post(f"/v1/reminders/{reminder_id}/confirm",
+                             headers=auth_headers(user), json={"rev": rev})
+    assert resp.status_code == 200
+    before = (await client.get("/v1/sync", headers=auth_headers(user))).json()
+    action = next(a for a in before["actions"] if a["reminder_id"] == reminder_id)
+    deleted = await client.delete(f"/v1/notes/{note_id}", headers=auth_headers(user))
+    assert deleted.status_code == 204
+    after = (await client.get("/v1/sync", headers=auth_headers(user),
+                              params={"since": before["cursor"]})).json()
+    assert action["id"] in after["deleted"]["actions"]
+    assert not any(a["reminder_id"] == reminder_id for a in after["actions"])
+    async with get_sessionmaker()() as session:
+        tombstone = await session.get(SaChannelAction, action["id"])
+        assert tombstone.deleted_at is not None
+        assert tombstone.change_seq > before["cursor"]
+
+
+@pytest.mark.parametrize("body", [{}, {"rev": 0}, {"rev": 2_147_483_648}])
+async def test_confirm_requires_bounded_rev(client, user, body):
+    _, reminder_id, _ = await _suggested(client, user)
+    resp = await client.post(f"/v1/reminders/{reminder_id}/confirm",
+                             headers=auth_headers(user), json=body)
+    assert resp.status_code == 422
+
+
+async def test_confirm_modify_scheduled_checks_rev(client, user):
+    _, reminder_id, rev = await _suggested(client, user)
+    url = f"/v1/reminders/{reminder_id}/confirm"
+    first = await client.post(url, headers=auth_headers(user), json={"rev": rev})
+    assert first.status_code == 200
+    body = {"rev": first.json()["reminder"]["rev"], "title": "changed"}
+    modified = await client.post(url, headers=auth_headers(user), json=body)
+    assert modified.status_code == 200, modified.text
+    assert modified.json()["reminder"]["rev"] == rev + 2
+    assert modified.json()["action"]["payload"]["title"] == "changed"
+    assert modified.json()["action"]["id"] == first.json()["action"]["id"]
+    stale = await client.post(url, headers=auth_headers(user), json=body)
+    assert stale.status_code == 409

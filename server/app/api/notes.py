@@ -24,7 +24,7 @@ from app.db import get_db_session
 from app.deps import get_current_user_id
 from app.errors import ApiError
 from app.jobs.queue import enqueue
-from app.models import Note, Reminder
+from app.models import Note, Reminder, SaChannelAction
 from app.schemas import NoNulStr, NoteCreate, NotePatch, note_to_dict
 from app.sources import submit_note_uploaded
 from app.timeutil import to_utc, utcnow
@@ -264,12 +264,23 @@ async def delete_note(
         await session.rollback()
         raise ApiError(404, "not_found", "笔记不存在")
     reminder_ids = await _tombstone_reminders(session, note.id, only_suggested=False)
+    # Reminder locks precede action locks; allocate_seq stays after job INSERT.
+    # Empty IN () is invalid SQL on some dialects — skip when no reminders.
+    if reminder_ids:
+        action_ids = list((await session.scalars(
+            update(SaChannelAction).where(
+                SaChannelAction.reminder_id.in_(reminder_ids),
+                SaChannelAction.deleted_at.is_(None),
+            ).values(deleted_at=utcnow()).returning(SaChannelAction.id)
+        )).all())
+    else:
+        action_ids = []
     # 记忆清理由 memory_sync job 收敛（与任何在途的整理交错也不会复活或
     # 误删，见 app/pipeline/memory_sync.py 的复查协议）
     await enqueue(
         session, "memory_sync", {"note_id": note_id}, note_id=note.id, dedupe_pending=True
     )
-    await _assign_change_seqs(session, note.id, reminder_ids)
+    await _assign_change_seqs(session, note.id, reminder_ids, action_ids)
     await session.commit()
 
 
@@ -296,14 +307,16 @@ async def _tombstone_reminders(
 
 
 async def _assign_change_seqs(
-    session: AsyncSession, note_id: str, reminder_ids: list[str]
+    session: AsyncSession, note_id: str, reminder_ids: list[str],
+    action_ids: list[str] | None = None,
 ) -> None:
     """业务行锁齐之后批量分配并写回 change_seq（必须最后调用，紧贴提交）。
 
     每行独占一个 seq：共用同一个值时，分页切在组中间会让剩余墓碑被
     `> cursor` 永久跳过（见 app/api/sync.py）。
     """
-    total = 1 + len(reminder_ids)
+    await session.flush()
+    total = 1 + len(reminder_ids) + len(action_ids or [])
     last_seq = await allocate_seq(session, count=total)
     seqs = iter(range(last_seq - total + 1, last_seq + 1))
     # 第二条 UPDATE 只写 change_seq：行锁已在第一条条件 UPDATE 里拿到
@@ -313,6 +326,11 @@ async def _assign_change_seqs(
     for reminder_id in reminder_ids:
         await session.execute(
             update(Reminder).where(Reminder.id == reminder_id).values(change_seq=next(seqs))
+        )
+    for action_id in action_ids or []:
+        await session.execute(
+            update(SaChannelAction).where(SaChannelAction.id == action_id)
+            .values(change_seq=next(seqs))
         )
 
 

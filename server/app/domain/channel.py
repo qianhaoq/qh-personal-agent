@@ -3,6 +3,7 @@
 Workers never push notifications or set system alarms. Client-visible side
 effects are Channel actions (sync-visible payloads) plus note/reminder rows.
 """
+from datetime import datetime
 from typing import Protocol
 
 from sqlalchemy import select, update
@@ -15,9 +16,10 @@ from app.domain.model import (
     SUBSCRIPTION_ACTIVE,
     SUBSCRIPTION_REMINDER_CONFIRM,
 )
+from app.errors import ApiError
 from app.models import Note, Reminder, SaChannelAction, SaSubscription
 from app.schemas import clean_llm_str
-from app.timeutil import to_iso, utcnow
+from app.timeutil import as_utc, to_iso, utcnow
 
 
 class Channel(Protocol):
@@ -77,11 +79,15 @@ class SyncChannel:
             return None
         if reminder.user_id != user_id:
             return None
+        if reminder.rev != payload.get("rev"):
+            raise ApiError(409, "conflict", "版本冲突，请拉取最新版本后重试")
         if reminder.status not in ("suggested", "scheduled"):
             return None
 
         title_override = payload.get("title")
         fire_at_override = payload.get("fire_at")
+        if isinstance(fire_at_override, str):
+            fire_at_override = datetime.fromisoformat(fire_at_override)
         now = utcnow()
         new_title = (
             clean_llm_str(title_override, limit=256)
@@ -89,9 +95,16 @@ class SyncChannel:
         )
         new_fire = fire_at_override if fire_at_override is not None else reminder.fire_at
 
+        new_fire = as_utc(new_fire)
+        # Product choice: reject expired effective times, including empty overrides.
+        # Read the clock after acquiring the reminder lock (INV-13).
+        if new_fire is None or new_fire <= now:
+            raise ApiError(409, "conflict", "reminder time has expired")
+
         if reminder.status == "suggested":
             changed = await session.execute(update(Reminder).where(
                 Reminder.id == reminder_id,
+                Reminder.rev == payload["rev"],
                 Reminder.status == "suggested",
                 Reminder.deleted_at.is_(None),
                 Reminder.user_id == user_id,
@@ -103,18 +116,19 @@ class SyncChannel:
                 updated_at=now,
             ))
             if changed.rowcount != 1:
-                reminder = await session.get(Reminder, reminder_id)
-                if reminder is None or reminder.status != "scheduled":
-                    return None
-            reminder = await session.get(Reminder, reminder_id)
+                # PG holds the row lock; SQLite's conditional write also fences rev.
+                await session.refresh(reminder)
+                raise ApiError(409, "conflict", "版本冲突，请拉取最新版本后重试")
+            await session.refresh(reminder)
         else:
             # Already scheduled: apply modifications when provided.
             if (
                 (title_override is not None or fire_at_override is not None)
-                and (new_title != reminder.title or new_fire != reminder.fire_at)
+                and (new_title != reminder.title or new_fire != as_utc(reminder.fire_at))
             ):
-                await session.execute(update(Reminder).where(
+                changed = await session.execute(update(Reminder).where(
                     Reminder.id == reminder_id,
+                    Reminder.rev == payload["rev"],
                     Reminder.status == "scheduled",
                     Reminder.deleted_at.is_(None),
                 ).values(
@@ -123,7 +137,10 @@ class SyncChannel:
                     rev=Reminder.rev + 1,
                     updated_at=now,
                 ))
-                reminder = await session.get(Reminder, reminder_id)
+                if changed.rowcount != 1:
+                    await session.refresh(reminder)
+                    raise ApiError(409, "conflict", "版本冲突，请拉取最新版本后重试")
+                await session.refresh(reminder)
 
         dedupe_key = f"schedule_reminder:{reminder_id}"
         existing = (await session.scalars(select(SaChannelAction).where(
