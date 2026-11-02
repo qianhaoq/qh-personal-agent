@@ -153,6 +153,8 @@ class ReminderBootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != Intent.ACTION_BOOT_COMPLETED || (BuildConfig.DEBUG && BuildConfig.USE_MOCK_API)) return
         val appContext = context.applicationContext
+        val repository = AppRepositories.real(appContext)
+        if (!repository.signedIn) return
         val scheduler = ReminderAlarmScheduler(appContext)
         // Bound broadcast work: restore local alarms immediately; never wait on network here.
         scheduler.restore()
@@ -160,9 +162,8 @@ class ReminderBootReceiver : BroadcastReceiver() {
         // Network sync is best-effort background work outside the broadcast lifetime.
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
             try {
-                val repository = AppRepositories.real(appContext)
-                if (!repository.signedIn) return@launch
                 if (generation != AppRepositories.sessionGeneration()) return@launch
+                if (!repository.signedIn) return@launch
                 val response = withTimeoutOrNull(BOOT_SYNC_BUDGET_MS) { repository.sync() } ?: return@launch
                 AppRepositories.ifCurrent(generation) {
                     if (repository.signedIn) scheduler.consume(response)
