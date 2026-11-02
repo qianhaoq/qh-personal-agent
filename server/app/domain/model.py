@@ -9,7 +9,7 @@
 - WorkItem：dsh 的 Ticket 在本仓的对应物，可观测/可停止/可恢复的
   授权工作单元（organize_note / answer_ask / …）。
 
-全部为内存 dataclass：进程内可见、重启即空，不替代 jobs 队列。
+dataclass 是事务外快照；权威状态持久化于 SQLAlchemy Store。
 """
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -20,6 +20,7 @@ TRIGGER_ASK_REQUESTED = "ask_requested"
 
 # WorkItem kind（授权工作单元类型；v0 只实装 organize_note）
 WORK_ITEM_ORGANIZE_NOTE = "organize_note"
+WORK_ITEM_ANSWER_ASK = "answer_ask"
 
 # WorkItem 状态机：pending → running → done | failed
 WORK_ITEM_PENDING = "pending"
@@ -44,7 +45,7 @@ class Trigger:
 
 @dataclass
 class Thread:
-    """时间有序事件串：同一 thread 上的评估天然串行（v0 内存态）。"""
+    """时间有序事件串：同一 thread 上的评估天然串行（Store 事务内串行）。"""
 
     key: str
     trigger_ids: list[str] = field(default_factory=list)
@@ -89,6 +90,10 @@ class WorkItem:
     worker_id: str | None = None
     result: dict | None = None
     error: str | None = None
+    payload: dict = field(default_factory=dict)
+    attempts: int = 0
+    max_attempts: int = 3
+    locked_at: datetime | None = None
 
 
 @dataclass(frozen=True)

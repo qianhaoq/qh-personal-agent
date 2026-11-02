@@ -19,31 +19,27 @@
 > 第十六轮（#6 mem0-backend）：在 inmemory|disabled 骨架上加回 mem0 生产后端（infer=False、安装探测、embedding 凭据、compose 默认 mem0）；INV-3/10 保证代码与测试表同步。
 > 第十七轮（#6 Codex P1）：Dockerfile 可写 HOME/MEM0_DIR；harden 钉 mem0 logger；init-db 幂等引导 mem0 schema；memory_sync 外部写异常且丢租约仍补偿 requeue；P2 dims/凭据 fail-fast/PG-only；P3 README。
 
-## 0. 总览：新任务与记忆模型
+## 0. 当前任务与记忆模型（clean Runtime 替代 #23/#25）
 
-现状：单一 `organize_note` job 既做 LLM 抽取又做记忆写入（`memory_synced` bool + `memory_only` 补写路径），PATCH/DELETE 在提交后直接调 `MemoryStore.delete_by_note`，另有 `cleanup_memory` job 兜底。问题：两类职责共享 attempts、失败语义互相污染（C5）、记忆写删入口分散导致交错窗口（C4/C9）。
+POST /v1/notes 提交后由 Source → Engine 在 Store 开 organize WorkItem；PATCH 正文同事务清派生/作废 suggested/enqueue memory_sync，提交后开新 rev 的 WorkItem。Runtime 数据库轮询补扫缺 Trigger 的 uploaded note、领取 pending Ticket、回收过期 Assignment。生产 API 不再 enqueue extract。
 
-新模型只有两种 job，记忆写删入口唯一：
+OrganizeWorker：短读 note → 事务外 LLM → Engine.complete 的 running+worker_id CAS → Channel 同事务写整理产物并 enqueue memory_sync。实现已迁至 `app/workers/extract_impl.py`；旧 `pipeline/extract.py` 只是历史 Job 排空与租约回归的 import alias。
 
-```
-POST /v1/notes       ──► enqueue extract(rev=1)
-PATCH /v1/notes/:id  ──► note: rev+1, status=uploaded, memory_status=pending
-                         enqueue extract(rev=新rev)；enqueue memory_sync（pending 去重）
-DELETE /v1/notes/:id ──► note: 软删；enqueue memory_sync（pending 去重）
+Memory 写删仍只经 memory_sync，终态记忆 == f(note 终态)，metadata={note_id, source_rev}；memory_status 是内部字段，不推进 updated_at/change_seq。下面 extract job 的历史规则继续约束旧队列行，当前整理 Ticket 规则见本节新增约束及 INV-6/15。
 
-extract(note_id, rev)    LLM 抽取 + 短写事务落整理产物（title/tags/todos/
-                         suggested reminders；rev+1、status=organized、
-                         memory_status=pending），同事务 enqueue memory_sync。
-                         执行时 note.rev != rev → 跳过 = done。
-memory_sync(note_id)     不带 rev。短读事务取 note 当前状态 →（事务外）删/写
-                         记忆 → 复查 (rev, deleted_at) → 不一致则只删本次新增的
-                         记忆 id 并再入队 memory_sync。记忆写删的唯一入口。
-```
+### Runtime 约束（沿用 INV-1/6/11/12/13/14/15）
 
-- 记忆归属：每条记忆 `metadata={note_id, source_rev}`，只属于 note 的当前 rev（INV-3）。
-- 收敛目标（终态断言）：**记忆 == f(note 终态)**——已删除或未 organized → 该 note 无记忆；organized → 恰好一组记忆，对应 source_rev=当前 rev 的 text（INV-5 给论证）。
-- `notes.memory_synced: bool` 替换为 `notes.memory_status: pending|synced|failed`（服务端内部状态，不进 API 响应、不占 change_seq）。
-- `cleanup_memory` job 取消，语义并入 `memory_sync`。
+- sa_threads/sa_triggers/sa_work_items 持久化；Mandate/Decision JSON 不可变快照，Assignment 嵌 worker_id/locked_at/attempts。Engine 是 Runtime 状态唯一写入口。
+- intake：Thread upsert 串行同 Thread Eval，Trigger dedupe 唯一键，原子建 Ticket。只在新 Trigger 上 Eval；重复返回原记录。此事务不锁 note/jobs/sequences、不调用 LLM/Memory。
+- claim：pending 且 run_after <= claim 时新取的 utcnow() 条件 UPDATE rowcount=1；pending() 候选只是快照，其他 Runtime 可能已失败重试并推迟 run_after，claim 必须原子复验退避时间，拒绝时不得推进 attempts（INV-13）；等锁成功后取 locked_at。每次 Assignment 使用唯一 execution worker_id（不可复用进程 id）。complete/fail：running+worker_id 条件 CAS；不命中仅 false，不猜测错误类别（INV-12 的因果封闭 boolean 操作）。
+- complete 的 CAS 与 Channel 写回同事务，锁序 **sa_work_items → note → reminders → jobs INSERT → flush → sequences 最后**。API 写事务不碰既有 Ticket，避免 note→Ticket 逆向锁；只在提交后 intake。
+- Organize 输出受 Ticket owner fence 与 note rev/删除态双重保护；完成回滚则产物也回滚；done 不被迟到 fail 覆盖。耗尽失败/过期判死仅更新入单 rev 的未删除未 organized note，按 INV-1 分配 seq。每个回收候选独立提交，不能拿着 sequences 继续 claim 下一个。
+- 上传与 intake 两事务之间的中断由 Runtime 补扫稳定 note_id+rev dedupe_key 修复；已 Policy ignore 的 Trigger 不补开 Ticket。ask 在同请求 Worker 完成后经 Channel 返回持久 result；后台不重放已中断请求。
+- errors 仅 safe_error_text（异常类型/粗码），LLM 文本经 clean_llm_str；外部调用期间无会话/事务。
+
+**保证代码**：`app/domain/{engine,store,channel}.py`、`app/runtime.py`、`app/workers/{organize,extract_impl,answer}.py`、`app/api/{notes,ask}.py`。
+
+**验证测试**：`test_channel_and_completion_rollback_together`、`test_cas_owner_and_terminal_state`、`test_pending_and_done_survive_pool_and_engine_restart`、`test_notes_api_hook_opens_ticket_without_double_extract`、`test_patch_opens_new_ticket_and_stale_result_is_discarded`、`test_engine_hook_failure_never_breaks_notes_api`、`test_ask_ticket_answer_same_request_and_channel`、`test_ask_failure_is_safe_and_ticket_failed`、`test_expired_assignment_recovered_and_old_report_rejected`、`test_concurrent_intake_and_claim_single_assignment`、`test_late_organize_output_fenced_after_expiry`。
 
 ---
 
@@ -62,8 +58,8 @@ memory_sync(note_id)     不带 rev。短读事务取 note 当前状态 →（�
 
 | 路径 | 加锁序列（左先右后） | seq 分配 |
 | --- | --- | --- |
-| POST /v1/notes（create） | note INSERT（新行）→ jobs INSERT extract（新行）→ flush → **allocate_seq** → note change_seq 写回 → commit。幂等冲突分支（client_note_id 撞唯一约束）整体回滚后只读复查，无二次加锁 | 1 |
-| PATCH /v1/notes/:id | note 条件 UPDATE（锁行，乐观锁）→ reminders 条件 UPDATE（作废 suggested）→ jobs INSERT extract + INSERT memory_sync（均新行，DO NOTHING）→ flush → **allocate_seq** → note+reminders change_seq 写回 → commit | 1+N |
+| POST /v1/notes（create） | note INSERT（新行）→ flush → **allocate_seq** → note change_seq 写回 → commit。幂等冲突分支（client_note_id 撞唯一约束）整体回滚后只读复查，无二次加锁 | 1 |
+| PATCH /v1/notes/:id | note 条件 UPDATE（锁行，乐观锁）→ reminders 条件 UPDATE（作废 suggested）→ jobs INSERT memory_sync（新行，DO NOTHING）→ flush → **allocate_seq** → note+reminders change_seq 写回 → commit | 1+N |
 | DELETE /v1/notes/:id | note 条件 UPDATE（软删）→ reminders 条件 UPDATE（全量墓碑）→ jobs INSERT memory_sync → flush → **allocate_seq** → 写回 → commit | 1+N |
 | extract 短写事务（apply） | **jobs 行（PG FOR UPDATE，threads15 P1：写回前原子复核租约 `(status, locked_by, locked_at)`——锁序与队列路径同向 jobs → note，先 note 后 job 会与 finalize/判死成 AB-BA；复核不过不写任何行）** → note FOR UPDATE（PG）→ reminders（stale 条件 UPDATE + fresh INSERT）→ jobs INSERT memory_sync → flush → **allocate_seq** → 写回 → commit | 1+S+F |
 | memory_sync 各短事务 | 读事务：note + job 行纯读无锁。外部调用：无任何会话/锁。置位事务（threads8 P2 起）：jobs 行（PG FOR UPDATE，锁内复核租约，锁序 = 队列路径 jobs → note）→ note 条件 UPDATE（memory_status，不分配 seq、不碰 updated_at/change_seq，见 INV-2.6）。再入队：jobs INSERT。**该路径永不碰 sequences** | 0 |
@@ -76,7 +72,7 @@ memory_sync(note_id)     不带 rev。短读事务取 note 当前状态 →（�
 | POST /v1/auth/logout | device 行（`_lock_device`，PG FOR UPDATE——threads11 P1：原实现 `session.get` 无锁读，DELETE 快照看不到并发 login/refresh 未提交的新 token 行；threads15 P1：锁内复验凭证代际/吊销态，跨代或已吊销不删）→ refresh_tokens DELETE（清除该设备全部 token 行） | 0 |
 | GET /v1/sync | 只读。PG 下 REPEATABLE READ 单快照，无行锁（既有设计，见 app/api/sync.py docstring，不变） | 0 |
 
-**保证代码**：`app/common.py::allocate_seq`（docstring 已载规则，保留）、`app/api/notes.py`（create 重排：job INSERT 先 flush 再 allocate_seq，修 C2；PATCH/DELETE 移除提交后直删记忆）、`app/pipeline/extract.py`（原 organize 的 apply 事务）、`app/pipeline/memory_sync.py`（新）、`app/jobs/queue.py`（队列路径）、`app/api/auth.py`（INV-8）。全局规则同步写进 AGENTS.md 的既有条目。
+**保证代码**：`app/common.py::allocate_seq`（docstring 已载规则，保留）、`app/api/notes.py`（create 重排：job INSERT 先 flush 再 allocate_seq，修 C2；PATCH/DELETE 移除提交后直删记忆）、`app/workers/extract_impl.py`（原 organize 的 apply 事务）、`app/pipeline/memory_sync.py`（新）、`app/jobs/queue.py`（队列路径）、`app/api/auth.py`（INV-8）。全局规则同步写进 AGENTS.md 的既有条目。
 
 **验证测试**（计划名）：
 - `test_create_note_sql_order_job_insert_before_seq_update`（engine 事件监听 SQL 流，断言 jobs INSERT 先于 sequences UPDATE；SQLite+PG 双后端语义一致）
@@ -86,7 +82,7 @@ memory_sync(note_id)     不带 rev。短读事务取 note 当前状态 →（�
 - `test_claim_commits_dead_job_transition_before_next_candidate`（threads11 P1，双后端：claim 循环判死一个过期 job 后领取下一个候选时，判死转移必须已提交——独立会话可见）
 - `test_claim_dead_jobs_commit_between_candidates_no_deadlock`（threads11 P1，PG 真并发：判死 job A（持 note A + sequences）后扫到 job B 时，并发 PATCH 已持 note B 行锁、正等 sequences——正确实现下 PATCH 只等 note 行锁即放行，无 DeadlockDetected/500）
 - `test_logout_waits_for_device_lock_then_deletes_concurrent_login_token`（threads11 P1，PG 真并发：login 事务持 device 行锁且新 token 行未提交时，logout 阻塞等锁；login 提交后 logout 的 DELETE 必须把新 token 行一并删掉——锁定「logout 204 ⇒ 该设备无存活 token」的可观察契约；旧实现靠 last_seen UPDATE 隐式满足它，显式 `_lock_device` 后不再依赖该偶然写）
-- `test_business_paths_never_update_existing_job_rows`（静态断言：grep/AST 检查 app/api 与 app/pipeline/extract.py 中对 Job 的写仅为 INSERT）
+- `test_business_paths_never_update_existing_job_rows`（静态断言：grep/AST 检查 app/api 与 app/workers/extract_impl.py 中对 Job 的写仅为 INSERT）
 
 ### INV-2 任务模型：extract 与 memory_sync 两种 job
 
@@ -99,7 +95,7 @@ memory_sync(note_id)     不带 rev。短读事务取 note 当前状态 →（�
 5. 两类 job 各自独立的 attempts/max_attempts/失败语义：extract 耗尽 → `note.status='failed'`（条件：`rev=入队rev AND deleted_at IS NULL AND status!='organized'`）；memory_sync 耗尽 → `note.memory_status='failed'`（条件：note 未删除且**无其他** pending/running 的 memory_sync，`NOT EXISTS(... AND id != :job_id)`）。互不污染（修 C5：memory 失败不再触碰 note.status，extract 失败不触碰 memory_status）。
 6. **内部状态更新不碰 `updated_at`/`change_seq`**（threads5 P2-2）：`memory_status` 是服务端内部字段，不进任何 API 响应（`note_to_dict` 不含它）、不占 change_seq——因此 `_mark_memory_status` 与 `_mark_memory_sync_failed` 的 UPDATE 显式写 `updated_at=notes.updated_at`（自赋值抑制列级 onupdate），`updated_at` 与 `change_seq` 都不动。反方向：对外可见字段的任何变更必须按 INV-1 分配 change_seq 并推进 `updated_at`。若允许内部更新推进 `updated_at` 而不变更 seq，`/v1/sync` 只回 seq 更大的行，客户端永远观察不到那个新时间戳（「不可观察的时间戳」）。
 
-**保证代码**：`app/models.py`（Job 增 `note_id`/`note_rev` 列与三条部分唯一索引，`postgresql_where`/`sqlite_where` 双方言）、`app/jobs/queue.py::enqueue`（带 note_id/note_rev 与 DO NOTHING）、`app/pipeline/extract.py`、`app/pipeline/memory_sync.py`、`app/pipeline/runner.py::execute_job`（分发两种 kind）。
+**保证代码**：`app/models.py`（Job 增 `note_id`/`note_rev` 列与三条部分唯一索引，`postgresql_where`/`sqlite_where` 双方言）、`app/jobs/queue.py::enqueue`（带 note_id/note_rev 与 DO NOTHING）、`app/workers/extract_impl.py`、`app/pipeline/memory_sync.py`、`app/pipeline/runner.py::execute_job`（分发两种 kind）。
 
 **验证测试**：
 - `test_extract_skips_when_rev_moved_marks_done`
@@ -138,7 +134,7 @@ memory_sync(note_id)     不带 rev。短读事务取 note 当前状态 →（�
 
 **陈述**：调用 `MemoryStore.add / delete / delete_by_note` 的只有 **memory_sync job 的执行体**（`app/pipeline/memory_sync.py`）与账户级 `delete_all`（未来账户注销；当前无 API）。API 请求路径（PATCH/DELETE note）与 extract job **不得**直接改记忆，只能在写事务内 enqueue memory_sync（修 C4：不再依赖提交后 best-effort 直删）。
 
-**保证代码**：`app/api/notes.py`（PATCH/DELETE 删除所有 `get_memory_store()` 直调）、`app/pipeline/extract.py`（不 import memory store）、`app/pipeline/memory_sync.py`（唯一入口）。
+**保证代码**：`app/api/notes.py`（PATCH/DELETE 删除所有 `get_memory_store()` 直调）、`app/workers/extract_impl.py`（不 import memory store）、`app/pipeline/memory_sync.py`（唯一入口）。
 
 **验证测试**：
 - `test_patch_and_delete_never_touch_memory_store_directly`（用记录型假 store：HTTP PATCH/DELETE 请求期间 store 写方法调用数必须为 0；排空 job 后调用只来自 memory_sync）
@@ -210,7 +206,7 @@ memory_sync(note_id)     不带 rev。短读事务取 note 当前状态 →（�
 
 **陈述**：收尾必须带租约条件 `WHERE status='running' AND locked_by=:me AND locked_at=:claimed`（租约失效则放弃一切写入，既有规则）。在此之上：**extract 收尾失败标记额外受入队 rev 条件约束**（`note.rev=入队rev AND deleted_at IS NULL AND status!='organized'`）；**memory_sync 收尾只校验租约**（不带 rev，其失败标记 memory_status 受 INV-2.5 的「无其他 pending/running」条件约束）。回收判死路径（`_fail_expired`）同理按 kind 分流。threads5 P2-1 起这同一租约条件**也约束 memory_sync 执行体的复查**（INV-5 第 3 步）：置位前必须仍持有租约，丢租约的执行不得置位、只删自己刚写的 memory id——threads6 P1-1 起唯一允许的数据库效果是**补偿再入队**（INSERT 新 job 行，不改本 job/note；见 INV-5 第 3 步第三结局）。threads8 P2 补：**置位时刻的租约校验必须与 memory_status 的 UPDATE 原子**（复查读在已关闭的会话里，读与写之间租约可能被回收）——置位事务内锁 job 行复核 `(status, locked_by, locked_at)`，失败即放弃置位（回收者是后继，见 INV-5 第 3 步第一结局的原子化实现）。threads15 P1 起同一租约条件**再前置到 extract 执行体的写回事务**（`_apply_extraction`）：LLM 调用可能慢于 `JOB_LOCK_TIMEOUT_SECONDS`，被回收换主甚至判死后，旧 worker 只查 note rev 挡不住迟到写回（**判死不动 rev**，rev 栅栏对此盲）——写回事务先锁 job 行原子复核三元组，复核不过放弃全部写入（note/建议提醒/memory_sync 入队都在放弃之列），job 与 note 由新持有者决定；本执行的收尾同样被 finalize_claim 放弃。复核与 memory_sync 置位栅栏共用 `queue.lease_still_held`（锁序 jobs → note，INV-1 表）。
 
-**保证代码**：`app/jobs/queue.py::finalize_claim`、`_fail_expired`（按 kind 选择 note 标记条件）、`app/jobs/queue.py::lease_still_held`（threads15：extract 写回与 memory_sync 置位共用的锁内租约复核）、`app/pipeline/runner.py::_finalize`（及 `execute_job` 从认领快照向两类 job 传租约凭证，threads15）、`app/pipeline/memory_sync.py`（复查的租约栅栏 + 置位事务内的原子租约复核）、`app/pipeline/extract.py::_apply_extraction`（写回事务先复核租约，threads15 P1）。
+**保证代码**：`app/jobs/queue.py::finalize_claim`、`_fail_expired`（按 kind 选择 note 标记条件）、`app/jobs/queue.py::lease_still_held`（threads15：extract 写回与 memory_sync 置位共用的锁内租约复核）、`app/pipeline/runner.py::_finalize`（及 `execute_job` 从认领快照向两类 job 传租约凭证，threads15）、`app/pipeline/memory_sync.py`（复查的租约栅栏 + 置位事务内的原子租约复核）、`app/workers/extract_impl.py::_apply_extraction`（写回事务先复核租约，threads15 P1）。
 
 **验证测试**：
 - `test_stale_worker_finalize_ignored_after_lease_reclaimed_extract` / `test_stale_worker_finalize_ignored_after_lease_reclaimed_memory_sync`（两种 kind 各一条）
@@ -250,7 +246,7 @@ memory_sync(note_id)     不带 rev。短读事务取 note 当前状态 →（�
 | query：`/v1/search?q=`、`/v1/sync?since=&limit=`、`/v1/notes?cursor=&limit=` | 中间件（q 已有 `NoNulStr`）；since/cursor 补 `le=int8 上界`（超大整数绑定 OverflowError） |
 | header | 当前**无任何 header 值入库**（authorization 只做 JWT 解析，不落库）；规则：未来任何从 header 取值入库的字段必须走 `NoNulStr`（自查清单项） |
 
-**保证代码**：`app/middleware.py`、`app/main.py::create_app`（注册）、`app/schemas.py`（含 `utc_safe_datetime` 界判定；`clean_llm_str`/`_UNSAFE_LLM_CHARS`——LLM 出站字符串公共清洗，threads12 起 extract 与 ask 共用；`NoteCreate._asr_size` 按 UTF-8 字节量测）、`app/errors.py`、`app/api/notes.py`（path 参数注解、cursor 上界）、`app/api/sync.py`（since 上界）、`app/api/ask.py::ask`（answer 过 `clean_llm_str`，threads12 P2）、`app/pipeline/extract.py::_parse_fire_at`（LLM 输出同界）、`app/pipeline/extract.py::_coerce_extraction`（抽取字段过公共 `clean_llm_str`；`_as_list` 集合字段收口，threads13 P2）、`app/llm/mock.py::parse_datetime/_safe_relative`（相对时间数量上界）、`app/llm/mock.py::_cn_to_int`（十进制位数上界，threads9 P2）、`app/llm/mock.py::parse_datetime` 时钟分支（时分秒范围判定，threads11 P2）、`app/llm/mock.py::_extract_note_and_now`（timezone 完整捕获 + ZoneInfo 校验，threads12 P2；元数据只从 system 消息解析，threads13 P2）。
+**保证代码**：`app/middleware.py`、`app/main.py::create_app`（注册）、`app/schemas.py`（含 `utc_safe_datetime` 界判定；`clean_llm_str`/`_UNSAFE_LLM_CHARS`——LLM 出站字符串公共清洗，threads12 起 extract 与 ask 共用；`NoteCreate._asr_size` 按 UTF-8 字节量测）、`app/errors.py`、`app/api/notes.py`（path 参数注解、cursor 上界）、`app/api/sync.py`（since 上界）、`app/api/ask.py::ask`（answer 过 `clean_llm_str`，threads12 P2）、`app/workers/extract_impl.py::_parse_fire_at`（LLM 输出同界）、`app/workers/extract_impl.py::_coerce_extraction`（抽取字段过公共 `clean_llm_str`；`_as_list` 集合字段收口，threads13 P2）、`app/llm/mock.py::parse_datetime/_safe_relative`（相对时间数量上界）、`app/llm/mock.py::_cn_to_int`（十进制位数上界，threads9 P2）、`app/llm/mock.py::parse_datetime` 时钟分支（时分秒范围判定，threads11 P2）、`app/llm/mock.py::_extract_note_and_now`（timezone 完整捕获 + ZoneInfo 校验，threads12 P2；元数据只从 system 消息解析，threads13 P2）。
 
 **验证测试**：
 - `test_nul_in_path_param_422`（`/v1/notes/n%00x` 的 GET/PATCH/DELETE）
@@ -471,7 +467,7 @@ fence 模型（`credential_generation` 整型代际，两表各一列、默认 0
 
 **边界（允许的例外，须注释论证）**：纯展示/时间戳用途的旧值（如 PATCH `.values(updated_at=utcnow())` 在语句构造时求值，陈旧 µs–ms 级、无决策依赖；device `last_seen` 无任何决策读它）；方向保守的判定（如 `_claim_postgres` 的 `cutoff = now - timeout` 在循环外取——陈旧只会让刚过期的租约晚一轮被回收，不会错回收/错放行）；无等待窗口的首个写（login 的 invite 条件 UPDATE 前 `now` 即取即用）。全仓各锁点的逐条核查记录见第八/九轮 sweep（`/workspace/.agent-tmp/sweep8.md` D 类、`sweep9.md` A 类）。
 
-**保证代码**：`app/api/auth.py::login`（`_resolve_lost_invite` 重读后重取 now；`_token_pair` 移到 device upsert 之后，threads9 P1；device 锁落定后、签发前用锁后新 now 复验 invite 过期——过期回滚本次登录事务并 403，threads14 P1，首用与既有 owner 双路径）、`app/api/auth.py::_claim_invite_first_use`（rowcount==1 后锁内重取 now 复验过期，threads10 P1）、`app/api/auth.py::refresh`（锁内重取 now；`_revoke_device_for_reuse` 的锁内 `utcnow()` 判过期为 threads7 已有正面样例）、`app/api/auth.py::logout`（持锁后复验凭证代际/吊销态再删，threads15 P1；gen claim 经 `app/deps.py::AuthContext.credential_generation` 传入）、`app/pipeline/extract.py::_apply_extraction`（版本栅栏 + 锁内 now；写回事务先原子复核租约，threads15 P1）、`app/jobs/queue.py::finalize_claim`（锁内读值判定）、`app/jobs/queue.py::lease_still_held`（threads15：extract 写回/memory_sync 置位共用的租约复核）、`app/jobs/queue.py::_mark_running/_reclaim_running`（租约 locked_at 取写入时刻，threads10）、`app/pipeline/memory_sync.py::_mark_memory_status`（置位事务内原子租约复核，INV-5/6）。
+**保证代码**：`app/api/auth.py::login`（`_resolve_lost_invite` 重读后重取 now；`_token_pair` 移到 device upsert 之后，threads9 P1；device 锁落定后、签发前用锁后新 now 复验 invite 过期——过期回滚本次登录事务并 403，threads14 P1，首用与既有 owner 双路径）、`app/api/auth.py::_claim_invite_first_use`（rowcount==1 后锁内重取 now 复验过期，threads10 P1）、`app/api/auth.py::refresh`（锁内重取 now；`_revoke_device_for_reuse` 的锁内 `utcnow()` 判过期为 threads7 已有正面样例）、`app/api/auth.py::logout`（持锁后复验凭证代际/吊销态再删，threads15 P1；gen claim 经 `app/deps.py::AuthContext.credential_generation` 传入）、`app/workers/extract_impl.py::_apply_extraction`（版本栅栏 + 锁内 now；写回事务先原子复核租约，threads15 P1）、`app/jobs/queue.py::finalize_claim`（锁内读值判定）、`app/jobs/queue.py::lease_still_held`（threads15：extract 写回/memory_sync 置位共用的租约复核）、`app/jobs/queue.py::_mark_running/_reclaim_running`（租约 locked_at 取写入时刻，threads10）、`app/pipeline/memory_sync.py::_mark_memory_status`（置位事务内原子租约复核，INV-5/6）。
 
 **验证测试**：
 - `test_refresh_token_expires_while_waiting_device_lock_401`（threads8 P1：可控时钟 + 注入等锁窗口，token 在窗口内跨过 expires_at → 401 unauthorized、行未轮换、设备未吊销）
@@ -532,13 +528,13 @@ fence 模型（`credential_generation` 整型代际，两表各一列、默认 0
 
 | 源字段 | 派生字段 | 失效方式 |
 | --- | --- | --- |
-| `note.text` | `title`、`tags`、`todos`、`status`（organized/failed）、suggested reminders、记忆（经 memory_sync） | PATCH：同事务清空 title/tags/todos + `status='uploaded'` + 墓碑全部 suggested 提醒 + 入队 extract 与 memory_sync（新值由重抽取写回；extract 永久失败时旧派生也不残留） |
+| `note.text` | `title`、`tags`、`todos`、`status`（organized/failed）、suggested reminders、记忆（经 memory_sync） | PATCH：同事务清空 title/tags/todos + `status='uploaded'` + 墓碑全部 suggested 提醒 + 同事务 enqueue memory_sync；提交后开 organize WorkItem / 调度 Worker（新值由重抽取写回；extract 永久失败时旧派生也不残留） |
 | `note.recorded_at` / `note.timezone` | suggested reminders 的 `fire_at`（相对时间参照与时区） | 当前 **PATCH 不支持改这两个字段**（`NotePatch` 只有 text+rev）——无可失效点；未来放开时必须与 text 同路径（清派生 + 重入队），本表即验收清单 |
 | `note.deleted_at`（DELETE） | 全部派生 | 软删后 GET/list/sync 排除该行（sync 只回墓碑 id），提醒全量墓碑，memory_sync 清记忆——行内残留的 title/tags/todos 不可观察 |
 
 各写路径的处理：
 
-- `POST /v1/notes`：新行，title/tags/todos 天然 NULL、status=uploaded、入队 extract(rev=1)——无旧派生。
+- `POST /v1/notes`：新行，title/tags/todos 天然 NULL、status=uploaded、提交后开 organize WorkItem / 调度 Worker(rev=1)——无旧派生。
 - `POST /v1/notes` 幂等命中：只读返回，无写。
 - `PATCH` 完整路径：见上表第一行（**本轮修复**：此前只置 `status='uploaded'` 不清 title/tags/todos——PATCH 响应与 /v1/sync 把旧 rev 的抽取产物当当前元数据返回，新 extract 永久失败时旧产物永久残留）。
 - `PATCH` 内容不变快路径：**不失效**（无源字段变更；无操作 PATCH 不得抹掉 organized 元数据）。
@@ -547,10 +543,10 @@ fence 模型（`credential_generation` 整型代际，两表各一列、默认 0
 - extract apply：写全新派生（先软删旧 suggested 再写新产物）。
 - 队列失败标记（`_mark_extract_failed`）：置 failed 不清派生——PATCH 已清空，失败落在一组空派生上，语义自洽。
 
-**保证代码**：`app/api/notes.py::patch_note`（条件 UPDATE 一并 `title=None, tags=None, todos=None`）、`app/schemas.py::NotePatch`（源字段白名单：text+rev）、`app/pipeline/extract.py::_apply_extraction`（重算写回）。
+**保证代码**：`app/api/notes.py::patch_note`（条件 UPDATE 一并 `title=None, tags=None, todos=None`）、`app/schemas.py::NotePatch`（源字段白名单：text+rev）、`app/workers/extract_impl.py::_apply_extraction`（重算写回）。
 
 **验证测试**：
-- `test_patch_clears_stale_extraction_fields`（threads8 P1：organized 后 PATCH 正文 → 响应与库内 title/tags/todos 清空、status=uploaded、suggested 提醒在 /v1/sync 出现为墓碑、extract 与 memory_sync 均入队）
+- `test_patch_clears_stale_extraction_fields`（threads8 P1：organized 后 PATCH 正文 → 响应与库内 title/tags/todos 清空、status=uploaded、suggested 提醒在 /v1/sync 出现为墓碑、organize WorkItem 已开、memory_sync 已入队）
 - `test_patch_unchanged_text_keeps_extraction_fields`（快路径不清派生；既有 `test_patch_unchanged_text_with_stale_rev_409` 锁定不入队）
 
 ### INV-16 密钥拼进 URL 前必须 percent-encode（threads12 P1，docker-compose.yml:24）

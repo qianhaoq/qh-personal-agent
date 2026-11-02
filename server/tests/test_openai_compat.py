@@ -20,7 +20,7 @@ from app.llm.openai_compat import (
     OpenAICompatClient,
     _reset_response_format_cache,
 )
-from app.models import Job, Note
+from app.models import Note, SaWorkItem
 from tests.conftest import auth_headers
 
 # DeepSeek 实测的错误体形态（只用于驱动 mock，不含任何真实凭据）
@@ -235,7 +235,7 @@ async def test_chat_without_response_format_omits_key(monkeypatch):
 
 
 async def test_json_object_bad_output_fails_extraction_parse(monkeypatch):
-    from app.pipeline.extract import _parse_llm_json
+    from app.workers.extract_impl import _parse_llm_json
 
     content = {"v": "模型抽风，这不是 JSON"}
     _install_transport(monkeypatch, lambda req: _ok(content["v"]))
@@ -253,14 +253,14 @@ async def test_extract_json_object_bad_json_marks_note_failed(client, user, monk
     """端到端：json_object 模式返回坏 JSON → 确定性失败，job 记 failed、
     笔记不被标整理完成（校验语义与 json_schema 模式完全同一套）。"""
     from app.db import get_sessionmaker
-    from app.pipeline.runner import run_pending_jobs
+    from tests.runtime_driver import run_pending_jobs
 
     _install_transport(monkeypatch, lambda req: _ok("模型抽风，这不是 JSON"))
 
     async def fake_get_llm():
         return _llm("json_object")
 
-    monkeypatch.setattr("app.pipeline.extract.get_llm_client", fake_get_llm)
+    monkeypatch.setattr("app.workers.extract_impl.get_llm_client", fake_get_llm)
 
     r = await client.post(
         "/v1/notes",
@@ -273,7 +273,7 @@ async def test_extract_json_object_bad_json_marks_note_failed(client, user, monk
     async with get_sessionmaker()() as session:
         note = await session.get(Note, note_id)
         job = (
-            await session.execute(select(Job).where(Job.kind == "extract", Job.note_id == note_id))
+            await session.execute(select(SaWorkItem).where(SaWorkItem.kind == "organize_note", SaWorkItem.note_id == note_id))
         ).scalar_one()
     assert job.status == "failed"
     assert note.status == "failed"
@@ -283,7 +283,7 @@ async def test_extract_json_object_bad_json_marks_note_failed(client, user, monk
 async def test_extract_json_object_valid_json_organizes(client, user, monkeypatch):
     """端到端：json_object 模式返回合法 JSON → 笔记正常整理（title 写入）。"""
     from app.db import get_sessionmaker
-    from app.pipeline.runner import run_pending_jobs
+    from tests.runtime_driver import run_pending_jobs
 
     content = json.dumps(
         {"title": "买火车票", "tags": ["出行"], "todos": [{"text": "买火车票"}], "suggested_reminders": []},
@@ -294,7 +294,7 @@ async def test_extract_json_object_valid_json_organizes(client, user, monkeypatc
     async def fake_get_llm():
         return _llm("json_object")
 
-    monkeypatch.setattr("app.pipeline.extract.get_llm_client", fake_get_llm)
+    monkeypatch.setattr("app.workers.extract_impl.get_llm_client", fake_get_llm)
 
     r = await client.post(
         "/v1/notes",

@@ -119,7 +119,7 @@ def auth_headers(user: dict) -> dict:
 
 @pytest.fixture
 def run_jobs():
-    from app.pipeline.runner import run_pending_jobs
+    from tests.runtime_driver import run_pending_jobs
 
     async def _run():
         # 失败重试会推迟 run_after，这里跑到没有可执行的为止

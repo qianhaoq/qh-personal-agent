@@ -56,7 +56,7 @@ async def test_create_note_sql_order_job_insert_before_seq_update(client, user):
     """INV-1.2（修 C2）：create 里 jobs INSERT 先 flush 落定，之后才
     allocate_seq（sequences 是提交前最后一把锁），change_seq 其后写回。"""
     headers = auth_headers(user)
-    with _SqlTrace(("notes", "jobs", "sequences")) as trace:
+    with _SqlTrace(("notes", "jobs", "sa_work_items", "sequences")) as trace:
         r = await client.post(
             "/v1/notes",
             json={"client_note_id": str(uuid.uuid4()), "text": "顺序验证"},
@@ -69,11 +69,11 @@ async def test_create_note_sql_order_job_insert_before_seq_update(client, user):
     job_insert = trace.indices("jobs", "INSERT")
     seq_write = _first_seq_write(trace)
     assert note_insert, "应先 INSERT notes"
-    assert job_insert, "应 INSERT jobs（extract 任务）"
-    assert note_insert[0] < job_insert[0] < seq_write, (
-        f"create 锁序违规：note INSERT @ {note_insert}, jobs INSERT @ {job_insert}, "
-        f"sequences 写 @ {seq_write}，trace={trace.trace}"
-    )
+    assert job_insert == [], "POST creates no extract jobs"
+    assert note_insert[0] < seq_write
+    ticket_insert = trace.indices("sa_work_items", "INSERT")
+    assert len(ticket_insert) == 1 and ticket_insert[0] > seq_write, (
+        "Ticket intake must happen after the upload transaction commits")
     # change_seq 写回（对 notes 的 UPDATE）必须在 sequences 写之后
     note_updates = [i for i in trace.indices("notes", "UPDATE") if i > seq_write]
     assert note_updates, "change_seq 应在 allocate_seq 之后用第二条 UPDATE 写回"
@@ -82,11 +82,11 @@ async def test_create_note_sql_order_job_insert_before_seq_update(client, user):
     from sqlalchemy import select
 
     from app.db import get_sessionmaker
-    from app.models import Job
+    from app.models import SaWorkItem
 
     async with get_sessionmaker()() as session:
         job = (
-            await session.execute(select(Job).where(Job.kind == "extract", Job.note_id == note_id))
+            await session.execute(select(SaWorkItem).where(SaWorkItem.kind == "organize_note", SaWorkItem.note_id == note_id))
         ).scalar_one()
     assert job.note_rev == 1
 
@@ -118,12 +118,11 @@ async def test_patch_sql_order_note_reminders_jobs_before_seq_update(client, use
     seq_write = _first_seq_write(trace)
     assert note_update, "PATCH 应以 note 条件 UPDATE 开头（拿行锁/乐观锁）"
     assert reminder_update, "应作废建议提醒"
-    assert len(job_inserts) >= 2, "应入队 extract 与 memory_sync 两个新 job 行"
+    assert len(job_inserts) == 1, "PATCH enqueues only memory_sync"
     order_ok = (
         note_update[0]
         < reminder_update[0]
         < job_inserts[0]
-        < job_inserts[-1]
         < seq_write
     )
     assert order_ok, (
@@ -143,7 +142,7 @@ async def test_extract_apply_sql_order_jobs_before_seq(client, user):
     """INV-1.2：extract 写回事务同样 jobs INSERT（memory_sync）先于
     allocate_seq（MockLLM 不访问数据库，无 LLM 语句混入）。"""
     headers = auth_headers(user)
-    from app.pipeline.runner import run_pending_jobs
+    from tests.runtime_driver import run_pending_jobs
 
     created = await client.post(
         "/v1/notes",
@@ -178,6 +177,8 @@ def test_business_paths_never_update_existing_job_rows():
         app_dir / "api" / "sync.py",
         app_dir / "api" / "ask.py",
         app_dir / "pipeline" / "extract.py",
+        app_dir / "workers" / "extract_impl.py",
+        app_dir / "domain" / "channel.py",
         app_dir / "pipeline" / "memory_sync.py",
     ]
     forbidden = re.compile(r"update\s*\(\s*Job\b")

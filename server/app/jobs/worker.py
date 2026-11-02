@@ -7,6 +7,7 @@ from app.db import startup_create_all
 from app.errors import safe_error_text
 from app.logs import harden_third_party_loggers
 from app.pipeline.runner import run_pending_jobs
+from app.runtime import run_pending_work
 
 logging.basicConfig(
     level=get_settings().log_level.upper(),
@@ -42,7 +43,8 @@ async def main() -> None:
     logger.info("worker started (interval=%.1fs)", settings.worker_poll_interval_seconds)
     while True:
         try:
-            n = await run_pending_jobs(limit=settings.worker_batch_size)
+            n = await run_pending_work(limit=settings.worker_batch_size)
+            n += await run_pending_jobs(limit=settings.worker_batch_size)
             if n == 0:
                 await asyncio.sleep(settings.worker_poll_interval_seconds)
         except Exception as exc:  # noqa: BLE001 常驻进程不能退出：任何异常只记日志

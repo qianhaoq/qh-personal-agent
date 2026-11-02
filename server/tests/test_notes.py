@@ -359,9 +359,12 @@ async def test_patch_clears_stale_extraction_fields(client, user, run_jobs):
         ).scalars().all()
     assert (row.title, row.tags, row.todos) == (None, None, None)
     assert row.status == "uploaded"
-    assert {j.kind for j in jobs if j.status == "pending"} >= {"extract", "memory_sync"}, (
-        "源字段变更必须重新入队 extract 与 memory_sync"
-    )
+    assert {j.kind for j in jobs if j.status == "pending"} == {"memory_sync"}
+    from app.domain.engine import Engine
+    tickets = await Engine().work_items_for_note(note_id)
+    current = [t for t in tickets if t.note_rev == body["rev"]]
+    assert len(current) == 1 and current[0].status == "pending"
+    assert current[0].kind == "organize_note"
 
     # 旧 suggested 提醒在 /v1/sync 里以墓碑出现（客户端据此本地删除）
     sync = await client.get(

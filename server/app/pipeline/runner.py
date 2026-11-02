@@ -1,4 +1,8 @@
-"""job 执行器：处理一个/一批待执行 job。worker 与测试共用。"""
+"""Memory 端口队列执行器，保留排空历史 extract 行的能力。
+
+Super-agent 编排在 app.runtime / domain.engine；本模块不创建整理 Ticket，
+新 notes/PATCH 不再入队 extract。进程入口独立轮询 Runtime 与本队列。
+"""
 import json
 import logging
 from dataclasses import dataclass
@@ -139,6 +143,7 @@ async def execute_job(kind: str, payload: dict, *, claim: _Claimed | None = None
     持有者（memory_sync 复查/置位自 threads5 P2-1 起，extract 写回自
     threads15 P1 起，INV-5 第 3 步/INV-6/13 的租约栅栏）。"""
     if kind == "extract":
+        # Historical queued rows only; production intake opens Store Tickets.
         from app.pipeline.extract import extract_note
 
         await extract_note(
