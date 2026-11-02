@@ -61,7 +61,7 @@ Memory 写删仍只经 memory_sync，终态记忆 == f(note 终态)，metadata={
 | POST /v1/notes（create） | note INSERT（新行）→ flush → **allocate_seq** → note change_seq 写回 → commit。幂等冲突分支（client_note_id 撞唯一约束）整体回滚后只读复查，无二次加锁 | 1 |
 | PATCH /v1/notes/:id | note 条件 UPDATE（锁行，乐观锁）→ reminders 条件 UPDATE（作废 suggested）→ jobs INSERT memory_sync（新行，DO NOTHING）→ flush → **allocate_seq** → note+reminders change_seq 写回 → commit | 1+N |
 | DELETE /v1/notes/:id | note 条件 UPDATE（软删）→ reminders 条件 UPDATE（全量墓碑）→ sa_channel_actions 条件 UPDATE（墓碑）→ jobs INSERT memory_sync → flush → **allocate_seq** → 写回 → commit | 1+N+A |
-| POST /v1/reminders/:id/confirm | Runtime thread/trigger → reminders FOR UPDATE（锁内 rev + utcnow 复验）→ sa_channel_actions 写入 → flush → **allocate_seq** → reminder/action change_seq 写回；每次 HTTP 请求均到达锁内检查，action 按 reminder 去重 | 2（无变更为 0） |
+| POST /v1/reminders/:id/confirm | Runtime thread/trigger → reminders FOR UPDATE（锁内 rev + utcnow 复验）→ sa_channel_actions 写入 → flush → **allocate_seq** → reminder/action change_seq 写回；Trigger 按 reminder+请求 rev+覆盖项哈希去重；新 Trigger 到达锁内检查，重复 Trigger 返回前重读 rev，旧 rev 一律 409；action 按 reminder 去重 | 2（无变更为 0） |
 | extract 短写事务（apply） | **jobs 行（PG FOR UPDATE，threads15 P1：写回前原子复核租约 `(status, locked_by, locked_at)`——锁序与队列路径同向 jobs → note，先 note 后 job 会与 finalize/判死成 AB-BA；复核不过不写任何行）** → note FOR UPDATE（PG）→ reminders（stale 条件 UPDATE + fresh INSERT）→ jobs INSERT memory_sync → flush → **allocate_seq** → 写回 → commit | 1+S+F |
 | memory_sync 各短事务 | 读事务：note + job 行纯读无锁。外部调用：无任何会话/锁。置位事务（threads8 P2 起）：jobs 行（PG FOR UPDATE，锁内复核租约，锁序 = 队列路径 jobs → note）→ note 条件 UPDATE（memory_status，不分配 seq、不碰 updated_at/change_seq，见 INV-2.6）。再入队：jobs INSERT。**该路径永不碰 sequences** | 0 |
 | 队列 claim | jobs 行（FOR UPDATE SKIP LOCKED / 条件 UPDATE）；循环里判死候选先走下一行 `_fail_expired` 并**即时 commit**（threads11）再继续扫 | 0 |
@@ -393,7 +393,7 @@ fence 模型（`credential_generation` 整型代际，两表各一列、默认 0
 
 1. **哪些接口需要 rev**：
    - `PATCH /v1/notes/{note_id}`：请求体必填 `rev`（`NotePatch.rev`，int，1..int4 上界）。
-   - `POST /v1/reminders/{reminder_id}/confirm`：请求体必填 `rev`（int，1..int4 上界）；Channel 在 reminder 行锁内先检查 rev，幂等快路径也不能绕过。有效 fire_at 在锁内以新 utcnow() 检查，过期返回 409，不生成 action。Trigger 时间只存 ISO 字符串。
+   - `POST /v1/reminders/{reminder_id}/confirm`：请求体必填 `rev`（int，1..int4 上界）；Channel 在 reminder 行锁内先检查 rev，幂等快路径也不能绕过。有效 fire_at 在锁内以新 utcnow() 检查，过期返回 409，不生成 action。Trigger 时间只存 ISO 字符串。confirm dedupe_key 为 `reminder_confirm:{id}:r{rev}:{sha256_hex16_of_mods}`，覆盖项稳定编码后哈希，不嵌入原文；同 rev+同覆盖项只建一个 Trigger，A→B→A 依靠递增 rev 分开。Engine 重复 Trigger 跳过 Channel 时，API 必须重读 reminder，`receipt.duplicate and fresh.rev != body.rev` 返回 409；首次成功允许 Channel 推进 rev，当前 rev 无变更重确认返回 duplicate=true。
    - 不需要 rev 的写接口及其理由：`POST /v1/notes`（幂等键是 `client_note_id`，无版本概念；重放命中返回数据库当前状态）；`DELETE /v1/notes/{note_id}`（删除是最后写者胜，无内容合并问题）；`POST /v1/auth/*`（凭据接口，无资源版本语义）；`POST /v1/ask`（无 DB 写）。未来新增写接口若表达「对已知版本的变更」（如 reminders 完成），必须照本条携带并原子校验 rev。
 2. **比较时机**：任何提前返回/幂等快路径**之前**；在加锁或条件更新中原子比较。PATCH 的两条路径：
    - 完整路径：`UPDATE notes SET … WHERE id=:id AND user_id=:uid AND rev=:body.rev AND deleted_at IS NULL`（条件更新即乐观锁，rowcount==0 → 回滚重读归因，见 INV-12）；
@@ -408,7 +408,7 @@ fence 模型（`credential_generation` 整型代际，两表各一列、默认 0
 **保证代码**：`app/api/notes.py::patch_note`（快路径的自赋值条件校验 + `_raise_conflict_or_not_found` 复查归因）、`app/schemas.py::NotePatch`、`app/errors.py`。
 
 **验证测试**：
-- `test_confirm_stale_rev_even_for_idempotent_retry` / `test_confirm_modify_scheduled_checks_rev` / `test_concurrent_confirm_same_rev_exactly_one_success`（最后一项为 PG 并发）
+- `test_confirm_long_title_dedupe_key_bounded` / `test_confirm_title_a_b_a_restores_a` / `test_confirm_stale_rev_even_for_idempotent_retry` / `test_confirm_modify_scheduled_checks_rev` / `test_concurrent_confirm_same_rev_exactly_one_success`（最后一项为 PG 并发）
 - `test_patch_unchanged_text_with_stale_rev_409`（threads6 P1-2：过期 rev + 内容不变 → 409；过期 rev + 旧内容 → 409；当前 rev + 内容不变 → 200，rev/updated_at 不动、不新增 job）
 
 ### INV-12 条件更新/删除匹配 0 行后的归因规则（threads6 P1-3）

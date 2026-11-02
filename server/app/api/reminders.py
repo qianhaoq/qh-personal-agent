@@ -1,4 +1,6 @@
 """提醒确认：POST /v1/reminders/{id}/confirm — Subscription 直通原 WorkItem。"""
+import hashlib
+import json
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Path
@@ -64,9 +66,14 @@ async def confirm_reminder(
     if body.title is not None:
         payload["title"] = body.title
 
-    # Each HTTP attempt must reach the locked rev check, including retries.
-    # Action dedupe remains stable; Trigger dedupe must not bypass INV-11.
-    dedupe_key = f"reminder_confirm:{reminder_id}:{new_id('req')}"
+    # Stable JSON distinguishes an omitted override from an explicit empty title.
+    # Hash only overrides; revision scope allows A→B→A without unbounded keys.
+    mods = json.dumps(
+        {"title": body.title, "fire_at": payload.get("fire_at")},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    )
+    digest = hashlib.sha256(mods.encode("utf-8")).hexdigest()[:16]
+    dedupe_key = f"reminder_confirm:{reminder_id}:r{body.rev}:{digest}"
 
     trigger = Trigger(
         id=new_id("trg"),
@@ -91,6 +98,9 @@ async def confirm_reminder(
         ))).one_or_none()
     if fresh is None:
         raise ApiError(404, "not_found", "reminder not found")
+    # Duplicate intake skips Channel, so enforce INV-11 on the fresh revision.
+    if receipt.duplicate and fresh.rev != body.rev:
+        raise ApiError(409, "conflict", "版本冲突，请拉取最新版本后重试")
     return {
         "reminder": reminder_to_dict(fresh),
         "action": action_to_dict(action_row) if action_row else None,

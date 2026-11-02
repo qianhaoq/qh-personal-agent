@@ -176,6 +176,14 @@ async def test_confirm_stale_rev_even_for_idempotent_retry(client, user):
     assert current.status_code == 200
     assert current.json()["reminder"]["rev"] == rev + 1
     assert current.json()["action"]["id"] == first.json()["action"]["id"]
+    retry = await client.post(url, headers=auth_headers(user),
+                              json={"rev": current.json()["reminder"]["rev"]})
+    assert retry.status_code == 200
+    assert retry.json()["duplicate"] is True
+    async with get_sessionmaker()() as session:
+        assert await session.scalar(select(func.count()).select_from(SaTrigger).where(
+            SaTrigger.kind == "user_confirmed_reminder",
+        )) == 2  # original rev and current rev; retries reuse their Trigger
 
 
 @pytest.mark.parametrize("override", [False, True])
@@ -240,3 +248,56 @@ async def test_confirm_modify_scheduled_checks_rev(client, user):
     assert modified.json()["action"]["id"] == first.json()["action"]["id"]
     stale = await client.post(url, headers=auth_headers(user), json=body)
     assert stale.status_code == 409
+
+
+async def test_confirm_long_title_dedupe_key_bounded(client, user):
+    _, reminder_id, rev = await _suggested(client, user)
+    title = "长" * 256
+    resp = await client.post(f"/v1/reminders/{reminder_id}/confirm",
+                             headers=auth_headers(user), json={"rev": rev, "title": title})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["reminder"]["title"] == title
+    assert resp.json()["action"]["payload"]["title"] == title
+    async with get_sessionmaker()() as session:
+        reminder = await session.get(Reminder, reminder_id)
+        action = (await session.scalars(select(SaChannelAction).where(
+            SaChannelAction.reminder_id == reminder_id,
+        ))).one()
+        trigger = (await session.scalars(select(SaTrigger).where(
+            SaTrigger.kind == "user_confirmed_reminder",
+        ))).one()
+        assert reminder.title == action.payload["title"] == title
+        key = trigger.dedupe_key
+        prefix = f"reminder_confirm:{reminder_id}:r{rev}:"
+        assert len(key) <= 256 and title not in key
+        assert key.startswith(prefix)
+        digest = key[len(prefix):]
+        assert len(digest) == 16 and all(c in "0123456789abcdef" for c in digest)
+
+
+async def test_confirm_title_a_b_a_restores_a(client, user):
+    _, reminder_id, rev = await _suggested(client, user)
+    revisions = []
+    for title in ("A", "B", "A"):
+        revisions.append(rev)
+        resp = await client.post(f"/v1/reminders/{reminder_id}/confirm",
+                                 headers=auth_headers(user), json={"rev": rev, "title": title})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["reminder"]["title"] == title
+        assert resp.json()["action"]["payload"]["title"] == title
+        assert resp.json()["duplicate"] is False
+        assert resp.json()["reminder"]["rev"] == rev + 1
+        rev = resp.json()["reminder"]["rev"]
+    async with get_sessionmaker()() as session:
+        reminder = await session.get(Reminder, reminder_id)
+        action = (await session.scalars(select(SaChannelAction).where(
+            SaChannelAction.reminder_id == reminder_id,
+        ))).one()
+        assert reminder.title == action.payload["title"] == "A"
+        keys = (await session.scalars(select(SaTrigger.dedupe_key).where(
+            SaTrigger.kind == "user_confirmed_reminder",
+        ))).all()
+        assert len(keys) == len(set(keys)) == 3
+        for request_rev in revisions:
+            assert sum(key.startswith(f"reminder_confirm:{reminder_id}:r{request_rev}:")
+                       for key in keys) == 1
