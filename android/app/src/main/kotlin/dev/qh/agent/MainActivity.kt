@@ -50,7 +50,7 @@ class MainActivity : ComponentActivity() {
                         ReminderAlarmScheduler(applicationContext)
                     ) as T
                 })
-                AgentApp(model, { callback -> VoiceAsr(this, callback).also { voice = it } }, {
+                AgentApp(model, { fallback, callback -> VoiceAsr(this, callback, fallback).also { voice = it } }, {
                     microphonePermission.launch(android.Manifest.permission.RECORD_AUDIO)
                 }, { voice?.cancel() })
             }
@@ -120,6 +120,11 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
         val body = pending ?: noteDraft(draft, source = draftSource).also { pending = it }
         repo.create(body); draft = ""; pending = null; draftSource = "app"; done()
     }
+    fun askFromVoice(text: String) {
+        val result = voiceQuestion(text, busy)
+        question = result.question
+        if (result.shouldAutoAsk) ask()
+    }
     fun ask() = run { answer = null; answer = repo.ask(question) }
     fun logout() = run {
         // Bump generation + clear alarms before network logout so in-flight boot cannot re-arm.
@@ -130,10 +135,10 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
     }
 }
 @Composable
-fun AgentApp(model: AgentModel, voiceFactory: ((String) -> Unit) -> VoiceAsr, requestMicrophone: () -> Unit, cancelVoice: () -> Unit) {
+fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> VoiceAsr, requestMicrophone: () -> Unit, cancelVoice: () -> Unit) {
     Surface(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().imePadding().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("随记 · S3" + if (BuildConfig.USE_MOCK_API) " / 本地演示" else " / 服务器", style = MaterialTheme.typography.headlineSmall)
+            Text("随记 · S4" + if (BuildConfig.USE_MOCK_API) " / 本地演示" else " / 服务器", style = MaterialTheme.typography.headlineSmall)
             if (model.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
             model.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             if (!model.signedIn) {
@@ -191,7 +196,7 @@ fun AgentApp(model: AgentModel, voiceFactory: ((String) -> Unit) -> VoiceAsr, re
                         val onVoiceResult by rememberUpdatedState<(String) -> Unit>({ text ->
                             model.createFromVoice(text) { nav.popBackStack() }
                         })
-                        val voice = remember { voiceFactory { onVoiceResult(it) } }
+                        val voice = remember { voiceFactory("文字记事") { onVoiceResult(it) } }
                         val captureLifecycle = LocalLifecycleOwner.current.lifecycle
                         DisposableEffect(voice, captureLifecycle) {
                             val observer = LifecycleEventObserver { _, event ->
@@ -222,11 +227,36 @@ fun AgentApp(model: AgentModel, voiceFactory: ((String) -> Unit) -> VoiceAsr, re
                         }
                     }
                     composable("ask") {
+                        val onVoiceResult by rememberUpdatedState<(String) -> Unit>(model::askFromVoice)
+                        val voice = remember { voiceFactory("文字提问") { onVoiceResult(it) } }
+                        val askLifecycle = LocalLifecycleOwner.current.lifecycle
+                        DisposableEffect(voice, askLifecycle) {
+                            val observer = LifecycleEventObserver { _, event ->
+                                if (event == Lifecycle.Event.ON_PAUSE) voice.releaseForBackground()
+                            }
+                            askLifecycle.addObserver(observer)
+                            onDispose { askLifecycle.removeObserver(observer); voice.destroy() }
+                        }
                         LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                             item {
                                 OutlinedTextField(model.question, { model.question = it }, label = { Text("问题（最多 2000 字）") },
-                                    modifier = Modifier.fillMaxWidth(), enabled = !model.busy)
-                                Button(model::ask, enabled = !model.busy && model.question.isNotBlank()) { Text("提问") }
+                                    modifier = Modifier.fillMaxWidth(), enabled = !model.busy && voice.state == AsrUiState.Idle)
+                                voice.message?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                                when (voice.state) {
+                                    AsrUiState.Idle -> OutlinedButton({ voice.start(requestMicrophone) }, enabled = !model.busy) { Text("语音提问") }
+                                    else -> {
+                                        Text(when (voice.state) {
+                                            AsrUiState.Permission -> "等待麦克风权限…"
+                                            AsrUiState.Listening -> "正在听写，请说中文…"
+                                            else -> "正在识别…"
+                                        })
+                                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                            if (voice.state == AsrUiState.Listening) OutlinedButton(voice::stop) { Text("停止并识别") }
+                                            TextButton(voice::cancel) { Text("取消") }
+                                        }
+                                    }
+                                }
+                                Button(model::ask, enabled = !model.busy && voice.state == AsrUiState.Idle && model.question.isNotBlank()) { Text("提问") }
                             }
                             model.answer?.let { answer ->
                                 item { Text(answer.answer) }

@@ -1,8 +1,8 @@
-# Android S3 · 随记
+# Android S4 · 语音问答
 
 紧凑的 Kotlin / Compose 客户端：登录、时间线、文字记事、问答、提醒同步与确认；
 确认后的 `schedule_reminder` Channel action 会落到 AlarmManager，响铃时显示系统通知。
-系统 SpeechRecognizer 中文语音记事。minSdk 26，compile/targetSdk 34，JDK 17，Gradle 8.7，AGP 8.5.2。
+系统 SpeechRecognizer 中文语音记事与语音问答。minSdk 26，compile/targetSdk 34，JDK 17，Gradle 8.7，AGP 8.5.2。
 
 ## 安装与运行
 
@@ -51,6 +51,19 @@ api.useMock=false
 切回 mock：删除 `api.useMock=false` 或改为 `api.useMock=true`。
 `local.properties` 在构建时读取，改动后需重新构建安装。
 
+## S4 语音问答
+
+「问一问」页面新增「语音提问」，复用 S3 的系统 SpeechRecognizer / VoiceAsr，
+语言为 `zh-CN`。识别成功先填入问题，再自动调用 Repository.ask → `POST /v1/ask`，
+沿用原有答案与 citations 展示；若已有请求进行中，仍保留问题供稍后手动「提问」。
+听写期间禁用问题编辑与「提问」，提供状态、「停止并识别」与「取消」。
+无引擎、权限拒绝或识别失败会提示改用文字提问，识别结果在请求失败后保留以便重试。
+权限与后台释放规则和记事页一致：ON_PAUSE / onStop 释放活动中的识别，
+但 Permission 状态保留，避免系统权限弹窗触发后台事件后丢失授权回调；
+离开页面时销毁 recognizer，旧回调失效。系统引擎可能联网，不保存录音文件。
+默认 debug mock 仍可使用语音或文字提问并展示固定问答，无需连接服务器；
+mock 只替代问答 API，语音识别仍需要设备系统引擎。
+
 ## S3 语音随手记
 
 进入「记一条」后点「语音记事」，首次使用申请 `RECORD_AUDIO`。使用系统默认
@@ -58,7 +71,8 @@ SpeechRecognizer 引擎，语言为 `zh-CN`；设备需安装可用 RecognitionS
 不保证离线识别，系统引擎可能联网处理音频；应用不保存或上传录音文件。
 无引擎、拒绝权限、网络异常或未听清时显示提示，可继续文字记事。
 听写时显示状态，可「停止并识别」或「取消」；离开页面、退出登录、Activity
-进入后台或销毁时取消听写，释放 recognizer，并忽略旧回调。
+进入后台或销毁时取消听写，释放 recognizer，并忽略旧回调；等待权限时的
+pause/stop 保留 Permission 状态，允许权限结果继续启动识别。
 识别成功直接复用 Repository.create / `POST /v1/notes`，`source="voice_asr"`；
 创建成功返回时间线。失败则保留识别文本供编辑、保存重试，未编辑重试沿用请求 ID。
 文字记事默认仍为 `source="app"`。不引入 Pipecat、自带模型或后台持续录音。
@@ -89,12 +103,12 @@ SpeechRecognizer 引擎，语言为 `zh-CN`；设备需安装可用 RecognitionS
 ## 模块与契约
 
 - `:app`：Compose Navigation、提醒列表与确认、AlarmManager、通知、开机重放、
-  系统 SpeechRecognizer 语音记事、ViewModel 保留旋转期间状态、手动 DI。
+  系统 SpeechRecognizer 语音记事与语音提问、ViewModel 保留旋转期间状态、手动 DI。
 - `:data`：纯 JVM DTO、Retrofit、仓库、mock 和测试。接口核对自当前服务端
   `app/schemas.py` 与 `app/api/{auth,notes,ask,sync,reminders}.py`，未知响应字段由 Gson 忽略。
 - `:core-security`：Android Keystore MasterKey + EncryptedSharedPreferences。
   access/refresh 成对保存；稳定随机设备 UUID 在退出后保留。应用禁用备份。
-- 不为 S3 新建 `:sync`、`:feature-reminder` 等空壳模块。
+- 不为 S4 新建 `:sync`、`:feature-reminder` 等空壳模块。
 
 真实路由：`POST /v1/auth/login`、`POST /v1/auth/refresh`、
 `POST /v1/auth/logout`、`POST /v1/notes`、`GET /v1/notes`、`POST /v1/ask`、
@@ -143,13 +157,14 @@ JAR SHA-256：`cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8`
 ## 本次环境验证
 
 使用 `/home/box/.local/jdk/jdk-17.0.16+8` 与 `/home/box/.local/android-sdk`。
-`./gradlew :data:test :app:assembleDebug`：`BUILD SUCCESSFUL`。
-`./gradlew --no-daemon assembleDebug testDebugUnitTest`：`BUILD SUCCESSFUL`；
-`:data` 的 RepositoryTest 共 11 tests，0 failures / 0 errors / 0 skipped；
-`:app` 的 AsrStateTest 共 4 tests，0 failures / 0 errors / 0 skipped；
-`:core-security` 没有本地 unit test source（对应任务 `NO-SOURCE`）。
+`./gradlew --no-daemon :data:test :app:testDebugUnitTest :app:assembleDebug`：`BUILD SUCCESSFUL`。
+`:data` RepositoryTest：**11** tests，0 failures / 0 errors / 0 skipped；
+`:app` AsrStateTest：**6** + VoiceQuestionTest：**2**（共 8），0 failures / 0 errors / 0 skipped；
+`:core-security` unit tests：`NO-SOURCE`。
+`:app` JVM 测试覆盖 ASR 状态机（含 Permission 跨 pause/stop）与语音问题填入/自动提问决策，
+不依赖真实 SpeechRecognizer 引擎；`:data:test` 保留 mock 与 Retrofit 问答契约覆盖。
 `python3 scripts/check-invariants.py`：`0 error(s), 0 warning(s)`。
-已核对 debug manifest：S3 标签、`RECORD_AUDIO`、麦克风 feature optional、RecognitionService queries
+应用标签更新为 S4，保留 `RECORD_AUDIO`、麦克风 feature optional、RecognitionService queries
 与既有四项权限/两个 receiver。未运行模拟器/真机、Keystore instrumentation
 或连接实际服务的端到端测试。语音权限拒绝、无引擎、中文听写、停止/取消、
 页面离开/旋转/后台与退出登录的设备行为仍需验收。
