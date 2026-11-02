@@ -51,15 +51,33 @@ async def test_job_exception_not_logged_nor_persisted_raw(client, user, caplog):
     """threads8 P1（runner.py:71）：任务异常消息含笔记正文与伪造密钥 →
     caplog 与 jobs.last_error 均不含原文、只含类型名/错误码；job 照常按
     重试/失败语义收尾（不因脱敏改变控制流）。"""
+    import app.workers.dispatch as dispatch
+    from app.db import get_sessionmaker
+    from app.jobs.queue import enqueue
     from app.pipeline import runner
 
-    r = await client.post(
-        "/v1/notes",
-        json={"client_note_id": str(uuid.uuid4()), "text": "明天上午十点交周报"},
-        headers=auth_headers(user),
-    )
-    assert r.status_code == 202, r.text
-    note_id = r.json()["note_id"]
+    prev = dispatch.schedule_organize
+    dispatch.schedule_organize = lambda work_item: None  # type: ignore[assignment]
+    try:
+        r = await client.post(
+            "/v1/notes",
+            json={"client_note_id": str(uuid.uuid4()), "text": "明天上午十点交周报"},
+            headers=auth_headers(user),
+        )
+        assert r.status_code == 202, r.text
+        note_id = r.json()["note_id"]
+        # B 刀后 create 不再 enqueue extract；手动入队供 runner 脱敏断言
+        async with get_sessionmaker()() as session:
+            await enqueue(
+                session,
+                "extract",
+                {"note_id": note_id, "rev": 1},
+                note_id=note_id,
+                note_rev=1,
+            )
+            await session.commit()
+    finally:
+        dispatch.schedule_organize = prev
 
     marker = "pa_sk_JOBSECRET_111 SQL参数里的笔记正文"
 

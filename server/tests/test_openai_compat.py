@@ -262,12 +262,30 @@ async def test_extract_json_object_bad_json_marks_note_failed(client, user, monk
 
     monkeypatch.setattr("app.pipeline.extract.get_llm_client", fake_get_llm)
 
-    r = await client.post(
-        "/v1/notes",
-        json={"client_note_id": str(uuid.uuid4()), "text": "会失败的笔记"},
-        headers=auth_headers(user),
-    )
-    note_id = r.json()["note_id"]
+    import app.workers.dispatch as dispatch
+    from app.jobs.queue import enqueue
+
+    prev = dispatch.schedule_organize
+    dispatch.schedule_organize = lambda work_item: None  # type: ignore[assignment]
+    try:
+        r = await client.post(
+            "/v1/notes",
+            json={"client_note_id": str(uuid.uuid4()), "text": "会失败的笔记"},
+            headers=auth_headers(user),
+        )
+        note_id = r.json()["note_id"]
+        async with get_sessionmaker()() as session:
+            await enqueue(
+                session,
+                "extract",
+                {"note_id": note_id, "rev": 1},
+                note_id=note_id,
+                note_rev=1,
+            )
+            await session.commit()
+    finally:
+        dispatch.schedule_organize = prev
+
     await run_pending_jobs(retry_delay_seconds=0)
 
     async with get_sessionmaker()() as session:
@@ -296,12 +314,15 @@ async def test_extract_json_object_valid_json_organizes(client, user, monkeypatc
 
     monkeypatch.setattr("app.pipeline.extract.get_llm_client", fake_get_llm)
 
+    from app.workers.dispatch import drain_organize_tasks
+
     r = await client.post(
         "/v1/notes",
         json={"client_note_id": str(uuid.uuid4()), "text": "明天去买火车票"},
         headers=auth_headers(user),
     )
     note_id = r.json()["note_id"]
+    await drain_organize_tasks()
     await run_pending_jobs(retry_delay_seconds=0)
 
     async with get_sessionmaker()() as session:

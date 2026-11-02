@@ -13,7 +13,13 @@ async def _create(client, user, text="明天早上九点提醒我交周报") -> 
     return r.json()["note_id"]
 
 
-async def test_sync_returns_changes_since_cursor(client, user, run_jobs):
+async def test_sync_returns_changes_since_cursor(client, user, run_jobs, monkeypatch):
+    import app.workers.dispatch as dispatch
+    from app.sources import submit_note_uploaded
+    from app.workers.dispatch import drain_organize_tasks, schedule_organize
+
+    # 屏蔽 create 的即时调度，保证两次 sync 之间不会被 Ticket extract 改写
+    monkeypatch.setattr(dispatch, "schedule_organize", lambda work_item: None)
     first_id = await _create(client, user)
     r1 = await client.get("/v1/sync", headers=auth_headers(user))
     d1 = r1.json()
@@ -25,7 +31,14 @@ async def test_sync_returns_changes_since_cursor(client, user, run_jobs):
     r2 = await client.get(f"/v1/sync?since={d1['cursor']}", headers=auth_headers(user))
     assert r2.json()["notes"] == []
 
-    # 整理完成后：笔记变化 + 建议提醒出现
+    # 恢复调度：create 时已开单但被 stub 掉，这里对同一 note 再开单并排空
+    monkeypatch.setattr(dispatch, "schedule_organize", schedule_organize)
+    receipt = submit_note_uploaded(
+        user_id=user["user_id"], note_id=first_id, rev=1
+    )
+    assert receipt is not None and receipt.work_item is not None
+    schedule_organize(receipt.work_item)
+    await drain_organize_tasks()
     await run_jobs()
     r3 = await client.get(f"/v1/sync?since={d1['cursor']}", headers=auth_headers(user))
     d3 = r3.json()

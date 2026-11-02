@@ -7,8 +7,8 @@ Eval（policy.evaluate，规则无 LLM）→ accept 则签 Mandate 并开 WorkIt
 根本没有这类调用）。
 
 与现网执行路径的关系（第一刀双路径，见 docs/architecture-superagent.md）：
-- 现网：POST /v1/notes 仍 enqueue("extract")，由 jobs 队列驱动
-  app.pipeline.extract（契约不变，不双跑）；
+- 现网（S2 B 刀起）：POST/PATCH /v1/notes 开 Ticket 后同进程调度
+  OrganizeNoteWorker → pipeline.extract；jobs 主要剩 memory_sync；
 - 旁路：engine 开出的 WorkItem 由 workers/organize 的 facade 消化
   （单测验证领域骨架可驱动 pipeline；生产 notes 路径不因 Ticket
   再 enqueue 一次 extract）。

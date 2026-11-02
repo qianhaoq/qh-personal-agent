@@ -61,12 +61,19 @@ async def _fresh_env():
     SQLite 同样 drop：import 时删库文件只清一次，同一进程内残留的
     job/note 行会跨测试泄漏（并发测试尤其依赖空队列起步）。
     """
+    from app.domain.engine import reset_engine
+    from app.workers.dispatch import drain_organize_tasks
+
+    reset_engine()
+    await drain_organize_tasks()
     engine = get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
     await create_all()
     set_memory_store(InMemoryStore())
     yield
+    await drain_organize_tasks()
+    reset_engine()
     await dispose_engine()
 
 
@@ -118,14 +125,27 @@ def auth_headers(user: dict) -> dict:
 
 
 @pytest.fixture
+def drain_organize():
+    """等待 API 调度的 OrganizeNoteWorker tasks。"""
+    from app.workers.dispatch import drain_organize_tasks
+
+    return drain_organize_tasks
+
+
+@pytest.fixture
 def run_jobs():
+    """先 drain Ticket 驱动的整理，再排空 jobs（主要是 memory_sync）。"""
     from app.pipeline.runner import run_pending_jobs
+    from app.workers.dispatch import drain_organize_tasks
 
     async def _run():
-        # 失败重试会推迟 run_after，这里跑到没有可执行的为止
+        # 失败重试会推迟 run_after；Ticket 路径可能刚入队 memory_sync
         for _ in range(10):
+            await drain_organize_tasks()
             n = await run_pending_jobs()
             if n == 0:
-                break
+                await drain_organize_tasks()
+                if await run_pending_jobs() == 0:
+                    break
 
     return _run

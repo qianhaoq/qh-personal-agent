@@ -21,6 +21,7 @@ def _freeze_now(monkeypatch, fixed: datetime) -> None:
 
 
 async def _create_and_extract(client, user, text, run_jobs) -> Note:
+    """创建笔记并经 Ticket→Worker 整理（不再依赖 extract job）。"""
     r = await client.post(
         "/v1/notes",
         json={
@@ -36,6 +37,48 @@ async def _create_and_extract(client, user, text, run_jobs) -> Note:
 
     async with get_sessionmaker()() as session:
         return await session.get(Note, note_id)
+
+
+async def _post_note_without_schedule(client, user, text: str, **extra) -> str:
+    import app.workers.dispatch as dispatch
+    from app.jobs.queue import enqueue
+    from app.db import get_sessionmaker
+
+    prev = dispatch.schedule_organize
+    dispatch.schedule_organize = lambda work_item: None  # type: ignore[assignment]
+    try:
+        body = {"client_note_id": str(uuid.uuid4()), "text": text, **extra}
+        r = await client.post(
+            "/v1/notes",
+            json=body,
+            headers=auth_headers(user),
+        )
+        assert r.status_code == 202, r.text
+        return r.json()["note_id"]
+    finally:
+        dispatch.schedule_organize = prev
+
+
+async def _enqueue_extract(note_id: str, rev: int = 1) -> Job:
+    from app.db import get_sessionmaker
+    from app.jobs.queue import enqueue
+
+    async with get_sessionmaker()() as session:
+        await enqueue(
+            session,
+            "extract",
+            {"note_id": note_id, "rev": rev},
+            note_id=note_id,
+            note_rev=rev,
+        )
+        await session.commit()
+        return (
+            await session.execute(
+                select(Job).where(
+                    Job.kind == "extract", Job.note_id == note_id, Job.note_rev == rev
+                )
+            )
+        ).scalar_one()
 
 
 async def _extract_job(note_id: str) -> Job:
@@ -133,16 +176,10 @@ async def test_first_llm_failure_leaves_no_side_effects(client, user, monkeypatc
     from app.pipeline.runner import run_pending_jobs
 
     text = "嗯，那个，明天上午十点交周报"
-    r = await client.post(
-        "/v1/notes",
-        json={
-            "client_note_id": str(uuid.uuid4()),
-            "text": text,
-            "recorded_at": "2026-10-16T08:00:00+00:00",
-        },
-        headers={"authorization": f"Bearer {user['access_token']}"},
+    note_id = await _post_note_without_schedule(
+        client, user, text, recorded_at="2026-10-16T08:00:00+00:00"
     )
-    note_id = r.json()["note_id"]
+    await _enqueue_extract(note_id)
 
     class BoomLLM:
         async def chat(self, messages, response_format=None):
@@ -198,20 +235,24 @@ async def test_extract_skips_when_rev_moved_marks_done(client, user, monkeypatch
     from app.db import get_sessionmaker
     from app.pipeline.runner import run_pending_jobs
 
-    r = await client.post(
-        "/v1/notes",
-        json={"client_note_id": str(uuid.uuid4()), "text": "第一版内容"},
-        headers=auth_headers(user),
-    )
-    note_id = r.json()["note_id"]  # rev=1，job 记录 note_rev=1
+    # 手动入队 rev=1 extract；PATCH 不再入队 extract，再手动入队 rev=2
+    note_id = await _post_note_without_schedule(client, user, "第一版内容")
+    await _enqueue_extract(note_id, rev=1)
 
-    # 抽取跑之前先 PATCH（rev 1→2，重新入队 rev=2 的 job）
-    patch = await client.patch(
-        f"/v1/notes/{note_id}",
-        json={"text": "明天上午十点交周报", "rev": 1},
-        headers=auth_headers(user),
-    )
-    assert patch.status_code == 200
+    # 抽取跑之前先 PATCH（rev 1→2）；再手动入队新 rev 的 extract job
+    import app.workers.dispatch as dispatch
+    prev = dispatch.schedule_organize
+    dispatch.schedule_organize = lambda work_item: None  # type: ignore[assignment]
+    try:
+        patch = await client.patch(
+            f"/v1/notes/{note_id}",
+            json={"text": "明天上午十点交周报", "rev": 1},
+            headers=auth_headers(user),
+        )
+        assert patch.status_code == 200
+        await _enqueue_extract(note_id, rev=2)
+    finally:
+        dispatch.schedule_organize = prev
 
     llm_calls = {"n": 0}
 
@@ -255,12 +296,8 @@ async def test_extract_attempts_exhausted_marks_note_failed_by_rev(client, user,
     from app.db import get_sessionmaker
     from app.pipeline.runner import run_pending_jobs
 
-    r = await client.post(
-        "/v1/notes",
-        json={"client_note_id": str(uuid.uuid4()), "text": "会失败的笔记"},
-        headers=auth_headers(user),
-    )
-    note_id = r.json()["note_id"]
+    note_id = await _post_note_without_schedule(client, user, "会失败的笔记")
+    await _enqueue_extract(note_id)
 
     class BoomLLM:
         async def chat(self, messages, response_format=None):
@@ -293,12 +330,8 @@ async def test_extract_finalize_skips_note_patched_after_enqueue(client, user, m
     from app.pipeline.runner import run_pending_jobs
 
     headers = auth_headers(user)
-    r = await client.post(
-        "/v1/notes",
-        json={"client_note_id": str(uuid.uuid4()), "text": "会失败且会被中途改掉的笔记"},
-        headers=headers,
-    )
-    note_id = r.json()["note_id"]
+    note_id = await _post_note_without_schedule(client, user, "会失败且会被中途改掉的笔记")
+    await _enqueue_extract(note_id, rev=1)
 
     class BoomLLM:
         async def chat(self, messages, response_format=None):
@@ -315,16 +348,23 @@ async def test_extract_finalize_skips_note_patched_after_enqueue(client, user, m
     async def finalize_with_mid_race_patch(maker, claimed, error, retry_delay_seconds, worker_id):
         finalize_calls["n"] += 1
         if finalize_calls["n"] == 3:
-            # 第 3 次（最后一次）失败收尾前，用户 PATCH：rev+1 并入队新任务，
-            # LLM 恢复（模拟“旧任务失败与用户修改并发，新任务随后成功”）
+            # 第 3 次（最后一次）失败收尾前，用户 PATCH：rev+1；再手动入队
+            # 新 rev extract（API 已不 enqueue extract），并恢复 LLM
             monkeypatch.undo()
-            rev = (await client.get(f"/v1/notes/{note_id}", headers=headers)).json()["rev"]
-            patched = await client.patch(
-                f"/v1/notes/{note_id}",
-                json={"text": "用户改过的最新内容", "rev": rev},
-                headers=headers,
-            )
-            assert patched.status_code == 200, patched.text
+            import app.workers.dispatch as dispatch
+            prev = dispatch.schedule_organize
+            dispatch.schedule_organize = lambda work_item: None  # type: ignore[assignment]
+            try:
+                rev = (await client.get(f"/v1/notes/{note_id}", headers=headers)).json()["rev"]
+                patched = await client.patch(
+                    f"/v1/notes/{note_id}",
+                    json={"text": "用户改过的最新内容", "rev": rev},
+                    headers=headers,
+                )
+                assert patched.status_code == 200, patched.text
+                await _enqueue_extract(note_id, rev=rev + 1)
+            finally:
+                dispatch.schedule_organize = prev
         await real_finalize(maker, claimed, error, retry_delay_seconds, worker_id)
 
     monkeypatch.setattr(runner, "_finalize", finalize_with_mid_race_patch)
@@ -554,13 +594,8 @@ async def test_enqueue_uses_configured_max_attempts(client, user, monkeypatch):
     from app.config import get_settings
 
     monkeypatch.setattr(get_settings(), "job_max_attempts", 5)
-    r = await client.post(
-        "/v1/notes",
-        json={"client_note_id": str(uuid.uuid4()), "text": "重试次数配置"},
-        headers={"authorization": f"Bearer {user['access_token']}"},
-    )
-    note_id = r.json()["note_id"]
-    job = await _extract_job(note_id)
+    note_id = await _post_note_without_schedule(client, user, "重试次数配置")
+    job = await _enqueue_extract(note_id)
     assert job.max_attempts == 5
 
 
@@ -660,11 +695,7 @@ async def test_llm_non_list_collection_fields_discarded_not_failed(client, user,
         reminders = (
             await session.execute(select(Reminder).where(Reminder.note_id == note_id))
         ).scalars().all()
-        job = (
-            await session.execute(select(Job).where(Job.kind == "extract", Job.note_id == note_id))
-        ).scalar_one()
     assert note.status == "organized", "畸形集合字段只影响对应字段，不该把笔记拖进重试/失败"
     assert note.title == "标题照常"
     assert note.tags == [] and note.todos == [], "非 list 集合字段整字段丢弃"
     assert reminders == []
-    assert job.status == "done"

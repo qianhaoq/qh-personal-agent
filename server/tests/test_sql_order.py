@@ -53,8 +53,8 @@ def _first_seq_write(trace: _SqlTrace) -> int:
 
 
 async def test_create_note_sql_order_job_insert_before_seq_update(client, user):
-    """INV-1.2（修 C2）：create 里 jobs INSERT 先 flush 落定，之后才
-    allocate_seq（sequences 是提交前最后一把锁），change_seq 其后写回。"""
+    """INV-1.2：create 在 S2 B 刀后不再 INSERT extract job；锁序为
+    notes INSERT → allocate_seq → change_seq 写回（无 jobs 行）。"""
     headers = auth_headers(user)
     with _SqlTrace(("notes", "jobs", "sequences")) as trace:
         r = await client.post(
@@ -69,32 +69,29 @@ async def test_create_note_sql_order_job_insert_before_seq_update(client, user):
     job_insert = trace.indices("jobs", "INSERT")
     seq_write = _first_seq_write(trace)
     assert note_insert, "应先 INSERT notes"
-    assert job_insert, "应 INSERT jobs（extract 任务）"
-    assert note_insert[0] < job_insert[0] < seq_write, (
-        f"create 锁序违规：note INSERT @ {note_insert}, jobs INSERT @ {job_insert}, "
-        f"sequences 写 @ {seq_write}，trace={trace.trace}"
+    assert not job_insert, "S2 B 刀：create 不再 enqueue extract / jobs INSERT"
+    assert note_insert[0] < seq_write, (
+        f"create 锁序违规：note INSERT @ {note_insert}, sequences 写 @ {seq_write}，"
+        f"trace={trace.trace}"
     )
-    # change_seq 写回（对 notes 的 UPDATE）必须在 sequences 写之后
     note_updates = [i for i in trace.indices("notes", "UPDATE") if i > seq_write]
     assert note_updates, "change_seq 应在 allocate_seq 之后用第二条 UPDATE 写回"
 
-    # 入队的确实是 extract 任务且携带入队 rev
     from sqlalchemy import select
 
     from app.db import get_sessionmaker
     from app.models import Job
 
     async with get_sessionmaker()() as session:
-        job = (
+        extract_jobs = (
             await session.execute(select(Job).where(Job.kind == "extract", Job.note_id == note_id))
-        ).scalar_one()
-    assert job.note_rev == 1
+        ).scalars().all()
+    assert extract_jobs == []
 
 
 async def test_patch_sql_order_note_reminders_jobs_before_seq_update(client, user, run_jobs):
     """INV-1.2：PATCH 的锁序 = note 条件 UPDATE → reminders 条件 UPDATE →
-    jobs INSERT（extract + memory_sync，均新行）→ flush → allocate_seq →
-    change_seq 写回。"""
+    jobs INSERT（memory_sync）→ flush → allocate_seq → change_seq 写回。"""
     headers = auth_headers(user)
     created = await client.post(
         "/v1/notes",
@@ -118,12 +115,11 @@ async def test_patch_sql_order_note_reminders_jobs_before_seq_update(client, use
     seq_write = _first_seq_write(trace)
     assert note_update, "PATCH 应以 note 条件 UPDATE 开头（拿行锁/乐观锁）"
     assert reminder_update, "应作废建议提醒"
-    assert len(job_inserts) >= 2, "应入队 extract 与 memory_sync 两个新 job 行"
+    assert len(job_inserts) >= 1, "应入队 memory_sync（不再 enqueue extract）"
     order_ok = (
         note_update[0]
         < reminder_update[0]
         < job_inserts[0]
-        < job_inserts[-1]
         < seq_write
     )
     assert order_ok, (
@@ -152,7 +148,11 @@ async def test_extract_apply_sql_order_jobs_before_seq(client, user):
     )
     assert created.status_code == 202, created.text
 
+    from app.workers.dispatch import drain_organize_tasks
+
     with _SqlTrace(("jobs", "sequences")) as trace:
+        # Ticket Worker 写回时入队 memory_sync；再排空 jobs
+        await drain_organize_tasks()
         await run_pending_jobs()
     job_inserts = trace.indices("jobs", "INSERT")
     seq_writes = trace.indices("sequences")
@@ -194,14 +194,17 @@ def test_business_paths_never_update_existing_job_rows():
     assert forbidden.search(queue_src), "对照组失败：queue.py 应包含 update(Job)"
 
 
-async def test_business_paths_job_rows_only_inserted_via_enqueue(client, user):
+async def test_business_paths_job_rows_only_inserted_via_enqueue(client, user, monkeypatch):
     """行为层复核（双后端）：连续两次 PATCH 同一笔记（第二次 PATCH 时，
     第一次入队的 memory_sync 仍 pending）不产生 500/唯一约束冲突——
     pending 去重靠 ON CONFLICT DO NOTHING，而不是 UPDATE 既存行。"""
+    import app.workers.dispatch as dispatch
     from sqlalchemy import func, select
 
     from app.db import get_sessionmaker
     from app.models import Job
+
+    monkeypatch.setattr(dispatch, "schedule_organize", lambda work_item: None)
 
     headers = auth_headers(user)
     created = await client.post(

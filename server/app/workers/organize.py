@@ -1,10 +1,9 @@
 """organize_note Worker：Ticket → 现有 pipeline 的 facade。
 
-第一刀不改现网执行路径：生产上 extract 仍由 jobs 队列驱动
-（POST /v1/notes 的 enqueue("extract")），notes 路径不因 Ticket 再
-enqueue 一次（不双跑）。本 facade 供 Engine 路径的 Assignment 调用，
-单测用它验证「领域骨架能驱动 pipeline」；pipeline 稳定收口进 Engine
-后再删 facade（mapping §6.3 过渡策略）。
+S2 B 刀起：生产 notes 路径由 Ticket 调度本 facade（API commit 后
+schedule_organize → OrganizeNoteWorker.run → extract_note）。notes API
+不再 enqueue("extract")；jobs 表主要承载 memory_sync（extract 队列
+基础设施保留，供兼容/测试手动入队）。不删 pipeline。
 """
 from app.domain.engine import Engine
 from app.domain.model import WorkItem

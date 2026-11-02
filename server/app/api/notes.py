@@ -9,8 +9,13 @@ flush 落定之后最后 allocate_seq，再用第二条 UPDATE 写 change_seq。
 记忆（后端内部还会调 LLM/embedding）一律不在这里写删（INV-4）：
 PATCH/DELETE 只在写事务内 enqueue memory_sync，由该 job 按 note 当前态
 幂等收敛（见 app/pipeline/memory_sync.py）。
+
+整理（extract）改由领域 Ticket → OrganizeNoteWorker 驱动（S2 B 刀）：
+create/PATCH 成功 commit 后 submit_note_uploaded 开单，再同进程
+schedule_organize；本文件不再 enqueue("extract")。
 """
 import json
+import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Path, Query
@@ -28,8 +33,17 @@ from app.models import Note, Reminder
 from app.schemas import NoNulStr, NoteCreate, NotePatch, note_to_dict
 from app.sources import submit_note_uploaded
 from app.timeutil import to_utc, utcnow
+from app.workers import dispatch as organize_dispatch
 
 router = APIRouter(prefix="/v1/notes", tags=["notes"])
+logger = logging.getLogger(__name__)
+
+
+def _schedule_organize_from_receipt(receipt) -> None:
+    """开单成功且非 duplicate 时同进程调度 Worker；失败不影响 HTTP 契约。"""
+    if receipt is None or receipt.duplicate or receipt.work_item is None:
+        return
+    organize_dispatch.schedule_organize(receipt.work_item)
 
 
 async def _get_owned_note(session: AsyncSession, user_id: str, note_id: str) -> Note:
@@ -76,17 +90,10 @@ async def create_note(
     )
     session.add(note)
     try:
-        # 业务行（note 新行 → jobs 新行）的 INSERT 全部先 flush 落定，之后
-        # allocate_seq 才是事务里最后一把锁（全局规则，见 app/common.py；
-        # job INSERT 在 seq 分配之前，修 C2）。与 PATCH/extract 等路径同序
+        # 业务行（note 新行）先 flush 落定，之后 allocate_seq 才是事务里
+        # 最后一把锁（全局规则，见 app/common.py）。整理不再入队 extract：
+        # commit 后 Ticket → OrganizeNoteWorker（S2 B 刀）
         await session.flush()
-        await enqueue(
-            session,
-            "extract",
-            {"note_id": note.id, "rev": 1},
-            note_id=note.id,
-            note_rev=1,
-        )
         note.change_seq = await allocate_seq(session)
         await session.commit()
     except IntegrityError:
@@ -103,11 +110,11 @@ async def create_note(
         if existing is None:
             raise
         return {"note_id": existing.id, "status": existing.status, "rev": existing.rev}
-    # Super-agent 旁路（docs/architecture-superagent.md）：提交成功后把
-    # NoteUploaded 交给领域引擎。纯内存同步、不跑 LLM、不上锁；上面的
-    # enqueue("extract") 保持不动（现网兼容，不双跑）——Ticket 由 Engine
-    # 路径的 Worker facade 消化。幂等重放分支（早退/IntegrityError）不触发
-    submit_note_uploaded(user_id=user_id, note_id=note.id, rev=1)
+    # Super-agent（docs/architecture-superagent.md）：commit 后开单，再同
+    # 进程调度 OrganizeNoteWorker（不在事务内跑 LLM）。幂等重放分支
+    # （早退/IntegrityError）不触发。
+    receipt = submit_note_uploaded(user_id=user_id, note_id=note.id, rev=1)
+    _schedule_organize_from_receipt(receipt)
     return {"note_id": note.id, "status": note.status, "rev": note.rev}
 
 
@@ -200,9 +207,9 @@ async def patch_note(
             return {"note": note_to_dict(note), "rev": note.rev}
 
     # 加锁顺序（全局规则见 app.common.allocate_seq）：先条件更新业务行
-    # note（本条 UPDATE 拿行锁），再作废 reminders，再 INSERT job 行
-    # （extract + memory_sync，均新行），全部 flush 后最后 allocate_seq，
-    # 用第二条 UPDATE 写 change_seq
+    # note（本条 UPDATE 拿行锁），再作废 reminders，再 INSERT memory_sync
+    # （新行；整理改走 Ticket，不再 enqueue extract），全部 flush 后最后
+    # allocate_seq，用第二条 UPDATE 写 change_seq
     result = await session.execute(
         update(Note)
         .where(
@@ -219,12 +226,12 @@ async def patch_note(
             # 的派生字段全部失效——title/tags/todos 同事务清空（不能只置
             # status：PATCH 响应与 /v1/sync 会把旧抽取产物当当前元数据返回，
             # 新抽取重试耗尽时旧产物与 failed 永久并存），新值由重新入队的
-            # extract 写回
+            # OrganizeNoteWorker/extract_note 写回
             title=None,
             tags=None,
             todos=None,
-            # 旧 rev 的记忆已作废：由本次入队的 memory_sync 清掉（extract
-            # 成功后再写新 rev 的记忆）
+            # 旧 rev 的记忆已作废：由本次入队的 memory_sync 清掉（Ticket
+            # 驱动的整理成功后再写新 rev 的记忆）
             memory_status="pending",
             updated_at=utcnow(),
         )
@@ -235,18 +242,10 @@ async def patch_note(
         # 复查区分 404（被并发删除/不存在）与 409（rev 已被并发修改）
         await _raise_conflict_or_not_found(session, user_id, note_id)
 
-    # 旧的整理产物作废，重新入队 extract（带新 rev，执行侧据此丢弃过期
-    # 任务）；同时入队 memory_sync 清旧记忆——即使 extract 永久失败，
-    # 旧 rev 的记忆也会被清掉（修 C4），且这里不再提交后直删记忆
-    # （记忆后端会调外部服务，也不能放进事务；入口唯一化见 INV-4）
+    # 旧的整理产物作废；入队 memory_sync 清旧记忆——即使后续整理永久失败，
+    # 旧 rev 的记忆也会被清掉（修 C4）。整理改走 commit 后的 Ticket
+    # （submit_note_uploaded + schedule_organize），不再 enqueue extract。
     reminder_ids = await _invalidate_outputs(session, note.id)
-    await enqueue(
-        session,
-        "extract",
-        {"note_id": note_id, "rev": body.rev + 1},
-        note_id=note.id,
-        note_rev=body.rev + 1,
-    )
     await enqueue(
         session, "memory_sync", {"note_id": note_id}, note_id=note.id, dedupe_pending=True
     )
@@ -254,6 +253,8 @@ async def patch_note(
     await session.commit()
     # expire_on_commit=False：显式刷新让 note_to_dict 读到条件更新后的行
     await session.refresh(note)
+    receipt = submit_note_uploaded(user_id=user_id, note_id=note.id, rev=note.rev)
+    _schedule_organize_from_receipt(receipt)
     return {"note": note_to_dict(note), "rev": note.rev}
 
 

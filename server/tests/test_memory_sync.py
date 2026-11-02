@@ -141,6 +141,9 @@ async def test_memory_sync_fails_not_marks_synced_when_enumeration_incomplete(
     await capped.add(user["user_id"], "旧 rev 的存量记忆", note_id=note_id, source_rev=0)
     set_memory_store(capped)
 
+    from app.workers.dispatch import drain_organize_tasks
+
+    await drain_organize_tasks()
     for _ in range(20):
         if await run_pending_jobs(retry_delay_seconds=0) == 0:
             break
@@ -293,10 +296,32 @@ async def test_memory_sync_on_unorganized_note_clears_stale_memory_without_add(
 
     headers = auth_headers(user)
     rev = (await client.get(f"/v1/notes/{note_id}", headers=headers)).json()["rev"]
-    patched = await client.patch(
-        f"/v1/notes/{note_id}", json={"text": "新内容：我喜欢游泳", "rev": rev}, headers=headers
-    )
-    assert patched.status_code == 200
+    # 屏蔽 Ticket 调度，手动入队 extract 以测 jobs 耗尽标 failed
+    import app.workers.dispatch as dispatch
+    from app.db import get_sessionmaker
+    from app.jobs.queue import enqueue
+
+    prev = dispatch.schedule_organize
+    dispatch.schedule_organize = lambda work_item: None  # type: ignore[assignment]
+    try:
+        patched = await client.patch(
+            f"/v1/notes/{note_id}",
+            json={"text": "新内容：我喜欢游泳", "rev": rev},
+            headers=headers,
+        )
+        assert patched.status_code == 200
+        new_rev = patched.json()["rev"]
+        async with get_sessionmaker()() as session:
+            await enqueue(
+                session,
+                "extract",
+                {"note_id": note_id, "rev": new_rev},
+                note_id=note_id,
+                note_rev=new_rev,
+            )
+            await session.commit()
+    finally:
+        dispatch.schedule_organize = prev
     # retry_delay=0 让 extract 立即重试至耗尽；memory_sync 在中途把旧记忆清掉
     from app.pipeline.runner import run_pending_jobs
 
@@ -404,11 +429,22 @@ async def test_memory_sync_requeues_and_deletes_only_own_ids_on_rev_change(
     foreign = await store.add(
         user["user_id"], "并发新任务刚写入的记忆", note_id=note_id, source_rev=99
     )
-    # 窗口内：用户 PATCH（rev 2→3，enqueue extract(rev=3) + memory_sync pending）
-    patched = await client.patch(
-        f"/v1/notes/{note_id}", json={"text": "版本三：我喜欢游泳", "rev": 2}, headers=headers
-    )
-    assert patched.status_code == 200, patched.text
+    # 窗口内：用户 PATCH（rev 2→3 + memory_sync pending）。
+    # 屏蔽 Ticket 调度，避免 organize 在竞态窗口内抢先 bump rev。
+    import app.workers.dispatch as dispatch
+
+    prev_sched = dispatch.schedule_organize
+    dispatch.schedule_organize = lambda work_item: None  # type: ignore[assignment]
+    try:
+        patched = await client.patch(
+            f"/v1/notes/{note_id}",
+            json={"text": "版本三：我喜欢游泳", "rev": 2},
+            headers=headers,
+        )
+        assert patched.status_code == 200, patched.text
+        new_rev = patched.json()["rev"]
+    finally:
+        dispatch.schedule_organize = prev_sched
 
     store.release.set()
     await asyncio.wait_for(worker, timeout=10)
@@ -432,7 +468,16 @@ async def test_memory_sync_requeues_and_deletes_only_own_ids_on_rev_change(
     note = await _note(note_id)
     assert note.rev == 3
 
-    # 排空：按新状态收敛（extract rev=3 → organized rev=4 → 记忆=新文本）
+    # 排空：手动入队 extract（B 刀后 PATCH 不再 enqueue extract），再收敛
+    async with get_sessionmaker()() as session:
+        await enqueue(
+            session,
+            "extract",
+            {"note_id": note_id, "rev": new_rev},
+            note_id=note_id,
+            note_rev=new_rev,
+        )
+        await session.commit()
     await run_jobs()
     note = await _note(note_id)
     assert note.status == "organized"
@@ -588,7 +633,7 @@ async def test_memory_sync_worker_killed_mid_run_reclaimed_converges(client, use
     )
     assert patched.status_code == 200
 
-    # 先让 extract（PATCH 入队、排在 memory_sync 前面）正常完成
+    # Ticket 重整理完成后，再认领 PATCH 入队的 memory_sync
     from datetime import timedelta
 
     from app.config import get_settings
@@ -596,9 +641,10 @@ async def test_memory_sync_worker_killed_mid_run_reclaimed_converges(client, use
     from app.jobs.queue import claim_next
     from app.pipeline.runner import run_pending_jobs
     from app.timeutil import utcnow
+    from app.workers.dispatch import drain_organize_tasks
 
     maker = get_sessionmaker()
-    assert await run_pending_jobs(limit=1) == 1
+    await drain_organize_tasks()
 
     # 模拟 worker 认领 memory_sync 后立刻崩溃（job 留在 running）
     from sqlalchemy import update
@@ -710,6 +756,11 @@ async def test_memory_sync_attempts_exhausted_marks_failed_only_without_newer_jo
         f"/v1/notes/{note_id}", json={"text": "彻底同步失败", "rev": cur}, headers=headers
     )
     assert patched2.status_code == 200
+    # Ticket extract 先把 note 整理成 organized；否则 memory_sync 走未整理
+    # 清空路径会直接 synced，测不到 add 耗尽落 failed。
+    from app.workers.dispatch import drain_organize_tasks
+
+    await drain_organize_tasks()
     monkeypatch.undo()
     for _ in range(10):
         if await run_pending_jobs(retry_delay_seconds=0) == 0:

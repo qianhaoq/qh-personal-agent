@@ -19,19 +19,75 @@ from tests.conftest import auth_headers, requires_postgres
 
 
 async def _create_note_with_job(client, user) -> tuple[str, str]:
-    """创建一条会入队 extract 任务的笔记，返回 (note_id, job_id)。"""
-    r = await client.post(
-        "/v1/notes",
-        json={"client_note_id": str(uuid.uuid4()), "text": "明天上午九点提醒我交周报"},
-        headers=auth_headers(user),
-    )
-    assert r.status_code == 202, r.text
-    note_id = r.json()["note_id"]
+    """创建笔记并**手动**入队 extract（API 已不再 enqueue extract），返回 (note_id, job_id)。
+
+    屏蔽 schedule_organize，避免 Ticket Worker 与 jobs 测的 extract 双跑。
+    """
+    import app.workers.dispatch as dispatch
+
+    prev = dispatch.schedule_organize
+    dispatch.schedule_organize = lambda work_item: None  # type: ignore[assignment]
+    try:
+        r = await client.post(
+            "/v1/notes",
+            json={"client_note_id": str(uuid.uuid4()), "text": "明天上午九点提醒我交周报"},
+            headers=auth_headers(user),
+        )
+        assert r.status_code == 202, r.text
+        note_id = r.json()["note_id"]
+        async with get_sessionmaker()() as session:
+            await enqueue(
+                session,
+                "extract",
+                {"note_id": note_id, "rev": 1},
+                note_id=note_id,
+                note_rev=1,
+            )
+            await session.commit()
+            job = (
+                await session.execute(
+                    select(Job).where(Job.kind == "extract", Job.note_id == note_id)
+                )
+            ).scalars().one()
+        return note_id, job.id
+    finally:
+        dispatch.schedule_organize = prev
+
+
+
+
+async def _post_note_without_schedule(client, user, text: str) -> str:
+    """POST /v1/notes 但屏蔽 Ticket Worker，返回 note_id。"""
+    import app.workers.dispatch as dispatch
+
+    prev = dispatch.schedule_organize
+    dispatch.schedule_organize = lambda work_item: None  # type: ignore[assignment]
+    try:
+        r = await client.post(
+            "/v1/notes",
+            json={"client_note_id": str(uuid.uuid4()), "text": text},
+            headers=auth_headers(user),
+        )
+        assert r.status_code == 202, r.text
+        return r.json()["note_id"]
+    finally:
+        dispatch.schedule_organize = prev
+
+
+async def _enqueue_extract(note_id: str, rev: int = 1) -> str:
     async with get_sessionmaker()() as session:
+        await enqueue(
+            session,
+            "extract",
+            {"note_id": note_id, "rev": rev},
+            note_id=note_id,
+            note_rev=rev,
+        )
+        await session.commit()
         job = (
             await session.execute(select(Job).where(Job.kind == "extract", Job.note_id == note_id))
         ).scalars().one()
-    return note_id, job.id
+    return job.id
 
 
 async def _claim_once(job_id: str, worker_id: str = "wkr_once") -> None:
@@ -142,28 +198,13 @@ async def test_claim_commits_dead_job_transition_before_next_candidate(
 
     headers = auth_headers(user)
     # 笔记 A 先建（其 extract job 是判死候选），笔记 B 的 job 是活候选
-    note_a = (
-        await client.post(
-            "/v1/notes",
-            json={"client_note_id": str(uuid.uuid4()), "text": "判死转移的笔记"},
-            headers=headers,
-        )
-    ).json()["note_id"]
-    note_b = (
-        await client.post(
-            "/v1/notes",
-            json={"client_note_id": str(uuid.uuid4()), "text": "下一个候选的笔记"},
-            headers=headers,
-        )
-    ).json()["note_id"]
+    note_a, job_a_id = await _create_note_with_job(client, user)
+    note_b, job_b_id = await _create_note_with_job(client, user)
 
     maker = get_sessionmaker()
     async with maker() as session:
-        jobs = (
-            await session.execute(select(Job).where(Job.kind == "extract"))
-        ).scalars().all()
-    jobs = {j.note_id: j for j in jobs}
-    job_a, job_b = jobs[note_a], jobs[note_b]
+        job_a = await session.get(Job, job_a_id)
+        job_b = await session.get(Job, job_b_id)
 
     # job_a 判死（running + 锁过期 + 次数用尽）；run_after 显式错开保证
     # 扫描顺序确定（a 先于 b，不依赖 created_at 的秒级精度）
@@ -587,13 +628,8 @@ async def test_extract_and_memory_sync_independent_attempts(client, user, run_jo
         return BoomLLM()
 
     monkeypatch.setattr("app.pipeline.extract.get_llm_client", fake_get_llm)
-    note1 = (
-        await client.post(
-            "/v1/notes",
-            json={"client_note_id": str(uuid.uuid4()), "text": "抽取会失败"},
-            headers=auth_headers(user),
-        )
-    ).json()["note_id"]
+    note1 = await _post_note_without_schedule(client, user, "抽取会失败")
+    await _enqueue_extract(note1)
     for _ in range(10):
         if await run_pending_jobs(retry_delay_seconds=0) == 0:
             break
@@ -609,13 +645,8 @@ async def test_extract_and_memory_sync_independent_attempts(client, user, run_jo
     monkeypatch.undo()
     # 方向二：memory_sync 耗尽（memory_status failed），note 保持 organized
     set_memory_store(BoomStore())
-    note2 = (
-        await client.post(
-            "/v1/notes",
-            json={"client_note_id": str(uuid.uuid4()), "text": "同步会失败"},
-            headers=auth_headers(user),
-        )
-    ).json()["note_id"]
+    note2 = await _post_note_without_schedule(client, user, "同步会失败")
+    await _enqueue_extract(note2)
     for _ in range(10):
         if await run_pending_jobs(retry_delay_seconds=0) == 0:
             break
@@ -659,13 +690,8 @@ async def test_extract_finalize_marks_failed_only_at_enqueued_rev(client, user, 
 
     monkeypatch.setattr("app.pipeline.extract.get_llm_client", fake_get_llm)
     headers = auth_headers(user)
-    note_id = (
-        await client.post(
-            "/v1/notes",
-            json={"client_note_id": str(uuid.uuid4()), "text": "收尾窗口里被删除"},
-            headers=headers,
-        )
-    ).json()["note_id"]
+    note_id = await _post_note_without_schedule(client, user, "收尾窗口里被删除")
+    await _enqueue_extract(note_id)
 
     finalize_calls = {"n": 0}
     real_finalize = runner._finalize
@@ -712,6 +738,8 @@ async def test_memory_sync_finalize_failure_marks_memory_status_not_note_status(
             raise RuntimeError("memory backend down")
 
     set_memory_store(BoomStore())
+    from app.workers.dispatch import drain_organize_tasks
+
     note_id = (
         await client.post(
             "/v1/notes",
@@ -719,6 +747,8 @@ async def test_memory_sync_finalize_failure_marks_memory_status_not_note_status(
             headers=auth_headers(user),
         )
     ).json()["note_id"]
+    # Ticket Worker 整理后再排空 memory_sync（BoomStore 使其失败）
+    await drain_organize_tasks()
     for _ in range(10):
         if await run_pending_jobs(retry_delay_seconds=0) == 0:
             break

@@ -1,9 +1,9 @@
 """Super-agent 第一刀：领域引擎（Trigger → Ticket → Worker facade）。
 
-覆盖 docs/architecture-superagent.md 的领域旁路：
+覆盖 docs/architecture-superagent.md 的领域路径：
 - engine.receive 开单（observe 默认）与 dedupe_key 幂等；
 - PersonalPolicy 的准入（off 忽略；observe 只授被动动作面）；
-- POST /v1/notes 钩子：Ticket 建立、契约不变、extract 不双跑、
+- POST /v1/notes 钩子：Ticket 建立、契约不变、不再 enqueue extract、
   旁路故障不影响 202；
 - organize worker facade 驱动现有 pipeline（不删 pipeline）。
 全部内存/MockLLM，不依赖外部密钥。
@@ -30,6 +30,13 @@ async def _clean_engine():
     yield
     reset_engine()
 
+
+
+def _silence_schedule(monkeypatch):
+    """禁止 API 自动调度，便于单测显式调用 OrganizeNoteWorker。"""
+    import app.workers.dispatch as dispatch
+
+    monkeypatch.setattr(dispatch, "schedule_organize", lambda work_item: None)
 
 def _note_body(text: str = "明天下午三点提醒我给张总回电话") -> dict:
     return {"client_note_id": str(uuid.uuid4()), "text": text, "source": "app"}
@@ -114,7 +121,8 @@ async def test_voice_ingress_placeholder_records_source_kind():
     assert trigger.kind == "note_uploaded"
 
 
-async def test_notes_api_hook_opens_ticket_without_double_extract(client, user):
+async def test_notes_api_hook_opens_ticket_without_double_extract(client, user, monkeypatch):
+    _silence_schedule(monkeypatch)
     body = _note_body()
     resp = await client.post("/v1/notes", json=body, headers=auth_headers(user))
     assert resp.status_code == 202, resp.text
@@ -133,12 +141,12 @@ async def test_notes_api_hook_opens_ticket_without_double_extract(client, user):
     assert resp2.json()["note_id"] == note_id
     assert len(engine.work_items_for_note(note_id)) == 1
 
-    # 现网执行路径不双跑：engine 旁路不额外 enqueue extract
+    # S2 B 刀：notes 路径不再 enqueue extract（Ticket 驱动）
     async with get_sessionmaker()() as session:
         extract_jobs = (
             await session.execute(select(Job).where(Job.kind == "extract"))
         ).scalars().all()
-    assert len(extract_jobs) == 1
+    assert len(extract_jobs) == 0
 
 
 async def test_engine_hook_failure_never_breaks_notes_api(client, user, monkeypatch):
@@ -150,7 +158,8 @@ async def test_engine_hook_failure_never_breaks_notes_api(client, user, monkeypa
     assert resp.status_code == 202, resp.text
 
 
-async def test_organize_worker_facade_runs_pipeline_and_completes_ticket(client, user):
+async def test_organize_worker_facade_runs_pipeline_and_completes_ticket(client, user, monkeypatch):
+    _silence_schedule(monkeypatch)
     resp = await client.post("/v1/notes", json=_note_body(), headers=auth_headers(user))
     note_id = resp.json()["note_id"]
 
@@ -172,6 +181,7 @@ async def test_organize_worker_facade_runs_pipeline_and_completes_ticket(client,
 
 
 async def test_organize_worker_facade_records_failure(client, user, monkeypatch):
+    _silence_schedule(monkeypatch)
     resp = await client.post("/v1/notes", json=_note_body(), headers=auth_headers(user))
     note_id = resp.json()["note_id"]
 
@@ -211,6 +221,7 @@ async def test_claim_only_pending_work_item_succeeds():
 
 
 async def test_concurrent_organize_worker_second_claim_rejected(client, user, monkeypatch):
+    _silence_schedule(monkeypatch)
     resp = await client.post("/v1/notes", json=_note_body(), headers=auth_headers(user))
     note_id = resp.json()["note_id"]
 
@@ -265,3 +276,112 @@ async def test_late_complete_ignored_when_not_holder():
     assert engine.complete(item.id, result={"note_id": "nte_1"}, worker_id="wrk_a") is True
     assert item.status == "done"
     assert item.result == {"note_id": "nte_1"}
+
+
+async def test_notes_create_no_extract_job_ticket_drives_organize(client, user, run_jobs):
+    """B 刀：create 不入队 extract；Ticket + Worker 整理到 organized。"""
+    from app.db import get_sessionmaker
+    from app.models import Note
+
+    body = _note_body("明天下午三点提醒我给张总回电话")
+    resp = await client.post("/v1/notes", json=body, headers=auth_headers(user))
+    assert resp.status_code == 202, resp.text
+    note_id = resp.json()["note_id"]
+
+    async with get_sessionmaker()() as session:
+        extract_jobs = (
+            await session.execute(select(Job).where(Job.kind == "extract", Job.note_id == note_id))
+        ).scalars().all()
+    assert extract_jobs == []
+
+    engine = get_engine()
+    items = engine.work_items_for_note(note_id)
+    assert len(items) == 1
+    assert items[0].kind == "organize_note"
+
+    await run_jobs()
+    async with get_sessionmaker()() as session:
+        note = await session.get(Note, note_id)
+    item = get_engine().get_work_item(items[0].id)
+    assert note.status == "organized"
+    assert item is not None and item.status == "done"
+
+
+async def test_notes_patch_opens_new_ticket_and_reorganizes(client, user, run_jobs):
+    """B 刀：PATCH 正文开新 Ticket、无 extract job、仍有 memory_sync，并重整理。"""
+    from app.db import get_sessionmaker
+    from app.models import Note
+
+    headers = auth_headers(user)
+    created = await client.post(
+        "/v1/notes",
+        json=_note_body("明天上午十点交周报"),
+        headers=headers,
+    )
+    note_id = created.json()["note_id"]
+    await run_jobs()
+    engine = get_engine()
+    assert len(engine.work_items_for_note(note_id)) == 1
+
+    got = (await client.get(f"/v1/notes/{note_id}", headers=headers)).json()
+    patched = await client.patch(
+        f"/v1/notes/{note_id}",
+        json={"text": "改成纯闲聊，没有任何待办", "rev": got["rev"]},
+        headers=headers,
+    )
+    assert patched.status_code == 200, patched.text
+
+    items = engine.work_items_for_note(note_id)
+    assert len(items) == 2
+
+    async with get_sessionmaker()() as session:
+        extract_jobs = (
+            await session.execute(select(Job).where(Job.kind == "extract", Job.note_id == note_id))
+        ).scalars().all()
+        mem_jobs = (
+            await session.execute(
+                select(Job).where(Job.kind == "memory_sync", Job.note_id == note_id)
+            )
+        ).scalars().all()
+    assert extract_jobs == []
+    assert mem_jobs, "PATCH 仍应 enqueue memory_sync"
+
+    await run_jobs()
+    async with get_sessionmaker()() as session:
+        note = await session.get(Note, note_id)
+    assert note.status == "organized"
+    assert note.text == "改成纯闲聊，没有任何待办"
+
+
+async def test_memory_sync_still_enqueued_after_ticket_extract(client, user, run_jobs, monkeypatch):
+    """B 刀：Ticket 路径跑完后仍有 memory_sync（可用 stub 计数 extract 调用）。"""
+    from app.db import get_sessionmaker
+    from app.models import Note
+    from app.pipeline import extract as extract_mod
+
+    calls: list[str] = []
+    real = extract_mod.extract_note
+
+    async def stub(note_id, enqueued_rev=None, **kwargs):
+        calls.append(note_id)
+        return await real(note_id, enqueued_rev=enqueued_rev, **kwargs)
+
+    monkeypatch.setattr(extract_mod, "extract_note", stub)
+
+    resp = await client.post(
+        "/v1/notes", json=_note_body("记得明天买牛奶"), headers=auth_headers(user)
+    )
+    note_id = resp.json()["note_id"]
+    await run_jobs()
+
+    assert calls == [note_id]
+    async with get_sessionmaker()() as session:
+        note = await session.get(Note, note_id)
+        mem_jobs = (
+            await session.execute(
+                select(Job).where(Job.kind == "memory_sync", Job.note_id == note_id)
+            )
+        ).scalars().all()
+    assert note.status == "organized"
+    assert note.memory_status == "synced"
+    assert mem_jobs and any(j.status == "done" for j in mem_jobs)

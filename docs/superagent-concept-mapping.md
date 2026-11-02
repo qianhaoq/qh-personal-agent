@@ -206,7 +206,7 @@ qh-personal-agent/
 2. ✅ `server/app/domain/`：Trigger/Thread/Mandate/Decision/WorkItem 最小模型 + `Engine.receive`（内存实现，无新表/迁移）。  
 3. ✅ `sources/voice_http.py`：`POST /v1/notes` 写库成功后 `submit_note_uploaded` → `engine.receive(NoteUploaded)`（纯内存同步、异常不上抛）。  
 4. ✅ Eval 快路径：规则「笔记上传 → accept organize_note Ticket」（strength=inferred）。  
-5. ✅ Worker：`workers/organize.py` facade 调现有 `pipeline/extract`（行为一致；单测驱动验证）。**生产 notes 路径不因 Ticket 再 enqueue 一次 extract（不双跑）**。  
+5. ✅ Worker：`workers/organize.py` facade 调现有 `pipeline/extract`；**S2 B 刀起生产 notes 经 Ticket→`schedule_organize`→Worker 执行**，API 不再 enqueue("extract")，jobs 主要剩 memory_sync。  
 6. ✅ Policy：硬编码版本 `v0` + `accept_mode=observe`（Mandate 只授被动面：整理 + 建议提醒；不含静默建闹钟/外发）。  
 7. ✅ 测试：`server/tests/test_domain_engine.py`（幂等、生命周期、facade、契约不变、旁路故障不影响 202）。  
 8. ✅ README 增加「Super-agent 重写进行中」指针；**不删**旧 pipeline 直到旁路稳定。
@@ -354,7 +354,7 @@ POST /v1/ask → Trigger(AskRequested) → Ticket(answer_ask)
 2. Router「单个常驻 LLM Session」在个人单用户下可先用**无状态函数 + 短上下文**，等 S3 再常驻。  
 3. 文中 Watchdog / A2A / 云端攻破端侧 等安全议题：个人单租户先做鉴权隔离与最小工具面，**不在第一刀展开**。  
 4. 原型许可 MIT，可阅读思想与结构；**不要整文件复制**进本仓而不标注；更推荐按映射重写。  
-5. **第一刀的已知限制**（详见 architecture 文）：Engine 为进程内内存态——多 worker 进程间不可见、重启即空；生产执行仍走 jobs 队列，Ticket 状态与 job 状态暂不同步（`pending` 停留在内存）。
+5. **已知限制**（详见 architecture 文）：Engine 为进程内内存态——多进程间 Ticket 不可见、重启即空；整理已由同进程 Ticket→Worker 驱动，jobs 主要剩 memory_sync（跨进程 Ticket / WorkItem PG 后续刀）。
 
 ---
 
@@ -375,8 +375,8 @@ POST /v1/ask → Trigger(AskRequested) → Ticket(answer_ask)
 | `server/app/domain/{__init__,model,engine,ports}.py` | 领域模型 + Engine（唯一写入口，内存实现）+ Worker 协议 |
 | `server/app/policy/{__init__,personal_policy}.py` | v0 PersonalPolicy：`accept_mode=observe`、被动/主动动作面 |
 | `server/app/sources/{__init__,base,voice_http,registry}.py` | HttpApiSource / VoiceIngress 占位 + `submit_note_uploaded`（API 钩子，异常不上抛） |
-| `server/app/workers/{__init__,organize}.py` | organize_note Worker facade（调 `pipeline/extract`，不删 pipeline） |
-| `server/app/api/notes.py` | create 成功路径（commit 后）加一行 `submit_note_uploaded`；`/v1` 契约与 enqueue("extract") 不变 |
+| `server/app/workers/{__init__,organize,dispatch}.py` | organize_note Worker + 进程内 schedule/drain（调 `pipeline/extract`，不删 pipeline） |
+| `server/app/api/notes.py` | create/PATCH 成功 commit 后 `submit_note_uploaded` + `schedule_organize`；不再 enqueue("extract")；保留 memory_sync |
 | `server/tests/test_domain_engine.py` | 9 条测试：开单/幂等/Policy/钩子不双跑/旁路故障不影响 202/facade 成败两路 |
 | `README.md` | 设计文档节加链接，注明 Super-agent 重写进行中 |
 

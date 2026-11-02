@@ -18,8 +18,51 @@ import uuid
 from tests.conftest import auth_headers, requires_postgres
 
 
-async def test_concurrent_patch_same_rev_exactly_one_success(client, user):
+async def _post_note_with_manual_extract(client, user, text: str, *, rev: int = 1) -> tuple[str, str]:
+    """屏蔽 Ticket 调度，POST 后手动 enqueue extract；返回 (note_id, job_id)。"""
+    import app.workers.dispatch as dispatch
+    from sqlalchemy import select
+
+    from app.db import get_sessionmaker
+    from app.jobs.queue import enqueue
+    from app.models import Job
+
+    prev = dispatch.schedule_organize
+    dispatch.schedule_organize = lambda work_item: None  # type: ignore[assignment]
+    try:
+        r = await client.post(
+            "/v1/notes",
+            json={"client_note_id": str(uuid.uuid4()), "text": text},
+            headers=auth_headers(user),
+        )
+        assert r.status_code == 202, r.text
+        note_id = r.json()["note_id"]
+        async with get_sessionmaker()() as session:
+            await enqueue(
+                session,
+                "extract",
+                {"note_id": note_id, "rev": rev},
+                note_id=note_id,
+                note_rev=rev,
+            )
+            await session.commit()
+            job = (
+                await session.execute(
+                    select(Job).where(Job.kind == "extract", Job.note_id == note_id)
+                )
+            ).scalars().one()
+        return note_id, job.id
+    finally:
+        dispatch.schedule_organize = prev
+
+
+
+async def test_concurrent_patch_same_rev_exactly_one_success(client, user, monkeypatch):
     """同 rev 并发 PATCH：恰好一个 200、一个 409。"""
+    import app.workers.dispatch as dispatch
+
+    # 屏蔽 create 的 Ticket 调度，避免 extract 抢先 bump rev 导致双 409
+    monkeypatch.setattr(dispatch, "schedule_organize", lambda work_item: None)
     headers = auth_headers(user)
     r = await client.post(
         "/v1/notes",
@@ -154,12 +197,7 @@ async def test_patch_during_llm_not_blocked_and_stale_result_discarded(
     from app.pipeline.runner import run_pending_jobs
 
     headers = auth_headers(user)
-    r = await client.post(
-        "/v1/notes",
-        json={"client_note_id": str(uuid.uuid4()), "text": "第一版内容"},
-        headers=headers,
-    )
-    note_id = r.json()["note_id"]
+    note_id, _jid = await _post_note_with_manual_extract(client, user, "第一版内容")
 
     in_llm, release = asyncio.Event(), asyncio.Event()
     calls = _slow_llm(monkeypatch, in_llm, release)
@@ -177,6 +215,11 @@ async def test_patch_during_llm_not_blocked_and_stale_result_discarded(
 
     release.set()
     await asyncio.wait_for(worker, timeout=10)
+    # PATCH 开的 Ticket 由同进程 Worker 重整理
+    from app.workers.dispatch import drain_organize_tasks
+
+    await drain_organize_tasks()
+    await run_pending_jobs()
 
     assert calls["llm"] == 2  # 旧任务确实在 LLM 里等待过，新任务又调了一次
     async with get_sessionmaker()() as session:
@@ -198,12 +241,7 @@ async def test_other_user_writes_during_llm_and_memory_sync(client, user, monkey
     from tests.conftest import make_invite
 
     headers = auth_headers(user)
-    r = await client.post(
-        "/v1/notes",
-        json={"client_note_id": str(uuid.uuid4()), "text": "user1 的笔记"},
-        headers=headers,
-    )
-    user1_note_id = r.json()["note_id"]
+    user1_note_id, _jid = await _post_note_with_manual_extract(client, user, "user1 的笔记")
 
     in_llm, release_llm = asyncio.Event(), asyncio.Event()
     in_memory, release_memory = asyncio.Event(), asyncio.Event()
@@ -293,12 +331,7 @@ async def test_patch_and_organize_writeback_overlap_no_deadlock(client, user, mo
     from app.pipeline.runner import run_pending_jobs
 
     headers = auth_headers(user)
-    r = await client.post(
-        "/v1/notes",
-        json={"client_note_id": str(uuid.uuid4()), "text": "第一版内容"},
-        headers=headers,
-    )
-    note_id = r.json()["note_id"]
+    note_id, _job_id = await _post_note_with_manual_extract(client, user, "第一版内容")
 
     extract_holds_note = asyncio.Event()
     release_extract = asyncio.Event()
@@ -385,13 +418,9 @@ async def test_patch_delete_organize_three_way_overlap_no_deadlock(client, user,
     for i in range(rounds):
         gate["entered"] = asyncio.Event()
         gate["release"] = asyncio.Event()
-        created = await client.post(
-            "/v1/notes",
-            json={"client_note_id": str(uuid.uuid4()), "text": f"第 {i} 轮三方重叠"},
-            headers=headers,
+        note_id, _jid = await _post_note_with_manual_extract(
+            client, user, f"第 {i} 轮三方重叠"
         )
-        assert created.status_code == 202, created.text
-        note_id = created.json()["note_id"]
         note_ids.append(note_id)
 
         worker = asyncio.create_task(run_pending_jobs(limit=1))
@@ -477,12 +506,7 @@ async def test_extract_finalize_concurrent_patch_no_deadlock(client, user, monke
     monkeypatch.setattr("app.pipeline.extract.get_llm_client", fake_get_llm)
 
     headers = auth_headers(user)
-    r = await client.post(
-        "/v1/notes",
-        json={"client_note_id": str(uuid.uuid4()), "text": "收尾与 PATCH 并发"},
-        headers=headers,
-    )
-    note_id = r.json()["note_id"]
+    note_id, _jid = await _post_note_with_manual_extract(client, user, "收尾与 PATCH 并发")
 
     entered, release = asyncio.Event(), asyncio.Event()
     real_allocate_seq = queue_mod.allocate_seq
@@ -550,30 +574,13 @@ async def test_claim_dead_jobs_commit_between_candidates_no_deadlock(client, use
     from app.timeutil import utcnow
 
     headers = auth_headers(user)
-    note_a = (
-        await client.post(
-            "/v1/notes",
-            json={"client_note_id": str(uuid.uuid4()), "text": "判死 A 的笔记"},
-            headers=headers,
-        )
-    ).json()["note_id"]
-    note_b = (
-        await client.post(
-            "/v1/notes",
-            json={"client_note_id": str(uuid.uuid4()), "text": "候选 B 的笔记"},
-            headers=headers,
-        )
-    ).json()["note_id"]
+    note_a, job_a_id = await _post_note_with_manual_extract(client, user, "判死 A 的笔记")
+    note_b, job_b_id = await _post_note_with_manual_extract(client, user, "候选 B 的笔记")
 
     maker = get_sessionmaker()
     async with maker() as session:
-        jobs = {
-            j.note_id: j
-            for j in (
-                await session.execute(select(Job).where(Job.kind == "extract"))
-            ).scalars().all()
-        }
-    job_a, job_b = jobs[note_a], jobs[note_b]
+        job_a = await session.get(Job, job_a_id)
+        job_b = await session.get(Job, job_b_id)
 
     # 两个 extract job 都判死（running + 锁过期 + 次数用尽）；run_after
     # 错开保证 A 先被扫（不依赖 created_at 的精度）

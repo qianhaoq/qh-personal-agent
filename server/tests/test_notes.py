@@ -4,6 +4,11 @@ import uuid
 from tests.conftest import auth_headers
 
 
+
+def _silence_schedule(monkeypatch):
+    import app.workers.dispatch as dispatch
+    monkeypatch.setattr(dispatch, "schedule_organize", lambda work_item: None)
+
 def _note_body(text: str = "明天下午三点提醒我给张总回电话") -> dict:
     return {"client_note_id": str(uuid.uuid4()), "text": text, "source": "app"}
 
@@ -40,7 +45,8 @@ async def test_get_missing_note_404(client, user):
     assert resp.json()["error"]["code"] == "not_found"
 
 
-async def test_patch_optimistic_lock_409(client, user):
+async def test_patch_optimistic_lock_409(client, user, monkeypatch):
+    _silence_schedule(monkeypatch)
     r = await client.post("/v1/notes", json=_note_body(), headers=auth_headers(user))
     note_id, rev = r.json()["note_id"], r.json()["rev"]
 
@@ -61,7 +67,8 @@ async def test_patch_optimistic_lock_409(client, user):
     assert got.json()["status"] == "uploaded"  # 修改后回到 uploaded 等待重新整理
 
 
-async def test_patch_unchanged_text_with_stale_rev_409(client, user):
+async def test_patch_unchanged_text_with_stale_rev_409(client, user, monkeypatch):
+    _silence_schedule(monkeypatch)
     """threads6 P1-2 / INV-11：内容不变（或缺 text）的快路径也必须先原子
     校验 rev——拿过期 rev 的无操作 PATCH 是 409，不是 200 + 过期视图；
     当前 rev 的无操作 PATCH 走 200 且不产生任何可观察变更。"""
@@ -308,11 +315,9 @@ async def test_nul_rejected_in_note_strings_422(client, user):
 
 
 async def test_patch_clears_stale_extraction_fields(client, user, run_jobs):
-    """threads8 P1 / INV-15（notes.py:215）：organized 后 PATCH 正文 →
-    旧 rev 的 title/tags/todos 必须同事务清空（旧行为只置 status=uploaded，
-    PATCH 响应与 /v1/sync 把旧抽取产物当当前元数据返回，新抽取重试耗尽时
-    旧产物永久残留）、suggested 提醒作废成墓碑、extract 与 memory_sync
-    都入队；排空后派生按新正文写回。"""
+    """threads8 P1 / INV-15：organized 后 PATCH 正文 →
+    旧 rev 的 title/tags/todos 必须同事务清空、suggested 提醒作废成墓碑、
+    入队 memory_sync（不再 enqueue extract；整理走 Ticket）；排空后派生按新正文写回。"""
     from sqlalchemy import select
 
     from app.db import get_sessionmaker
@@ -359,9 +364,9 @@ async def test_patch_clears_stale_extraction_fields(client, user, run_jobs):
         ).scalars().all()
     assert (row.title, row.tags, row.todos) == (None, None, None)
     assert row.status == "uploaded"
-    assert {j.kind for j in jobs if j.status == "pending"} >= {"extract", "memory_sync"}, (
-        "源字段变更必须重新入队 extract 与 memory_sync"
-    )
+    pending_kinds = {j.kind for j in jobs if j.status == "pending"}
+    assert "memory_sync" in pending_kinds, "源字段变更必须入队 memory_sync"
+    assert "extract" not in pending_kinds, "S2 B 刀：PATCH 不再 enqueue extract"
 
     # 旧 suggested 提醒在 /v1/sync 里以墓碑出现（客户端据此本地删除）
     sync = await client.get(

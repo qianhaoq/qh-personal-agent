@@ -30,9 +30,8 @@ def submit_note_uploaded(
 ) -> Receipt | None:
     """API 成功路径的领域旁路钩子：NoteUploaded → engine.receive。
 
-    纯内存同步调用，不跑 LLM/worker，也不重复 enqueue extract（现网
-    兼容路径见 app/api/notes.py 的 enqueue）。任何异常吞掉并记安全摘要，
-    返回 None——绝不把 202 变 500。
+    纯内存同步调用，不跑 LLM。开单成功后由 API 侧 schedule_organize
+    调度 Worker。任何异常吞掉并记安全摘要，返回 None——绝不把 202 变 500。
     """
     # 延迟导入：registry 反向引用本模块的 Source 类，模块级互 import 成环
     from app.sources.registry import get_source
