@@ -16,6 +16,7 @@ from app.models import Job, Note
 from app.pipeline.runner import run_pending_jobs
 from app.timeutil import utcnow
 from tests.conftest import auth_headers, requires_postgres
+from tests.runtime_driver import seed_legacy_extract
 
 
 async def _create_note_with_job(client, user) -> tuple[str, str]:
@@ -27,6 +28,7 @@ async def _create_note_with_job(client, user) -> tuple[str, str]:
     )
     assert r.status_code == 202, r.text
     note_id = r.json()["note_id"]
+    await seed_legacy_extract(note_id)
     async with get_sessionmaker()() as session:
         job = (
             await session.execute(select(Job).where(Job.kind == "extract", Job.note_id == note_id))
@@ -149,6 +151,7 @@ async def test_claim_commits_dead_job_transition_before_next_candidate(
             headers=headers,
         )
     ).json()["note_id"]
+    await seed_legacy_extract(note_a)
     note_b = (
         await client.post(
             "/v1/notes",
@@ -156,6 +159,7 @@ async def test_claim_commits_dead_job_transition_before_next_candidate(
             headers=headers,
         )
     ).json()["note_id"]
+    await seed_legacy_extract(note_b)
 
     maker = get_sessionmaker()
     async with maker() as session:
@@ -366,7 +370,8 @@ async def test_stale_worker_finalize_ignored_after_lease_reclaimed_memory_sync(
             headers=auth_headers(user),
         )
     ).json()["note_id"]
-    await run_jobs()  # 抽取+同步完成，记忆已写
+    await seed_legacy_extract(note_id)
+    await run_pending_jobs()  # 抽取+同步完成，记忆已写
 
     # 再入队一个 memory_sync（模拟冗余任务），让它在 store.add 里挂起
     async with get_sessionmaker()() as session, session.begin():
@@ -472,7 +477,8 @@ async def test_memory_sync_single_running_per_note(client, user, run_jobs, monke
             headers=auth_headers(user),
         )
     ).json()["note_id"]
-    await run_jobs()
+    await seed_legacy_extract(note_id)
+    await run_pending_jobs()
 
     # running#1（回收窗口内）+ pending#2 并存
     async with get_sessionmaker()() as session, session.begin():
@@ -594,6 +600,7 @@ async def test_extract_and_memory_sync_independent_attempts(client, user, run_jo
             headers=auth_headers(user),
         )
     ).json()["note_id"]
+    await seed_legacy_extract(note1)
     for _ in range(10):
         if await run_pending_jobs(retry_delay_seconds=0) == 0:
             break
@@ -616,6 +623,7 @@ async def test_extract_and_memory_sync_independent_attempts(client, user, run_jo
             headers=auth_headers(user),
         )
     ).json()["note_id"]
+    await seed_legacy_extract(note2)
     for _ in range(10):
         if await run_pending_jobs(retry_delay_seconds=0) == 0:
             break
@@ -666,6 +674,7 @@ async def test_extract_finalize_marks_failed_only_at_enqueued_rev(client, user, 
             headers=headers,
         )
     ).json()["note_id"]
+    await seed_legacy_extract(note_id)
 
     finalize_calls = {"n": 0}
     real_finalize = runner._finalize
@@ -719,6 +728,7 @@ async def test_memory_sync_finalize_failure_marks_memory_status_not_note_status(
             headers=auth_headers(user),
         )
     ).json()["note_id"]
+    await seed_legacy_extract(note_id)
     for _ in range(10):
         if await run_pending_jobs(retry_delay_seconds=0) == 0:
             break

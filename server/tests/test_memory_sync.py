@@ -113,7 +113,7 @@ async def test_memory_sync_fails_not_marks_synced_when_enumeration_incomplete(
     """threads5 P1-1 / INV-3：delete_by_note 枚举不完整（一页取满删不动）→
     memory_sync 抛错让 job 失败重试至耗尽——绝不把「取不全」当成已同步
     （memory_status 落 failed，绝非 synced）。"""
-    from app.pipeline.runner import run_pending_jobs
+    from tests.runtime_driver import run_pending_jobs
 
     note_id = await _create_note(client, user, "同步时枚举会不完整的笔记")
 
@@ -289,7 +289,7 @@ async def test_memory_sync_on_unorganized_note_clears_stale_memory_without_add(
     async def fake_get_llm():
         return BoomLLM()
 
-    monkeypatch.setattr("app.pipeline.extract.get_llm_client", fake_get_llm)
+    monkeypatch.setattr("app.workers.extract_impl.get_llm_client", fake_get_llm)
 
     headers = auth_headers(user)
     rev = (await client.get(f"/v1/notes/{note_id}", headers=headers)).json()["rev"]
@@ -298,7 +298,7 @@ async def test_memory_sync_on_unorganized_note_clears_stale_memory_without_add(
     )
     assert patched.status_code == 200
     # retry_delay=0 让 extract 立即重试至耗尽；memory_sync 在中途把旧记忆清掉
-    from app.pipeline.runner import run_pending_jobs
+    from tests.runtime_driver import run_pending_jobs
 
     for _ in range(10):
         if await run_pending_jobs(retry_delay_seconds=0) == 0:
@@ -390,7 +390,7 @@ async def test_memory_sync_requeues_and_deletes_only_own_ids_on_rev_change(
 
     from app.db import get_sessionmaker
     from app.jobs.queue import enqueue
-    from app.pipeline.runner import run_pending_jobs
+    from tests.runtime_driver import run_pending_jobs
 
     # 手动再入队一个 memory_sync（模拟去重竞争中留下的冗余任务）
     async with get_sessionmaker()() as session, session.begin():
@@ -460,7 +460,7 @@ async def test_memory_sync_converges_after_delete_during_add(client, user, run_j
     # 手动再入队一个 memory_sync，让它在 add 里挂起
     from app.db import get_sessionmaker
     from app.jobs.queue import enqueue
-    from app.pipeline.runner import run_pending_jobs
+    from tests.runtime_driver import run_pending_jobs
 
     async with get_sessionmaker()() as session, session.begin():
         await enqueue(session, "memory_sync", {"note_id": note_id}, note_id=note_id)
@@ -512,8 +512,8 @@ async def test_two_worker_delete_vs_add_converges_no_orphan(client, user, run_jo
     from app.config import get_settings
     from app.db import get_sessionmaker
     from app.jobs.queue import enqueue
-    from app.pipeline.runner import run_pending_jobs
     from app.timeutil import utcnow
+    from tests.runtime_driver import run_pending_jobs
 
     # 冗余的旧 memory_sync（模拟 ≥2 worker 时留下的重复任务）
     async with get_sessionmaker()() as session, session.begin():
@@ -594,8 +594,8 @@ async def test_memory_sync_worker_killed_mid_run_reclaimed_converges(client, use
     from app.config import get_settings
     from app.db import get_sessionmaker
     from app.jobs.queue import claim_next
-    from app.pipeline.runner import run_pending_jobs
     from app.timeutil import utcnow
+    from tests.runtime_driver import run_pending_jobs
 
     maker = get_sessionmaker()
     assert await run_pending_jobs(limit=1) == 1
@@ -667,7 +667,7 @@ async def test_memory_sync_attempts_exhausted_marks_failed_only_without_newer_jo
     assert patched.status_code == 200
 
     from app.pipeline import runner
-    from app.pipeline.runner import run_pending_jobs
+    from tests.runtime_driver import run_pending_jobs
 
     finalize_calls = {"n": 0}
     real_finalize = runner._finalize
@@ -731,8 +731,8 @@ async def test_memory_sync_recheck_fences_reclaimed_lease_deletes_own_ids(
     from app.config import get_settings
     from app.db import get_sessionmaker
     from app.jobs.queue import enqueue
-    from app.pipeline.runner import run_pending_jobs
     from app.timeutil import utcnow
+    from tests.runtime_driver import run_pending_jobs
 
     note_id = await _create_note(client, user, "租约被回收后迟到的写入")
     await run_jobs()  # organized rev=2；初次收敛已完成
@@ -808,8 +808,8 @@ async def test_memory_sync_mark_status_skipped_when_lease_lost_before_update(
     from app.db import get_sessionmaker
     from app.jobs.queue import enqueue
     from app.pipeline import memory_sync
-    from app.pipeline.runner import run_pending_jobs
     from app.timeutil import utcnow
+    from tests.runtime_driver import run_pending_jobs
 
     note_id = await _create_note(client, user, "置位前一刻丢租约的笔记")
     await run_jobs()  # organized + 初次收敛（memory_status=synced）
@@ -887,8 +887,8 @@ async def test_memory_sync_stalled_delete_by_note_past_lease_requeues_and_conver
     from app.config import get_settings
     from app.db import get_sessionmaker
     from app.jobs.queue import enqueue
-    from app.pipeline.runner import run_pending_jobs
     from app.timeutil import utcnow
+    from tests.runtime_driver import run_pending_jobs
 
     note_id = await _create_note(client, user, "删除挂起超过租约的笔记")
     await run_jobs()  # organized rev=2，初次收敛完成
@@ -1028,8 +1028,8 @@ async def test_memory_sync_lost_lease_delete_failure_still_requeues(
     from app.config import get_settings
     from app.db import get_sessionmaker
     from app.jobs.queue import enqueue
-    from app.pipeline.runner import run_pending_jobs
     from app.timeutil import utcnow
+    from tests.runtime_driver import run_pending_jobs
 
     note_id = await _create_note(client, user, "清理会在丢租约后炸掉的笔记")
     await run_jobs()  # organized rev=2，初次收敛完成
@@ -1162,8 +1162,8 @@ async def test_memory_sync_add_failure_after_lost_lease_requeues_and_raises(
     from app.db import get_sessionmaker
     from app.jobs.queue import claim_next, enqueue
     from app.pipeline.memory_sync import sync_note_memory
-    from app.pipeline.runner import run_pending_jobs
     from app.timeutil import as_utc, utcnow
+    from tests.runtime_driver import run_pending_jobs
 
     note_id = await _create_note(client, user, "add 会在写后炸掉的笔记")
     await run_jobs()  # organized，初次收敛完成

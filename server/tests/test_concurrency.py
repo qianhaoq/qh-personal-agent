@@ -16,6 +16,7 @@ import json
 import uuid
 
 from tests.conftest import auth_headers, requires_postgres
+from tests.runtime_driver import seed_legacy_extract
 
 
 async def test_concurrent_patch_same_rev_exactly_one_success(client, user):
@@ -140,7 +141,7 @@ def _slow_llm(monkeypatch, entered: asyncio.Event, release: asyncio.Event) -> di
     async def fake_get_llm():
         return SlowLLM()
 
-    monkeypatch.setattr("app.pipeline.extract.get_llm_client", fake_get_llm)
+    monkeypatch.setattr("app.workers.extract_impl.get_llm_client", fake_get_llm)
     return calls
 
 
@@ -151,7 +152,7 @@ async def test_patch_during_llm_not_blocked_and_stale_result_discarded(
     之后旧任务的结果被丢弃，PATCH 重新入队的任务用新文本正常抽取。"""
     from app.db import get_sessionmaker
     from app.models import Note
-    from app.pipeline.runner import run_pending_jobs
+    from tests.runtime_driver import run_pending_jobs
 
     headers = auth_headers(user)
     r = await client.post(
@@ -194,8 +195,8 @@ async def test_other_user_writes_during_llm_and_memory_sync(client, user, monkey
     from app.memory.base import set_memory_store
     from app.memory.inmemory import InMemoryStore
     from app.models import Note
-    from app.pipeline.runner import run_pending_jobs
     from tests.conftest import make_invite
+    from tests.runtime_driver import run_pending_jobs
 
     headers = auth_headers(user)
     r = await client.post(
@@ -288,9 +289,9 @@ async def test_patch_and_organize_writeback_overlap_no_deadlock(client, user, mo
     from sqlalchemy import select
 
     from app.db import get_sessionmaker
-    from app.models import Job, Note
-    from app.pipeline import extract as extract_mod
-    from app.pipeline.runner import run_pending_jobs
+    from app.models import Note, SaWorkItem
+    from app.workers import extract_impl as extract_mod
+    from tests.runtime_driver import run_pending_jobs
 
     headers = auth_headers(user)
     r = await client.post(
@@ -336,7 +337,7 @@ async def test_patch_and_organize_writeback_overlap_no_deadlock(client, user, mo
     async with get_sessionmaker()() as session:
         note = await session.get(Note, note_id)
         job = (
-            await session.execute(select(Job).where(Job.kind == "extract", Job.note_id == note_id))
+            await session.execute(select(SaWorkItem).where(SaWorkItem.kind == "organize_note", SaWorkItem.note_id == note_id))
         ).scalar_one()
     assert note.status == "organized"
     assert note.rev == 2
@@ -363,8 +364,8 @@ async def test_patch_delete_organize_three_way_overlap_no_deadlock(client, user,
     from app.db import get_sessionmaker
     from app.memory.base import get_memory_store
     from app.models import Job, Note, Reminder
-    from app.pipeline import extract as extract_mod
-    from app.pipeline.runner import run_pending_jobs
+    from app.workers import extract_impl as extract_mod
+    from tests.runtime_driver import run_pending_jobs
 
     headers = auth_headers(user)
     rounds = 20
@@ -474,7 +475,7 @@ async def test_extract_finalize_concurrent_patch_no_deadlock(client, user, monke
     async def fake_get_llm():
         return BoomLLM()
 
-    monkeypatch.setattr("app.pipeline.extract.get_llm_client", fake_get_llm)
+    monkeypatch.setattr("app.workers.extract_impl.get_llm_client", fake_get_llm)
 
     headers = auth_headers(user)
     r = await client.post(
@@ -483,6 +484,7 @@ async def test_extract_finalize_concurrent_patch_no_deadlock(client, user, monke
         headers=headers,
     )
     note_id = r.json()["note_id"]
+    await seed_legacy_extract(note_id)
 
     entered, release = asyncio.Event(), asyncio.Event()
     real_allocate_seq = queue_mod.allocate_seq
@@ -557,6 +559,7 @@ async def test_claim_dead_jobs_commit_between_candidates_no_deadlock(client, use
             headers=headers,
         )
     ).json()["note_id"]
+    await seed_legacy_extract(note_a)
     note_b = (
         await client.post(
             "/v1/notes",
@@ -564,6 +567,7 @@ async def test_claim_dead_jobs_commit_between_candidates_no_deadlock(client, use
             headers=headers,
         )
     ).json()["note_id"]
+    await seed_legacy_extract(note_b)
 
     maker = get_sessionmaker()
     async with maker() as session:
@@ -737,7 +741,7 @@ async def test_ask_slow_llm_single_connection_pool_still_serves(client, user, ru
         async def fake_get_llm():
             return SlowLLM()
 
-        monkeypatch.setattr("app.api.ask.get_llm_client", fake_get_llm)
+        monkeypatch.setattr("app.workers.answer.get_llm_client", fake_get_llm)
 
         ask_task = asyncio.create_task(
             client.post("/v1/ask", json={"text": "我吃东西要注意什么"}, headers=headers)

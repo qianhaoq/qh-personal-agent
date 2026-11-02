@@ -203,3 +203,54 @@ class Job(Base):
 
 # 记忆后端自身的表（若需要）由后端实现管理（生产后端在 feat/mem0-backend
 # 分支），不在这里定义。
+
+
+class SaThread(Base):
+    """Persistent conversation identity; intake serializes evaluation on this row."""
+    __tablename__ = "sa_threads"
+    key: Mapped[str] = mapped_column(String(256), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class SaTrigger(Base):
+    __tablename__ = "sa_triggers"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    dedupe_key: Mapped[str] = mapped_column(String(256), unique=True)
+    thread_key: Mapped[str] = mapped_column(ForeignKey("sa_threads.key"), index=True)
+    user_id: Mapped[str] = mapped_column(String(32))
+    kind: Mapped[str] = mapped_column(String(32))
+    source: Mapped[str] = mapped_column(String(32))
+    payload: Mapped[dict] = mapped_column(JSON)
+    decision: Mapped[dict] = mapped_column(JSON)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class SaWorkItem(Base):
+    """Ticket with immutable mandate and current Assignment embedded in columns.
+
+    worker_id is a fresh execution token on every claim, including retries.
+    This prevents an old report from matching a later assignment (ABA).
+    """
+    __tablename__ = "sa_work_items"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    trigger_id: Mapped[str] = mapped_column(ForeignKey("sa_triggers.id"), unique=True)
+    thread_key: Mapped[str] = mapped_column(ForeignKey("sa_threads.key"))
+    trigger_dedupe_key: Mapped[str] = mapped_column(String(256))
+    user_id: Mapped[str] = mapped_column(String(32))
+    kind: Mapped[str] = mapped_column(String(32))
+    mandate: Mapped[dict] = mapped_column(JSON)
+    decision: Mapped[dict] = mapped_column(JSON)
+    payload: Mapped[dict] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(16), index=True)
+    note_id: Mapped[str | None] = mapped_column(String(32), index=True)
+    note_rev: Mapped[int | None] = mapped_column(Integer)
+    worker_id: Mapped[str | None] = mapped_column(String(128))
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer)
+    run_after: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    result: Mapped[dict | None] = mapped_column(JSON)
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

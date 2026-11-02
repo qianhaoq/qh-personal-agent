@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 
 from sqlalchemy import select
 
-from app.models import Job, Note, Reminder
+from app.models import Job, Note, Reminder, SaWorkItem
 from app.timeutil import as_utc, to_iso
 from tests.conftest import auth_headers
 
@@ -17,7 +17,7 @@ def _freeze_now(monkeypatch, fixed: datetime) -> None:
     server_now_discarded），用固定过去/未来时间的测试不固定 now 的话，
     断言会随真实时钟漂移。
     """
-    monkeypatch.setattr("app.pipeline.extract.utcnow", lambda: fixed)
+    monkeypatch.setattr("app.workers.extract_impl.utcnow", lambda: fixed)
 
 
 async def _create_and_extract(client, user, text, run_jobs) -> Note:
@@ -43,7 +43,7 @@ async def _extract_job(note_id: str) -> Job:
 
     async with get_sessionmaker()() as session:
         return (
-            await session.execute(select(Job).where(Job.kind == "extract", Job.note_id == note_id))
+            await session.execute(select(SaWorkItem).where(SaWorkItem.kind == "organize_note", SaWorkItem.note_id == note_id))
         ).scalar_one()
 
 
@@ -130,7 +130,7 @@ async def test_first_llm_failure_leaves_no_side_effects(client, user, monkeypatc
     """
     from app.db import get_sessionmaker
     from app.memory.base import get_memory_store
-    from app.pipeline.runner import run_pending_jobs
+    from tests.runtime_driver import run_pending_jobs
 
     text = "嗯，那个，明天上午十点交周报"
     r = await client.post(
@@ -151,7 +151,7 @@ async def test_first_llm_failure_leaves_no_side_effects(client, user, monkeypatc
     async def fake_get_llm():
         return BoomLLM()
 
-    monkeypatch.setattr("app.pipeline.extract.get_llm_client", fake_get_llm)
+    monkeypatch.setattr("app.workers.extract_impl.get_llm_client", fake_get_llm)
     processed = await run_pending_jobs(limit=1, retry_delay_seconds=0)
     assert processed == 1
 
@@ -165,14 +165,14 @@ async def test_first_llm_failure_leaves_no_side_effects(client, user, monkeypatc
             await session.execute(select(Reminder).where(Reminder.note_id == note_id))
         ).scalars().all() == []
         job = (
-            await session.execute(select(Job).where(Job.kind == "extract", Job.note_id == note_id))
+            await session.execute(select(SaWorkItem).where(SaWorkItem.kind == "organize_note", SaWorkItem.note_id == note_id))
         ).scalars().one()
         assert job.status == "pending"
         assert job.attempts == 1
         assert job.note_rev == 1
         # INV-14（threads8 P1）：last_error 只记类型名+错误码，不落异常原文
-        assert "RuntimeError" in (job.last_error or "")
-        assert "transient llm failure" not in (job.last_error or "")
+        assert "RuntimeError" in (job.error or "")
+        assert "transient llm failure" not in (job.error or "")
         # 抽取未成功：没有 memory_sync 被入队，也没有任何记忆
         memsync = (
             await session.execute(
@@ -196,7 +196,7 @@ async def test_extract_skips_when_rev_moved_marks_done(client, user, monkeypatch
     PATCH 已重新入队新 rev 的 extract，旧任务执行时一次 LLM 都不调用。
     """
     from app.db import get_sessionmaker
-    from app.pipeline.runner import run_pending_jobs
+    from tests.runtime_driver import run_pending_jobs
 
     r = await client.post(
         "/v1/notes",
@@ -226,14 +226,14 @@ async def test_extract_skips_when_rev_moved_marks_done(client, user, monkeypatch
     async def fake_get_llm():
         return CountingLLM()
 
-    monkeypatch.setattr("app.pipeline.extract.get_llm_client", fake_get_llm)
+    monkeypatch.setattr("app.workers.extract_impl.get_llm_client", fake_get_llm)
 
     # 只跑一个：最旧的是 rev=1 的任务，它必须跳过 = done（零副作用）
     processed = await run_pending_jobs(limit=1, retry_delay_seconds=0)
     assert processed == 1
     async with get_sessionmaker()() as session:
         jobs = (
-            await session.execute(select(Job).where(Job.kind == "extract", Job.note_id == note_id))
+            await session.execute(select(SaWorkItem).where(SaWorkItem.kind == "organize_note", SaWorkItem.note_id == note_id))
         ).scalars().all()
         note = await session.get(Note, note_id)
     old = next(j for j in jobs if j.note_rev == 1)
@@ -253,7 +253,7 @@ async def test_extract_skips_when_rev_moved_marks_done(client, user, monkeypatch
 async def test_extract_attempts_exhausted_marks_note_failed_by_rev(client, user, monkeypatch):
     """INV-2.5：extract 连续失败耗尽 → note.status=failed（按入队 rev 条件）。"""
     from app.db import get_sessionmaker
-    from app.pipeline.runner import run_pending_jobs
+    from tests.runtime_driver import run_pending_jobs
 
     r = await client.post(
         "/v1/notes",
@@ -269,13 +269,13 @@ async def test_extract_attempts_exhausted_marks_note_failed_by_rev(client, user,
     async def fake_get_llm():
         return BoomLLM()
 
-    monkeypatch.setattr("app.pipeline.extract.get_llm_client", fake_get_llm)
+    monkeypatch.setattr("app.workers.extract_impl.get_llm_client", fake_get_llm)
     await run_pending_jobs(retry_delay_seconds=0)
 
     async with get_sessionmaker()() as session:
         note = await session.get(Note, note_id)
         job = (
-            await session.execute(select(Job).where(Job.kind == "extract", Job.note_id == note_id))
+            await session.execute(select(SaWorkItem).where(SaWorkItem.kind == "organize_note", SaWorkItem.note_id == note_id))
         ).scalar_one()
     assert job.status == "failed"
     assert note.status == "failed"
@@ -289,8 +289,8 @@ async def test_extract_finalize_skips_note_patched_after_enqueue(client, user, m
     任务正常完成。
     """
     from app.db import get_sessionmaker
-    from app.pipeline import runner
-    from app.pipeline.runner import run_pending_jobs
+    from app.domain.engine import Engine
+    from tests.runtime_driver import run_pending_jobs
 
     headers = auth_headers(user)
     r = await client.post(
@@ -307,12 +307,12 @@ async def test_extract_finalize_skips_note_patched_after_enqueue(client, user, m
     async def fake_get_llm():
         return BoomLLM()
 
-    monkeypatch.setattr("app.pipeline.extract.get_llm_client", fake_get_llm)
+    monkeypatch.setattr("app.workers.extract_impl.get_llm_client", fake_get_llm)
 
     finalize_calls = {"n": 0}
-    real_finalize = runner._finalize
+    real_finalize = Engine.fail
 
-    async def finalize_with_mid_race_patch(maker, claimed, error, retry_delay_seconds, worker_id):
+    async def finalize_with_mid_race_patch(self, item_id, error, *, worker_id, **kwargs):
         finalize_calls["n"] += 1
         if finalize_calls["n"] == 3:
             # 第 3 次（最后一次）失败收尾前，用户 PATCH：rev+1 并入队新任务，
@@ -325,9 +325,9 @@ async def test_extract_finalize_skips_note_patched_after_enqueue(client, user, m
                 headers=headers,
             )
             assert patched.status_code == 200, patched.text
-        await real_finalize(maker, claimed, error, retry_delay_seconds, worker_id)
+        return await real_finalize(self, item_id, error, worker_id=worker_id, **kwargs)
 
-    monkeypatch.setattr(runner, "_finalize", finalize_with_mid_race_patch)
+    monkeypatch.setattr(Engine, "fail", finalize_with_mid_race_patch)
 
     # 只跑 3 个：旧任务 3 次尝试全部失败（判 failed），新 rev 的任务留在队列里
     processed = await run_pending_jobs(limit=3, retry_delay_seconds=0)
@@ -343,7 +343,7 @@ async def test_extract_finalize_skips_note_patched_after_enqueue(client, user, m
     async with get_sessionmaker()() as session:
         note = await session.get(Note, note_id)
         jobs = (
-            await session.execute(select(Job).where(Job.note_id == note_id))
+            await session.execute(select(SaWorkItem).where(SaWorkItem.note_id == note_id))
         ).scalars().all()
     assert {j.status for j in jobs} == {"failed", "done"}
     assert note.status == "organized"  # 不是 failed：收尾条件更新未命中新 rev
@@ -409,7 +409,7 @@ async def test_past_or_broken_fire_at_discarded(client, user, monkeypatch, run_j
     async def fake_get_llm():
         return PastLLM()
 
-    monkeypatch.setattr("app.pipeline.extract.get_llm_client", fake_get_llm)
+    monkeypatch.setattr("app.workers.extract_impl.get_llm_client", fake_get_llm)
     r = await client.post(
         "/v1/notes",
         json={
@@ -475,7 +475,7 @@ async def test_llm_boundary_fire_at_overflow_discarded(client, user, monkeypatch
     async def fake_get_llm():
         return BoundaryLLM()
 
-    monkeypatch.setattr("app.pipeline.extract.get_llm_client", fake_get_llm)
+    monkeypatch.setattr("app.workers.extract_impl.get_llm_client", fake_get_llm)
     r = await client.post(
         "/v1/notes",
         json={
@@ -585,7 +585,7 @@ async def test_llm_output_unsafe_control_chars_stripped(client, user, run_jobs, 
     async def fake_get_llm():
         return DirtyLLM()
 
-    monkeypatch.setattr("app.pipeline.extract.get_llm_client", fake_get_llm)
+    monkeypatch.setattr("app.workers.extract_impl.get_llm_client", fake_get_llm)
     r = await client.post(
         "/v1/notes",
         json={
@@ -639,7 +639,7 @@ async def test_llm_non_list_collection_fields_discarded_not_failed(client, user,
     async def fake_get_llm():
         return SloppyLLM()
 
-    monkeypatch.setattr("app.pipeline.extract.get_llm_client", fake_get_llm)
+    monkeypatch.setattr("app.workers.extract_impl.get_llm_client", fake_get_llm)
     r = await client.post(
         "/v1/notes",
         json={
@@ -661,7 +661,7 @@ async def test_llm_non_list_collection_fields_discarded_not_failed(client, user,
             await session.execute(select(Reminder).where(Reminder.note_id == note_id))
         ).scalars().all()
         job = (
-            await session.execute(select(Job).where(Job.kind == "extract", Job.note_id == note_id))
+            await session.execute(select(SaWorkItem).where(SaWorkItem.kind == "organize_note", SaWorkItem.note_id == note_id))
         ).scalar_one()
     assert note.status == "organized", "畸形集合字段只影响对应字段，不该把笔记拖进重试/失败"
     assert note.title == "标题照常"

@@ -88,7 +88,7 @@ async def test_ask_uses_client_time_as_reference(client, user, run_jobs, monkeyp
     async def fake_get_llm():
         return SpyLLM()
 
-    monkeypatch.setattr("app.api.ask.get_llm_client", fake_get_llm)
+    monkeypatch.setattr("app.workers.answer.get_llm_client", fake_get_llm)
     resp = await client.post(
         "/v1/ask",
         json={
@@ -132,7 +132,7 @@ async def test_ask_naive_client_time_localized_by_timezone(client, user, run_job
     async def fake_get_llm():
         return SpyLLM()
 
-    monkeypatch.setattr("app.api.ask.get_llm_client", fake_get_llm)
+    monkeypatch.setattr("app.workers.answer.get_llm_client", fake_get_llm)
     resp = await client.post(
         "/v1/ask",
         json={
@@ -189,7 +189,7 @@ def _slow_ask_llm(monkeypatch, entered: asyncio.Event, release: asyncio.Event):
     async def fake_get_llm():
         return SlowLLM()
 
-    monkeypatch.setattr("app.api.ask.get_llm_client", fake_get_llm)
+    monkeypatch.setattr("app.workers.answer.get_llm_client", fake_get_llm)
 
 
 async def test_ask_slow_llm_does_not_block_other_requests(client, user, run_jobs, monkeypatch):
@@ -232,7 +232,7 @@ async def test_ask_answer_sanitized_unsafe_chars_stripped(client, user, run_jobs
     async def fake_get_llm():
         return SpyLLM()
 
-    monkeypatch.setattr("app.api.ask.get_llm_client", fake_get_llm)
+    monkeypatch.setattr("app.workers.answer.get_llm_client", fake_get_llm)
     resp = await client.post(
         "/v1/ask",
         json={"text": "我吃东西要注意什么"},

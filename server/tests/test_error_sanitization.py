@@ -15,6 +15,7 @@ from sqlalchemy.exc import IntegrityError, StatementError
 from app.errors import error_code, safe_error_summary, safe_error_text
 from app.models import Job
 from tests.conftest import auth_headers
+from tests.runtime_driver import seed_legacy_extract
 
 
 def test_safe_error_summary_type_and_code_only():
@@ -60,6 +61,7 @@ async def test_job_exception_not_logged_nor_persisted_raw(client, user, caplog):
     )
     assert r.status_code == 202, r.text
     note_id = r.json()["note_id"]
+    await seed_legacy_extract(note_id)
 
     marker = "pa_sk_JOBSECRET_111 SQL参数里的笔记正文"
 

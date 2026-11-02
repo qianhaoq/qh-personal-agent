@@ -1,84 +1,82 @@
-# Super-agent 架构（第一刀）
+# Super-agent Runtime（当前实现）
 
-> 状态：落地第一刀（分支 `feat/superagent-rewrite-s1`）。概念与术语以
-> [superagent-concept-mapping.md](superagent-concept-mapping.md) 为准，本文只讲
-> **落地形态**：数据流、模块边界、本地跑法、已知限制。
+钱浩要求的干净理想态重写，分支 `feat/superagent-clean-runtime`。本刀**替代 #23/#25 的增量路线**；不延续内存 Engine + pipeline facade，不 cherry-pick S2/S3。产品仍是个人语音随手记、建议提醒、记忆问答，Android 与 `/v1/auth|notes|sync|ask` 的 HTTP 形状保留。
 
-## 1. 数据流（第一刀：双路径并行）
-
-现有 S1 契约不动，领域骨架作为**旁路**并行走：
+## 当前数据流
 
 ```text
-POST /v1/notes（202，契约不变）
- ├─ 现网路径（保持唯一执行通道，不双跑）：
- │    enqueue("extract") → jobs 队列 → app.pipeline.extract（LLM 整理 + memory_sync）
- └─ 领域旁路（新增，纯内存同步，commit 之后调用）：
-      submit_note_uploaded()
-        → HttpApiSource.note_uploaded：构造 Trigger(NoteUploaded, dedupe_key=note_id:rev)
-        → Engine.receive：
-            幂等去重（dedupe_key）→ 记 Trigger/Thread(note:{id})
-            → Eval 快路径 = PersonalPolicy.evaluate（规则，无 LLM）
-            → accept ⇒ 签 Mandate(v0, 被动动作面) ⇒ 开 WorkItem(organize_note, pending)
+POST /v1/notes / PATCH 正文
+  → note 事务：清旧派生物、分配 change_seq、commit
+    （PATCH 同事务 enqueue memory_sync 清旧记忆）
+  → HttpApiSource → Trigger → Engine.receive
+  → Store 事务：Thread 串行化 → dedupe → Policy Eval → Mandate → pending Ticket
+
+python -m app.jobs.worker 每轮
+  → Runtime：补扫缺 Trigger 的 uploaded note → 回收过期 Assignment
+  → pending Ticket → OrganizeNoteWorker
+    → CAS claim → 短读 note → 事务外 LLM → report Engine.complete
+    → 同事务 CAS running+worker_id → Channel → note/reminders/memory_sync → seq → commit
+  → 独立 memory_sync 队列：事务外 MemoryStore 同步 → 租约与 rev 复查
+
+POST /v1/ask
+  → HttpApiSource → Trigger → Engine → pending answer_ask Ticket
+  → await AnswerAskWorker：CAS claim → 事务外 Memory.search / LLM
+  → Engine.complete → Channel → 持久 result → 同请求返回 answer/citations
 ```
 
-WorkItem 的执行方（Assignment）是 `app/workers/organize.py` 的 facade：
+LLM 与 Memory 都是 Worker 工具端口。Engine 是 Runtime 状态的唯一写入口，Channel 是 Engine 调用的统一结果出口。Worker 不直接发通知、不设置系统闹钟。默认 `PersonalPolicy v1 / observe` 只授权整理与建议提醒，显式问答只授权检索和回答。
 
-```text
-OrganizeNoteWorker.run(work_item)
-  → engine.mark_running(...)
-  → app.pipeline.extract.extract_note(note_id, enqueued_rev)   # 复用现网 pipeline
-  → engine.complete / engine.fail（结果与安全摘要记进 WorkItem + DomainEvent）
-```
+## 模块地图
 
-**第一刀里生产 notes 路径不调用这个 facade**（extract 已由 jobs 队列驱动，
-Ticket 不会触发第二次 enqueue）；facade 由单测驱动，验证「领域骨架能驱动
-pipeline」。等 Engine 路径稳定（PR-6）再收口为唯一执行入口。
+| 模块 | 当前职责 |
+| --- | --- |
+| `app/models.py::SaThread/SaTrigger/SaWorkItem` | `sa_threads`、`sa_triggers`、`sa_work_items` SQLAlchemy 表；PG/SQLite，create_all/init-db 自动注册 |
+| `app/domain/store.py` | 数据库会话与事务外快照读取，无主路径内存字典 |
+| `app/domain/engine.py` | 原子 intake、版本化 Mandate、Assignment claim/complete/fail、过期恢复 |
+| `app/policy/personal_policy.py` | off/observe/auto 准入；显式问答与被动整理权限隔离 |
+| `app/sources/base.py, voice_http.py` | HTTP 事件构造；VoiceIngress 接口占位；提交后 note 钩子安全失败 |
+| `app/runtime.py` | 持久化 Ticket 轮询、缺失 intake 补扫、过期恢复，多个进程竞争同一 Store |
+| `app/workers/organize.py` | 认领整理 Ticket、调用工具、向 Engine report |
+| `app/workers/extract_impl.py` | 整理快照、prompt、解析/清洗、Channel 使用的写适配器 |
+| `app/workers/answer.py` | 问答 Ticket 同请求执行、Memory/LLM 调用、Engine report |
+| `app/domain/channel.py` | SyncChannel：受 Assignment fence 保护的 note/建议提醒写回，或持久 ask result 返回 |
+| `app/pipeline/memory_sync.py` | Memory 端口同步执行体，原有收敛/租约补偿协议保留 |
+| `app/jobs/worker.py` | 进程入口：先轮询 Runtime，再轮询独立 Memory 队列 |
 
-## 2. 模块边界
+## 持久化与事务语义
 
-| 包 | 职责 | 禁止 |
-| --- | --- | --- |
-| `app/domain/` | 纯领域：模型 + `Engine.receive`（唯一写入口，内存态）+ Worker 协议 | 不碰 DB/LLM/网络；不 import api/pipeline |
-| `app/policy/` | 唯一准入来源：v0 `PersonalPolicy`（`accept_mode=observe`、被动/主动动作面） | 不含执行逻辑 |
-| `app/sources/` | 入口适配：`HttpApiSource`（notes API）/ `VoiceIngress`（Android 语音占位）+ registry；负责 Trigger 构造与幂等键 | 不做业务执行 |
-| `app/workers/` | WorkItem 执行方：organize facade 调现有 pipeline | 不直出信道（不推通知/UI），结果回 Engine |
-| `app/api/` | 薄适配：HTTP → sources 钩子 / 查询 | 不在事务内调 LLM（server-invariants INV-1.4） |
+- Thread 有持久 key，Trigger 有唯一 `dedupe_key`，每个 Trigger 至多一个 Ticket。Thread upsert 在短事务内串行同 Thread 的规则 Eval。重复 Trigger 返回原回执，不再次 Eval 或改变 Mandate。
+- Mandate 与 Decision 是 Ticket 上的 JSON 快照。Assignment 嵌在 Ticket 的 `worker_id/locked_at/attempts/status` 列；每次 Worker 执行生成新的 execution id，不能把进程 id 当作可重复使用的 Assignment token。
+- claim 严格 `UPDATE ... WHERE status='pending'` 且 `rowcount=1` 才成功；claim 等锁后重新取 locked_at。complete/fail 严格要求 `status='running' AND worker_id=:execution`。未命中只返回 false，不猜测不存在/状态冲突。
+- complete 的 Ticket CAS 与 Channel 的业务写回在同一事务：先 Ticket 行，再 note → reminders → memory_sync INSERT → flush → sequences 最后。Channel 出错则整个完成事务回滚，Worker 再 report fail。done 不被迟到 fail 覆盖。
+- 整理还有 note rev/删除态栅栏，PATCH/DELETE 期间的旧 LLM 输出被丢弃；旧 Ticket 可 done，但不覆盖当前笔记。长 LLM 调用不持会话/锁。
+- Organize 工具异常保存 `safe_error_text`，按现有 `job_max_attempts` 与延迟重试，耗尽才在当前 rev 上标 note failed。Memory 同步的 attempts 和失败态独立。
+- 轮询会将超时 running Assignment 回收为 pending；耗尽则 failed。过期旧执行因 execution token 不同无法写回。每次判死独立事务，不持 sequences 锁继续领下一个 Ticket。ask 由当前请求领取，后台不重放问答；请求中断可能留下可查询的 pending Ticket，超时 running 记录可回收，但不自动向不存在的请求投递。
+- 上传 note 提交与 intake 是两个事务。提交后 intake 异常只记安全摘要、保留 202；轮询用稳定的 note_id+rev 幂等键补扫没有 Trigger 的 uploaded note，因此进程在两者之间中断也不会丢整理。已被 Policy ignore 的 Trigger 不补开 Ticket。
+- 重启 Engine、Store、连接池不会清除 Ticket；没有内存 authoritative 状态。生产 PG 先 `init-db`，服务启动不并发建表（INV-9）。
 
-边界规则（沿用映射 §3）：`api/*` 只 `engine.receive`/读模型；`policy/*` 是唯一
-准入与主动强度来源；`workers/*` 只 `report` 回 Engine；`memory/*` 是 Worker 的
-工具端口。
+## 旧代码去向
 
-## 3. 与现网契约/不变量的关系
+生产 POST/PATCH **不 enqueue extract**。整理实现已迁入 `workers/extract_impl.py`，生产 OrganizeWorker 只调用计算工具，结果经 Engine/Channel 落库。`pipeline/extract.py` 仅是历史 import alias，供旧数据库中 extract 行的排空与既有 Job 租约回归；它不是生产 Worker 的 facade，也不是编排入口。`pipeline/runner.py` 只处理 Memory 同步及历史行，不能创建新整理 Ticket。
 
-- `/v1/notes` 的 202、幂等字段（`note_id/status/rev`）完全不变；幂等重放与
-  IntegrityError 分支**不触发**领域钩子（只有成功创建路径调用）。
-- 钩子在 `session.commit()` **之后**调用：纯内存、同步、无锁、无外部服务，
-  不进入 INV-1 的锁序故事；`submit_note_uploaded` 吞掉一切异常（只记
-  `safe_error_text` 安全摘要，INV-14），绝不把 202 变 500。
-- 现有 `enqueue("extract")` 保留，engine 旁路**不再 enqueue**（不双跑）。
-- `app/pipeline/*`、`app/jobs/*` 一行未删；`scripts/check-invariants.py` 全绿。
+旧队列回归显式插入历史 extract 行，继续验证原有 lease/判死/并发保护；生产集成测试读取 `SaWorkItem` 并验证无 extract jobs。`tests/runtime_driver.py` 是有限轮询的集成测试驱动，与生产进程入口的 Runtime + Memory 两个轮询面一致。
 
-## 4. 本地跑法（零外部密钥）
+## 本地验证
 
 ```bash
 cd server
-python3 -m venv .venv
-.venv/bin/pip install -r requirements-dev.txt
-cp .env.example .env          # 默认 LLM_PROVIDER=mock、MEMORY_BACKEND=inmemory、SQLite
-.venv/bin/python -m pytest    # 全量；领域骨架：.venv/bin/python -m pytest tests/test_domain_engine.py
+.venv/bin/python -m app.cli init-db
+.venv/bin/uvicorn app.main:app --no-access-log
+# 另一个终端（SQLite 的 inmemory Memory 仅供开发；生产 PG 用 mem0/disabled）
+.venv/bin/python -m app.jobs.worker
+.venv/bin/python -m pytest
+.venv/bin/ruff check app tests
 cd ..
 python3 scripts/check-invariants.py
 ```
 
-密钥只放本地 `.env`（模板 `server/.env.example`），不进仓。
+设 `TEST_DATABASE_URL` 后同一测试套件在 PG 上运行。`test_concurrent_intake_and_claim_single_assignment` 真并发独立 Engine/会话验证幂等与 CAS，`test_late_organize_output_fenced_after_expiry` 验证迟到有效结果不能复活已判死的笔记；原有 PG PATCH/DELETE 锁序与单连接池问答回归保留。
 
-## 5. 已知限制（不构成承诺）
+## 本刀未做
 
-- Engine 是**进程内内存态**：多进程（uvicorn 多 worker / 独立 job worker）间
-  不可见，重启即空。可观测性目前只能进程内查询（测试与将来 ops 页用）。
-- 生产上 Ticket 停在 `pending`：真正执行仍由 jobs 队列完成，WorkItem 状态与
-  job 状态**暂不同步**（第一刀刻意不双跑的代价；PR-5/6 的 Effects + PG 持久化
-  收口）。
-- `VoiceIngress` 是占位：S1 语音仍经端侧转写走 `POST /v1/notes`（即
-  HttpApiSource 链路），端侧直连留后续刀。
-- `accept_mode=observe`：只整理与「建议」提醒，不自动建系统闹钟、不外发。
+不部署、不自动合并；Android UI、完整 Subscription、Panel、多 agent、电脑操控、外部通知、系统闹钟、独立 Watchdog 均不在本刀。`auto` 只是版本化 Policy 权限模式，本刀没有主动执行器。并发安全与持久化是当前骨架，不是后续承诺。

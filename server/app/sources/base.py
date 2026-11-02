@@ -31,10 +31,18 @@ class Source:
 
     kind: str = ""
 
-    def note_uploaded(
+    async def note_uploaded(
         self, engine: Engine, *, user_id: str, note_id: str, rev: int
     ) -> Receipt:
         """笔记上传事件 → engine.receive（VoiceIngress/HttpApiSource 共用）。"""
-        return engine.receive(
+        return await engine.receive(
             build_note_uploaded_trigger(self.kind, user_id=user_id, note_id=note_id, rev=rev)
         )
+
+    async def ask_requested(self, engine: Engine, *, user_id: str, payload: dict) -> Receipt:
+        request_id = new_id("ask")
+        return await engine.receive(Trigger(
+            id=new_id("trg"), kind="ask_requested", source=self.kind,
+            dedupe_key=f"ask:{user_id}:{request_id}", user_id=user_id,
+            payload=payload, occurred_at=utcnow(), thread_key=f"ask:{user_id}:{request_id}",
+        ))
