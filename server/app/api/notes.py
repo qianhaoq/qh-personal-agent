@@ -26,6 +26,7 @@ from app.errors import ApiError
 from app.jobs.queue import enqueue
 from app.models import Note, Reminder
 from app.schemas import NoNulStr, NoteCreate, NotePatch, note_to_dict
+from app.sources import submit_note_uploaded
 from app.timeutil import to_utc, utcnow
 
 router = APIRouter(prefix="/v1/notes", tags=["notes"])
@@ -102,6 +103,11 @@ async def create_note(
         if existing is None:
             raise
         return {"note_id": existing.id, "status": existing.status, "rev": existing.rev}
+    # Super-agent 旁路（docs/architecture-superagent.md）：提交成功后把
+    # NoteUploaded 交给领域引擎。纯内存同步、不跑 LLM、不上锁；上面的
+    # enqueue("extract") 保持不动（现网兼容，不双跑）——Ticket 由 Engine
+    # 路径的 Worker facade 消化。幂等重放分支（早退/IntegrityError）不触发
+    submit_note_uploaded(user_id=user_id, note_id=note.id, rev=1)
     return {"note_id": note.id, "status": note.status, "rev": note.rev}
 
 

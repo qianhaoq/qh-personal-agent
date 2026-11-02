@@ -18,6 +18,7 @@
 - [产品原型 v1](docs/product-prototype-v1.md) · [v2](docs/product-prototype-v2.md)
 - [设计 v1](docs/design-v1.md) · [v2](docs/design-v2.md)
 - [技术架构](docs/tech-arch-v1.md) · [AI-native 架构](docs/ai-native-arch.md)
+- [Super-agent 概念映射](docs/superagent-concept-mapping.md) · [Super-agent 架构](docs/architecture-superagent.md)（重写进行中：领域骨架 `server/app/{domain,policy,sources,workers}` 与现网 pipeline 双路径并行）
 - [合并门禁](docs/MERGE_GATES.md)
 
 ## 开发与合并
