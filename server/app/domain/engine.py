@@ -23,7 +23,6 @@ from app.domain.model import (
     TRIGGER_NOTE_UPLOADED,
     WORK_ITEM_ORGANIZE_NOTE,
     WORK_ITEM_PENDING,
-    Decision,
     DomainEvent,
     Receipt,
     Thread,
