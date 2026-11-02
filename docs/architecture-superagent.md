@@ -1,6 +1,6 @@
 # Super-agent Runtime（当前实现）
 
-钱浩要求的干净理想态重写，分支 `feat/superagent-clean-runtime`。本刀**替代 #23/#25 的增量路线**；不延续内存 Engine + pipeline facade，不 cherry-pick S2/S3。产品仍是个人语音随手记、建议提醒、记忆问答，Android 与 `/v1/auth|notes|sync|ask` 的 HTTP 形状保留。
+钱浩要求的干净理想态重写，分支 `feat/superagent-subscription-channel`（基线 #26 clean runtime）。本刀**替代 #23/#25 的增量路线**；不延续内存 Engine + pipeline facade，不 cherry-pick S2/S3。产品仍是个人语音随手记、建议提醒、记忆问答，Android 与 `/v1/auth|notes|sync|ask` 的 HTTP 形状保留。
 
 ## 当前数据流
 
@@ -24,7 +24,7 @@ POST /v1/ask
   → Engine.complete → Channel → 持久 result → 同请求返回 answer/citations
 ```
 
-LLM 与 Memory 都是 Worker 工具端口。Engine 是 Runtime 状态的唯一写入口，Channel 是 Engine 调用的统一结果出口。Worker 不直接发通知、不设置系统闹钟。默认 `PersonalPolicy v1 / observe` 只授权整理与建议提醒，显式问答只授权检索和回答。
+LLM 与 Memory 都是 Worker 工具端口。Engine 是 Runtime 状态的唯一写入口，Channel 是 Engine 调用的统一结果出口（含 sync 可见 `actions[]`）。Worker 不直接发通知、不设置系统闹钟。默认 `PersonalPolicy v1 / observe` 只授权整理与建议提醒；用户确认后 Channel 才产出 `schedule_reminder` action。显式问答只授权检索和回答。
 
 ## 模块地图
 
@@ -39,7 +39,9 @@ LLM 与 Memory 都是 Worker 工具端口。Engine 是 Runtime 状态的唯一�
 | `app/workers/organize.py` | 认领整理 Ticket、调用工具、向 Engine report |
 | `app/workers/extract_impl.py` | 整理快照、prompt、解析/清洗、Channel 使用的写适配器 |
 | `app/workers/answer.py` | 问答 Ticket 同请求执行、Memory/LLM 调用、Engine report |
-| `app/domain/channel.py` | SyncChannel：受 Assignment fence 保护的 note/建议提醒写回，或持久 ask result 返回 |
+| `app/domain/channel.py` | SyncChannel：note/建议提醒写回、Subscription 激活、确认后 `schedule_reminder` action；Worker 禁止直推端侧副作用 |
+| `app/models.py::SaSubscription/SaChannelAction` | 订阅与 sync 可见 Channel actions；CAS/幂等 dedupe |
+| `app/api/reminders.py` | `POST /v1/reminders/{id}/confirm` 薄适配 → Trigger → Engine 订阅直通 |
 | `app/pipeline/memory_sync.py` | Memory 端口同步执行体，原有收敛/租约补偿协议保留 |
 | `app/jobs/worker.py` | 进程入口：先轮询 Runtime，再轮询独立 Memory 队列 |
 
@@ -77,6 +79,22 @@ python3 scripts/check-invariants.py
 
 设 `TEST_DATABASE_URL` 后同一测试套件在 PG 上运行。`test_concurrent_intake_and_claim_single_assignment` 真并发独立 Engine/会话验证幂等与 CAS，`test_late_organize_output_fenced_after_expiry` 验证迟到有效结果不能复活已判死的笔记；原有 PG PATCH/DELETE 锁序与单连接池问答回归保留。
 
+## 提醒确认契约（本刀）
+
+```text
+整理完成（observe）
+  → Channel.apply_output：suggested reminders + SaSubscription(thread=note:{id}, kind=reminder_confirm)
+  → sync：reminders status=suggested；**无** actions/schedule_reminder
+
+POST /v1/reminders/{id}/confirm   body?: { fire_at?, title? }
+  → Trigger user_confirmed_reminder（dedupe_key 幂等）
+  → Engine：active Subscription 直通原 organize WorkItem（不 Eval、不开新 Ticket）
+  → Channel.confirm_reminder：reminder suggested→scheduled + SaChannelAction(type=schedule_reminder)
+  → sync：reminders status=scheduled + actions[]（端侧日后可消费为 AlarmManager；本刀不实装）
+```
+
+响应：`{ reminder, action, work_item_id, duplicate }`。重复同 body 确认 `duplicate=true` 且 action id 不变。
+
 ## 本刀未做
 
-不部署、不自动合并；Android UI、完整 Subscription、Panel、多 agent、电脑操控、外部通知、系统闹钟、独立 Watchdog 均不在本刀。`auto` 只是版本化 Policy 权限模式，本刀没有主动执行器。并发安全与持久化是当前骨架，不是后续承诺。
+不部署、不自动合并；Android AlarmManager / UI、Panel、多 agent、电脑操控、外部推送、独立 Watchdog、删尽 pipeline alias 均不在本刀。`auto` 仍无主动执行器。

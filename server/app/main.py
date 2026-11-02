@@ -98,12 +98,13 @@ def create_app() -> FastAPI:
             )
 
     # 路由注册（放在 app 创建之后，避免路由 handlers 早于 app 定义）
-    from app.api import ask, auth, notes, sync
+    from app.api import ask, auth, notes, reminders, sync
 
     app.include_router(auth.router)
     app.include_router(notes.router)
     app.include_router(sync.router)
     app.include_router(ask.router)
+    app.include_router(reminders.router)
 
     # 第三方 HTTP 客户端库的 logger 钉 >= WARNING（INV-14 框架层，threads9）；
     # worker 进程在 app/jobs/worker.py 的 basicConfig 之后另行调用

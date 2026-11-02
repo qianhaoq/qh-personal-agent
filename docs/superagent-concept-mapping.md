@@ -21,12 +21,12 @@ dsh 面向 GitHub/Feishu coding 协作；本产品面向钱浩个人语音随手
 | Assignment | Ticket 内 worker_id/locked_at/attempts | 每次执行唯一 token；claim 条件 UPDATE，report 带 running+owner CAS |
 | Engine / Router | `domain/engine.py` | Runtime 状态唯一写入口；不含主路径 dict；report 后统一 Channel 出口 |
 | Worker / Executor | OrganizeNoteWorker、AnswerAskWorker | 事务外 LLM/Memory 工具；只向 Engine report，不能直接通知 |
-| Channel | SyncChannel | Engine fenced 事务中写 note/建议提醒/增量 seq；ask 返回持久 result |
+| Channel | SyncChannel + `SaChannelAction` | 写 note/建议提醒/订阅；确认后 sync 可见 `schedule_reminder`；ask 返回持久 result |
 | Store | `domain/store.py` + SQLAlchemy models | SQLite/PG 同实现，create_all/init-db 自动注册 |
 | Effects / 恢复调度 | `runtime.py` 数据库轮询 | 缺 intake 补扫、pending 认领、过期 Assignment 恢复、整理失败重试 |
 | Memory | `memory/*` + 独立 memory_sync job | 仅工具端口；按 note_id/source_rev 收敛，mem0 infer=False |
 | observe | PersonalPolicy 默认模式 | 只整理+建议；不静默建系统闹钟，不外发 |
-| Subscription / Watchdog / Panel | 本刀未实现 | 不用占位代码冒充完整交付 |
+| Subscription（提醒确认） | `SaSubscription` + `POST /v1/reminders/{id}/confirm` | 直通原 WorkItem，不经 Eval；Watchdog/Panel 仍未做 |
 
 ## 当前链路
 
@@ -51,4 +51,4 @@ dsh 面向 GitHub/Feishu coding 协作；本产品面向钱浩个人语音随手
 
 ## 保留与未做
 
-保留 FastAPI + SQLAlchemy + Postgres/pgvector（SQLite 单测）、Memory/LLM 端口、原生 Kotlin 客户端、原有 API 安全与同步协议。不开 auto-merge、不部署、不改 Android；完整 Subscription、多 agent、电脑操控、Panel、主动系统闹钟均未做。目标骨架就是当前实现；没有“之后再持久化”的阶段安排。
+保留 FastAPI + SQLAlchemy + Postgres/pgvector（SQLite 单测）、Memory/LLM 端口、原生 Kotlin 客户端、原有 API 安全与同步协议。不开 auto-merge、不部署、不改 Android；提醒确认 Subscription + Channel actions 已落地；多 agent、电脑操控、Panel、Android AlarmManager 实装仍未做。目标骨架就是当前实现；没有“之后再持久化”的阶段安排。

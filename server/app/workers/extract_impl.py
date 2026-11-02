@@ -240,8 +240,13 @@ async def _apply_extraction(
 
 
 async def apply_output(session: AsyncSession, note_id: str, enqueued_rev: int | None,
-                       snapshot: _NoteSnapshot, extraction: dict) -> bool:
-    """Channel-only write adapter; caller owns Assignment fence and transaction."""
+                       snapshot: _NoteSnapshot, extraction: dict,
+                       work_item=None) -> bool:
+    """Channel-only write adapter; caller owns Assignment fence and transaction.
+
+    Optional work_item: when suggested reminders are written, upsert the
+    reminder_confirm Subscription before allocate_seq (INV-1).
+    """
     settings = get_settings()
     stmt = select(Note).where(Note.id == note_id)
     if is_postgres():
@@ -309,7 +314,10 @@ async def apply_output(session: AsyncSession, note_id: str, enqueued_rev: int | 
         note_id=note.id,
         dedupe_pending=True,
     )
-    # 业务行（note → reminders → jobs）的 UPDATE/INSERT 全部先 flush
+    if work_item is not None and fresh_rows:
+        from app.domain.channel import SyncChannel
+        await SyncChannel()._upsert_subscription(session, work_item)
+    # 业务行（note → reminders → jobs → subscriptions）的 UPDATE/INSERT 全部先 flush
     # 落定、拿到行锁，之后才 allocate_seq：sequences 必须是本事务最后
     # 一把锁（全局加锁顺序规则，见 app.common.allocate_seq）。反过来
     # （先 allocate_seq 再锁 note）会与 PATCH 的“先条件 UPDATE note”

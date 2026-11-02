@@ -160,6 +160,19 @@ def reminder_to_dict(r: Reminder) -> dict:
         "updated_at": to_iso(r.updated_at),
     }
 
+def action_to_dict(a) -> dict:
+    """Serialize SaChannelAction for sync / confirm responses."""
+    from app.timeutil import to_iso
+    return {
+        "id": a.id,
+        "type": a.type,
+        "payload": a.payload or {},
+        "work_item_id": a.work_item_id,
+        "reminder_id": a.reminder_id,
+        "created_at": to_iso(a.created_at),
+    }
+
+
 
 def _check_timezone(value: str | None) -> str | None:
     """timezone 必须是合法 IANA 时区名且长度 <= 64，否则 422。"""

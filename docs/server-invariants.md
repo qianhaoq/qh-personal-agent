@@ -49,7 +49,7 @@ Memory 写删仍只经 memory_sync，终态记忆 == f(note 终态)，metadata={
 
 **陈述**：
 
-1. 同一写事务内，业务行锁按固定顺序获取：**invite → user → device → refresh_tokens → note → reminders → jobs**（refresh_tokens 只被 auth 路径触碰，且永远排在 device 之后，见 INV-8）。
+1. 同一写事务内，业务行锁按固定顺序获取：**invite → user → device → refresh_tokens → note → reminders → sa_subscriptions → sa_channel_actions → jobs**（refresh_tokens 只被 auth 路径触碰，且永远排在 device 之后，见 INV-8）。
 2. 所有业务行的 INSERT/UPDATE（**含 job 行的 INSERT**，修 C2）显式 flush 落定之后，`allocate_seq`（sequences 行锁）必须是提交前获取的**最后一把锁**；change_seq 由其后的第二条 UPDATE 写回（行锁已持有，不新获取）。不得依赖 ORM autoflush 隐式落序。
 3. **API/业务路径对既存 job 行只有 INSERT（`ON CONFLICT DO NOTHING`），永远不 UPDATE 既存 job 行**；既存 job 行的 UPDATE 只允许出现在队列内部（`app/jobs/queue.py` 的 claim / finalize / 回收判死路径；threads15 起两类 job 写回前的租约复核也统一走 `queue.lease_still_held`——对 job 行只取 FOR UPDATE 读锁、不 UPDATE，锁序同向 jobs → note，不破坏本条），这些路径对业务行的加锁序列固定为 **jobs → note（仅失败标记）→ sequences → change_seq 写回**，不碰 reminders/device。因此「业务路径」与「队列路径」的锁序单向不相交，全库无环。**claim 循环里判死路径的转移必须即时提交（threads11 P1，queue.py:182）**：`_fail_expired` 已按上序锁了 note 与 sequences 之后，循环若**不结束当前事务**继续找下一个候选，会在持有 sequences 锁的同时再去锁下一个 job/note——与并发 PATCH（先持 note 行锁、正等 sequences）构成 AB-BA，正是本条要禁的环。判死转移（job→failed + note 标记 + seq 写回）commit 落定后再进入下一轮扫描；连带契约：`claim_next` 可能中途 commit，调用方不得把它包在 `session.begin()` 上下文管理器里继续用同一事务（runner `_claim_one` 在 claim 上下文退出后自行提交领取写入）。
 4. 事务边界内不得调用 LLM / 记忆后端 / 任何外部网络服务（既有规则，保留）。
