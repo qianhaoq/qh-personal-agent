@@ -57,10 +57,14 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
     var draft by mutableStateOf(""); private set
     var question by mutableStateOf("")
     private var pending: NoteCreate? = null
-    private fun clearSession() {
+    private fun clearUi() {
         notes = emptyList(); reminders = emptyList(); answer = null; draft = ""; question = ""; pending = null
+    }
+    private fun clearSession() {
+        // Fence first so in-flight boot/foreground sync cannot re-apply alarms.
         AppRepositories.bumpSession()
         alarms.clear()
+        clearUi()
     }
     private fun run(action: suspend () -> Unit) {
         if (busy) return
@@ -86,7 +90,7 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
         reminders = sync.reminders.sortedWith(compareBy(nullsLast()) { it.fire_at })
         notes = repo.notes()
     }
-    fun login() = run { repo.login(invite); invite = "" }
+    fun login() = run { repo.login(invite); AppRepositories.bumpSession(); invite = "" }
     fun reload() = run { refresh() }
     fun confirmReminder(reminder: ReminderDto) = run {
         val confirmed = repo.confirmReminder(reminder.id, reminder.rev)
@@ -101,11 +105,11 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
     }
     fun ask() = run { answer = null; answer = repo.ask(question) }
     fun logout() = run {
-        // Bump generation and clear alarms before network logout so in-flight boot cannot re-arm.
+        // Bump generation + clear alarms before network logout so in-flight boot cannot re-arm.
         AppRepositories.bumpSession()
         alarms.clear()
         try { repo.logout() }
-        finally { clearSession() }
+        finally { clearUi() }
     }
 }
 @Composable

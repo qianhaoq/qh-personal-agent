@@ -23,9 +23,8 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 
 private const val ALARM_PREFS = "pending_reminder_alarms"
@@ -33,7 +32,8 @@ private const val ALARM_ACTION = "dev.qh.agent.action.REMINDER_ALARM"
 private const val EXTRA_REMINDER_ID = "reminder_id"
 private const val EXTRA_TITLE = "title"
 private const val NOTIFICATION_CHANNEL = "reminders"
-private const val BOOT_SYNC_BUDGET_MS = 8_000L
+// Soft budget for optional post-boot network sync (does not hold the broadcast).
+private const val BOOT_SYNC_BUDGET_MS = 10_000L
 private data class PendingReminder(val actionId: String, val reminderId: String,
     val title: String, val triggerAt: Long)
 
@@ -53,7 +53,7 @@ class ReminderAlarmScheduler(context: Context) {
         response.action?.let(::schedule) ?: schedule(response.reminder)
     }
     fun restore() = pending().forEach(::setAlarm)
-    fun fired(reminderId: String) { prefs.edit().remove(key(reminderId)).apply() }
+    fun fired(reminderId: String) { cancelReminder(reminderId) }
     fun clear() {
         pending().forEach(::cancel)
         prefs.edit().clear().apply()
@@ -76,11 +76,10 @@ class ReminderAlarmScheduler(context: Context) {
     }
     private fun setAlarm(reminder: PendingReminder) {
         val now = System.currentTimeMillis()
-        val alreadyPending = prefs.contains(key(reminder.reminderId))
-        // Historical action with no local pending: skip. Do not treat overdue as already fired.
-        if (reminder.triggerAt <= now && !alreadyPending) return
-        // Overdue but still pending (inexact/Doze): re-schedule soon; keep prefs.
-        val triggerAt = if (reminder.triggerAt <= now) now else reminder.triggerAt
+        // Historical sync actions must not create alarms, but a locally persisted pending
+        // alarm may still be waiting for inexact/Doze delivery even after triggerAt.
+        if (reminder.triggerAt <= now && !prefs.contains(key(reminder.reminderId))) return
+        val triggerAt = maxOf(reminder.triggerAt, now)
         prefs.edit().putString(key(reminder.reminderId), JSONObject()
             .put("action_id", reminder.actionId).put("reminder_id", reminder.reminderId)
             .put("title", reminder.title).put("trigger_at", reminder.triggerAt).toString()).apply()
@@ -124,7 +123,8 @@ class ReminderAlarmScheduler(context: Context) {
 
 class ReminderAlarmReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        if (SecureTokens(context).read() == null) return
+        // Drop delivery if the user already signed out (session fence).
+        if (SecureTokens(context.applicationContext).read() == null) return
         val reminderId = intent.getStringExtra(EXTRA_REMINDER_ID) ?: return
         val title = intent.getStringExtra(EXTRA_TITLE).orEmpty().ifBlank { "随记提醒" }
         ReminderAlarmScheduler(context).fired(reminderId)
@@ -152,32 +152,25 @@ class ReminderAlarmReceiver : BroadcastReceiver() {
 class ReminderBootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != Intent.ACTION_BOOT_COMPLETED || (BuildConfig.DEBUG && BuildConfig.USE_MOCK_API)) return
-        val pendingResult = goAsync()
         val appContext = context.applicationContext
+        val scheduler = ReminderAlarmScheduler(appContext)
+        // Bound broadcast work: restore local alarms immediately; never wait on network here.
+        scheduler.restore()
+        val generation = AppRepositories.sessionGeneration()
+        // Network sync is best-effort background work outside the broadcast lifetime.
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
-            val scheduler = ReminderAlarmScheduler(appContext)
             try {
                 val repository = AppRepositories.real(appContext)
                 if (!repository.signedIn) return@launch
-                val generation = AppRepositories.sessionGeneration()
-                // Local prefs first so reboot never waits on network to restore alarms.
-                scheduler.restore()
-                try {
-                    withTimeout(BOOT_SYNC_BUDGET_MS) {
-                        val sync = repository.sync()
-                        AppRepositories.ifCurrent(generation) {
-                            if (repository.signedIn) scheduler.consume(sync)
-                        }
-                    }
-                } catch (_: TimeoutCancellationException) {
-                    // Keep local restore only; do not block finish on unbounded sync.
-                } catch (error: CancellationException) {
-                    throw error
-                } catch (_: Exception) {
-                    // A boot without connectivity must not discard alarms already persisted on device.
+                if (generation != AppRepositories.sessionGeneration()) return@launch
+                val response = withTimeoutOrNull(BOOT_SYNC_BUDGET_MS) { repository.sync() } ?: return@launch
+                AppRepositories.ifCurrent(generation) {
+                    if (repository.signedIn) scheduler.consume(response)
                 }
-            } finally {
-                pendingResult.finish()
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                // A boot without connectivity must not discard alarms already persisted on device.
             }
         }
     }

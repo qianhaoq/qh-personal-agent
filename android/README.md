@@ -63,7 +63,7 @@ api.useMock=false
    因此可以按 action 墓碑找到并取消闹钟。
 4. 尚未触发的提醒以 action/reminder id、标题和触发时间保存在应用私有
    SharedPreferences；触发或退出登录时清除。开机后真实模式若本地会话仍有效，
-   先本地 restore 持久化闹钟，再以约 8 秒总预算尝试网络 sync；超时只保留本地重放。
+   先本地 restore 持久化闹钟（不占用广播生命周期等网络），再在后台以约 10 秒预算尝试 sync；超时只保留本地重放。
    仍 pending 的过期闹钟会立即重设，无本地记录的历史 action 则跳过（不当作已响）。
    前台与开机共用 AppRepositories 单例仓库与会话代际；sync 分页按 id 合并并应用墓碑。
    mock 没有跨进程会话，开机任务会跳过。
@@ -139,3 +139,6 @@ JAR SHA-256：`cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8`
 debug 允许明文、应用禁用备份。未运行模拟器/真机、Keystore instrumentation
 或连接实际服务的端到端测试。
 
+会话与同步安全：前台与开机共用 `AppRepositories.real`（进程级单例仓库，同一 Mutex），
+并以 session generation 栅栏防止 logout 后在途 boot sync 再设闹钟。分页 sync 按 ID 合并，
+后页覆盖前页，并应用 deleted 墓碑剔除。
