@@ -29,6 +29,41 @@ class RepositoryTest {
         try { repo.ask("x".repeat(2001)); fail("Expected validation") } catch (_: IllegalArgumentException) { }
         assertTrue(repo.notes().isEmpty())
     }
+    @Test fun mockSyncConfirmPaginationAndDeletedChanges() = runBlocking {
+        val repo = MockRepository(seedOnLogin = false); repo.login("demo")
+        assertTrue(repo.sync().let { it.cursor == 0L && it.reminders.isEmpty() && it.actions.isEmpty() })
+        val seeded = repo.seedReminder("吃药", "2099-01-01T00:00:00Z")
+        val initial = repo.sync()
+        assertEquals("suggested", initial.reminders.single().status)
+        assertTrue(repo.sync(initial.cursor).let {
+            it.cursor == initial.cursor && it.reminders.isEmpty() && it.actions.isEmpty() &&
+                it.deleted.actions.isEmpty() && it.deleted.reminders.isEmpty()
+        })
+        val confirmed = repo.confirmReminder(seeded.id, seeded.rev)
+        assertEquals("scheduled", confirmed.reminder.status)
+        assertEquals(2, confirmed.reminder.rev)
+        assertFalse(confirmed.duplicate)
+        assertEquals("schedule_reminder", confirmed.action?.type)
+        assertEquals(seeded.id, confirmed.action?.reminder_id)
+        val delta = repo.sync(initial.cursor)
+        assertEquals("scheduled", delta.reminders.single().status)
+        assertEquals(confirmed.action?.id, delta.actions.single().id)
+        assertTrue(delta.deleted.actions.isEmpty())
+        val duplicate = repo.confirmReminder(seeded.id, confirmed.reminder.rev)
+        assertTrue(duplicate.duplicate)
+        assertEquals(confirmed.action?.id, duplicate.action?.id)
+        assertTrue(repo.sync(delta.cursor).actions.isEmpty())
+        repo.deleteAction(confirmed.action!!.id)
+        val deletedAction = repo.sync(delta.cursor)
+        assertEquals(listOf(confirmed.action!!.id), deletedAction.deleted.actions)
+        assertTrue(deletedAction.actions.isEmpty())
+        repo.deleteReminder(seeded.id)
+        val deletedReminder = repo.sync(deletedAction.cursor)
+        assertEquals(listOf(seeded.id), deletedReminder.deleted.reminders)
+        assertTrue(deletedReminder.reminders.isEmpty())
+        repo.logout()
+        try { repo.sync(); fail("Expected session error") } catch (_: SessionExpired) { }
+    }
     private class Store : TokenStore {
         var tokens: Tokens? = null
         override fun read() = tokens
@@ -101,6 +136,68 @@ class RepositoryTest {
             assertFalse(repo.signedIn); assertEquals(2, server.requestCount)
         }
     }
+    @Test fun retrofitSyncPaginationAndReminderConfirmContract() = runBlocking {
+        MockWebServer().use { server ->
+            server.start(); val store = Store().apply { tokens = Tokens("access", "refresh", 900, "u1") }
+            val repo = RealRepository(realApi(server.url("/").toString()), store)
+            server.json("""{"cursor":4,"notes":[],"reminders":[{"id":"r1","note_id":"n1","title":"吃药","fire_at":"2099-01-01T00:00:00Z","rrule":null,"status":"suggested","rev":1,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}],"actions":[],"deleted":{"notes":[],"reminders":[],"actions":[]},"has_more":true}""")
+            server.json("""{"cursor":8,"notes":[],"reminders":[],"actions":[{"id":"a1","type":"schedule_reminder","payload":{"reminder_id":"r1","note_id":"n1","title":"吃药","fire_at":"2099-01-01T00:00:00Z","work_item_id":"w1","rev":2},"work_item_id":"w1","reminder_id":"r1","created_at":"2026-01-01T00:00:00Z","unknown":"ignored"}],"deleted":{"notes":["n0"],"reminders":[],"actions":[]},"has_more":false}""")
+            val synced = repo.sync(since = 0, limit = 2)
+            assertEquals(8, synced.cursor)
+            assertEquals("r1", synced.reminders.single().id)
+            assertEquals("a1", synced.actions.single().id)
+            assertEquals("w1", synced.actions.single().payload["work_item_id"])
+            assertEquals(listOf("n0"), synced.deleted.notes)
+            assertFalse(synced.has_more)
+            val first = server.takeRequest()
+            assertEquals("GET", first.method); assertEquals("/v1/sync?since=0&limit=2", first.path)
+            assertEquals("Bearer access", first.getHeader("Authorization"))
+            assertEquals("/v1/sync?since=4&limit=2", server.takeRequest().path)
+            server.json("""{"reminder":{"id":"r1","note_id":"n1","title":"吃药（晚上）","fire_at":"2099-01-01T01:00:00Z","rrule":null,"status":"scheduled","rev":3,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"},"action":{"id":"a1","type":"schedule_reminder","payload":{"reminder_id":"r1","note_id":"n1","title":"吃药（晚上）","fire_at":"2099-01-01T01:00:00Z","work_item_id":"w1","rev":3},"work_item_id":"w1","reminder_id":"r1","created_at":"2026-01-01T00:00:00Z"},"work_item_id":"w1","duplicate":false}""")
+            val confirmed = repo.confirmReminder("r1", 3, "2099-01-01T01:00:00Z", "吃药（晚上）")
+            assertEquals("scheduled", confirmed.reminder.status)
+            assertEquals("a1", confirmed.action?.id)
+            val confirm = server.takeRequest()
+            assertEquals("POST", confirm.method); assertEquals("/v1/reminders/r1/confirm", confirm.path)
+            assertEquals("Bearer access", confirm.getHeader("Authorization"))
+            val body = JsonParser.parseString(confirm.body.readUtf8()).asJsonObject
+            assertEquals(3, body["rev"].asInt)
+            assertEquals("2099-01-01T01:00:00Z", body["fire_at"].asString)
+            assertEquals("吃药（晚上）", body["title"].asString)
+        }
+    }
+    @Test fun syncKeepsLatestReminderAcrossPages() = runBlocking {
+        MockWebServer().use { server ->
+            server.start()
+            val store = Store().apply { tokens = Tokens("access", "refresh", 900, "u1") }
+            val repo = RealRepository(realApi(server.url("/").toString()), store)
+            server.json(syncPage(1, "[" + reminderJson("r1", 1, "Old") + "]", more = true))
+            server.json(syncPage(2, "[" + reminderJson("r1", 2, "Latest") + "]"))
+            val result = repo.sync()
+            assertEquals(2L, result.cursor)
+            assertFalse(result.has_more)
+            assertEquals("r1", result.reminders.single().id)
+            assertEquals(2, result.reminders.single().rev)
+            assertEquals("Latest", result.reminders.single().title)
+        }
+    }
+    @Test fun syncRemovesReminderWhenLaterPageContainsTombstone() = runBlocking {
+        MockWebServer().use { server ->
+            server.start()
+            val store = Store().apply { tokens = Tokens("access", "refresh", 900, "u1") }
+            val repo = RealRepository(realApi(server.url("/").toString()), store)
+            server.json(syncPage(1, "[" + reminderJson("r1", 1) + "]", more = true))
+            server.json(syncPage(2, "[]", deleted = """["r1"]"""))
+            val result = repo.sync()
+            assertTrue(result.reminders.isEmpty())
+            assertEquals(listOf("r1"), result.deleted.reminders)
+        }
+    }
+    private fun reminderJson(id: String, rev: Int, title: String = "提醒") =
+        """{"id":"$id","note_id":"n1","title":"$title","fire_at":"2099-01-01T00:00:00Z","rrule":null,"status":"suggested","rev":$rev,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"""
+    private fun syncPage(cursor: Long, reminders: String, deleted: String = "[]", more: Boolean = false) =
+        """{"cursor":$cursor,"notes":[],"reminders":$reminders,"actions":[],"deleted":{"notes":[],"reminders":$deleted,"actions":[]},"has_more":$more}"""
+
     @Test fun apiErrorsHaveReadableMessage() = runBlocking {
         MockWebServer().use { server ->
             server.start(); server.json("""{"error":{"code":"forbidden","message":"邀请码已过期"}}""", 403)

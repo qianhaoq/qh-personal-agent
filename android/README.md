@@ -1,7 +1,8 @@
-# Android S1 · 随记
+# Android S2 · 随记
 
-紧凑的 Kotlin / Compose 客户端：登录、时间线、文字记事、问答；录音按钮仅作占位。
-minSdk 26，compile/targetSdk 34，JDK 17，Gradle 8.7，AGP 8.5.2。
+紧凑的 Kotlin / Compose 客户端：登录、时间线、文字记事、问答、提醒同步与确认；
+确认后的 `schedule_reminder` Channel action 会落到 AlarmManager，响铃时显示系统通知。
+录音按钮仅作占位。minSdk 26，compile/targetSdk 34，JDK 17，Gradle 8.7，AGP 8.5.2。
 
 ## 安装与运行
 
@@ -11,13 +12,16 @@ minSdk 26，compile/targetSdk 34，JDK 17，Gradle 8.7，AGP 8.5.2。
    指向 SDK，或在 **本目录** `local.properties` 设置 `sdk.dir=/absolute/path/to/sdk`。
 3. 启动模拟器，选择 `app` 的 debug variant 后 Run。默认无需服务器：debug 的
    `USE_MOCK_API=true`，任意非空字符串均可登录（例如 `demo`，不是实际邀请码）。
+4. API 33+ 首次启动会请求通知权限。若系统未授予精确闹钟权限，提醒退化为
+   `setAndAllowWhileIdle` 的非精确闹钟；需要准点触发时，可在系统设置中允许
+   「闹钟和提醒」。未声明仅限系统闹钟/日历类应用使用的 `USE_EXACT_ALARM`。
 
 从本目录运行：
 
 ```sh
 ./gradlew :app:assembleDebug
-./gradlew --no-daemon assembleDebug testDebugUnitTest
 ./gradlew :data:test                 # 纯 JVM mock / Retrofit 契约与会话测试
+./gradlew --no-daemon assembleDebug testDebugUnitTest
 ./gradlew installDebug               # 已连接设备或模拟器
 ./gradlew assembleRelease            # 未配置签名；生成 unsigned APK
 ```
@@ -47,39 +51,75 @@ api.useMock=false
 切回 mock：删除 `api.useMock=false` 或改为 `api.useMock=true`。
 `local.properties` 在构建时读取，改动后需重新构建安装。
 
+## S2 提醒闭环
+
+1. 进入时间线或点「同步」时调用 `GET /v1/sync?since=0&limit=100`，真实仓库遍历
+   `has_more` 并合并全部分页；界面显示 reminders，suggested 状态提供确认按钮。
+2. 「确认并设闹钟」调用 `POST /v1/reminders/{id}/confirm`，body 携带当前 `rev`。
+   成功后立即消费响应中的 `schedule_reminder` action 设置闹钟，再刷新列表。
+3. 同步返回的同类型 action 也会设置/更新闹钟；`deleted.actions`、
+   `deleted.reminders` 以及 done/cancelled reminder 会取消对应本地闹钟。
+   使用 reminder id 的稳定 hash 作为 requestCode，action id 同时存入本地记录，
+   因此可以按 action 墓碑找到并取消闹钟。
+4. 尚未触发的提醒以 action/reminder id、标题和触发时间保存在应用私有
+   SharedPreferences；触发或退出登录时清除。开机后真实模式若本地会话仍有效，
+   先本地 restore 持久化闹钟（不占用广播生命周期等网络），再在后台以约 10 秒预算尝试 sync；超时只保留本地重放。
+   仍 pending 的过期闹钟会立即重设，无本地记录的历史 action 则跳过（不当作已响）。
+   前台与开机共用 AppRepositories 单例仓库与会话代际；sync 分页按 id 合并并应用墓碑。
+   mock 没有跨进程会话，开机任务会跳过。
+5. 精确闹钟使用 `setExactAndAllowWhileIdle`，权限不可用或检查后被撤销时退化为
+   非精确闹钟。API 33+ 未授予通知权限时，系统闹钟仍会触发，但无法显示通知。
+
+声明权限：`INTERNET`、`POST_NOTIFICATIONS`、`RECEIVE_BOOT_COMPLETED`、
+`SCHEDULE_EXACT_ALARM`。Alarm receiver 不导出；boot receiver 仅处理
+`BOOT_COMPLETED`。Doze、厂商省电策略及用户强制停止仍可能影响实际触发。
+
 ## 模块与契约
 
-- `:app`：Compose Navigation、四个页面、ViewModel 保留旋转期间状态、手动 DI。
+- `:app`：Compose Navigation、提醒列表与确认、AlarmManager、通知、开机重放、
+  ViewModel 保留旋转期间状态、手动 DI。
 - `:data`：纯 JVM DTO、Retrofit、仓库、mock 和测试。接口核对自当前服务端
-  `app/schemas.py` 与 `app/api/{auth,notes,ask}.py`，未知响应字段由 Gson 忽略。
+  `app/schemas.py` 与 `app/api/{auth,notes,ask,sync,reminders}.py`，未知响应字段由 Gson 忽略。
 - `:core-security`：Android Keystore MasterKey + EncryptedSharedPreferences。
   access/refresh 成对保存；稳定随机设备 UUID 在退出后保留。应用禁用备份。
-- 计划模块见 `settings.gradle.kts`：`:sync`、`:feature-capture`、`:feature-asr`、
-  `:feature-entry`、`:feature-reminder`，S1 不创建空壳模块。
+- 不为 S2 新建 `:sync`、`:feature-reminder` 等空壳模块。
 
 真实路由：`POST /v1/auth/login`、`POST /v1/auth/refresh`、
-`POST /v1/auth/logout`、`POST /v1/notes`、`GET /v1/notes`、`POST /v1/ask`。
-创建使用 `client_note_id/text/recorded_at/timezone/source`，返回 `note_id/status/rev`。
-列表遍历 `next_cursor` 分页；问答使用 `text/client_time/timezone` 并显示 citations。
+`POST /v1/auth/logout`、`POST /v1/notes`、`GET /v1/notes`、`POST /v1/ask`、
+`GET /v1/sync`、`POST /v1/reminders/{id}/confirm`。
+创建记事使用 `client_note_id/text/recorded_at/timezone/source`，返回 `note_id/status/rev`。
+记事列表遍历 `next_cursor` 分页；问答使用 `text/client_time/timezone` 并显示 citations。
 受保护请求发送 Bearer；401 后串行轮换 refresh 并重试一次。刷新失败即清本地会话，
 避免不确定网络结果下重放旧 refresh 导致服务端吊销设备。没有后台刷新或无限重试。
-退出尝试服务端吊销并始终清本地会话；离线时服务端凭证可能仍有效至过期。
+退出尝试服务端吊销并始终清本地会话和闹钟；离线时服务端凭证可能仍有效至过期。
 不会记录 token、邀请码、请求正文或响应日志。
 
-## 测试与边界
+## Mock 行为与测试
 
-`:data:test` 使用 JUnit + MockWebServer：mock 登录校验、会话隔离、创建幂等、
-长度校验、固定问答；真实 Retrofit 请求字段/路径/分页/鉴权、refresh 轮换及失败清理、
-可读 API 错误。契约测试不连接真实服务，也不替代真机或服务端端到端验收。
+Mock 登录后预置「给绿植浇水」「整理周报」两个 suggested 提醒。确认会将其改为
+scheduled、bump rev，生成 `schedule_reminder` action 并推进 cursor；重复确认当前
+scheduled rev 保持幂等。mock 还维护 action/reminder 删除墓碑供增量同步测试。
+记事、提醒、actions 和 cursor 仅在当前进程内存保存，退出或进程结束后清空；
+已经设置的闹钟记录仍在私有 SharedPreferences，退出时会主动清除。
 
-Mock 仅在当前进程内存保存记事，退出或进程结束后清空；真实模式仅 token 持久化。
-尚无 Room、离线队列、后台 sync、自动轮询、编辑/删除、ASR、录音权限、提醒调度、
-推送或发布签名。后台提取完成后需手动刷新时间线。
-同一份未修改草稿在失败重试时保留 `client_note_id`，但编辑草稿会生成新 ID；
-网络结果不确定时请先刷新时间线，避免编辑后重复记录。
-页面状态可跨旋转保留，不能跨进程恢复；不保存邀请码或草稿到磁盘。
-Keystore 异常/设备 UUID 的真实持久性仍需设备测试；损坏的安装可清除应用数据后重登录。
-UI/无障碍、弱网与设备测试尚需后续验证。不要把本脚手架视为完整生产客户端。
+`:data:test` 使用 JUnit + MockWebServer：覆盖 mock 登录校验、会话隔离、创建幂等、
+长度校验、固定问答、sync 空页/确认/action 与删除墓碑；真实 Retrofit 请求字段/路径/
+分页/鉴权、confirm rev 与可选修改、refresh 轮换及失败清理、可读 API 错误。
+契约测试不连接真实服务，也不替代真机或服务端端到端验收。
+
+## 明确不做 / 边界
+
+- 不引入 FCM、Room、离线写队列、Hilt；不做 Backfill confirmation subscriptions。
+- 不修改 `server/`，不部署服务端；服务端只负责产生 sync action，不执行系统闹钟。
+- 没有自动轮询或常驻后台同步，只有进入/刷新时间线、confirm 后刷新和 boot 同步。
+- `rrule` 目前只解析不执行，闹钟均为一次性；没有提醒编辑、贪睡或重复提醒 UI。
+- 尚无编辑/删除记事、ASR、录音权限、推送或发布签名；后台提取完成后需手动同步。
+- 同一份未修改草稿在失败重试时保留 `client_note_id`，但编辑草稿会生成新 ID；
+  网络结果不确定时请先刷新时间线，避免编辑后重复记录。
+- 页面状态可跨旋转保留，不能跨进程恢复；不保存邀请码或草稿到磁盘。
+- Keystore 异常/设备 UUID 的真实持久性仍需设备测试；损坏的安装可清除应用数据后重登录。
+- UI/无障碍、弱网、通知权限、精确/非精确闹钟、Doze、开机重放仍需模拟器/真机验收。
+  不要把本脚手架视为完整生产客户端。
 
 ## Wrapper 来源
 
@@ -90,11 +130,15 @@ JAR SHA-256：`cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8`
 
 ## 本次环境验证
 
-工具链在仓库外 `/tmp/qh-android-tools`（Temurin JDK 17 + Android SDK 34）。
-已运行 `./gradlew :app:assembleDebug
-./gradlew --no-daemon assembleDebug testDebugUnitTest assembleRelease`：
-`BUILD SUCCESSFUL`；JUnit 6 tests，0 failures，0 errors，0 skipped。
-已核对合并后的 manifest：debug 允许明文、release 禁止明文，二者均禁用备份；
-生成的 BuildConfig：debug 默认 mock，release 强制真实 API。
-`python3 scripts/check-invariants.py`：0 errors / 0 warnings。
-未运行模拟器/真机、Keystore instrumentation 或连接实际服务的端到端测试。
+使用 `/home/box/.local/jdk/jdk-17.0.16+8` 与 `/home/box/.local/android-sdk`。
+`./gradlew :data:test :app:assembleDebug`：`BUILD SUCCESSFUL`。
+`./gradlew --no-daemon assembleDebug testDebugUnitTest`：`BUILD SUCCESSFUL`；
+`:data` 的 RepositoryTest 共 10 tests，0 failures / 0 errors / 0 skipped；`:app` 与
+`:core-security` 没有本地 unit test source（对应任务 `NO-SOURCE`）。
+已核对合并后的 debug manifest：S2 标签、四项权限和两个 receiver 均已注册，
+debug 允许明文、应用禁用备份。未运行模拟器/真机、Keystore instrumentation
+或连接实际服务的端到端测试。
+
+会话与同步安全：前台与开机共用 `AppRepositories.real`（进程级单例仓库，同一 Mutex），
+并以 session generation 栅栏防止 logout 后在途 boot sync 再设闹钟。分页 sync 按 ID 合并，
+后页覆盖前页，并应用 deleted 墓碑剔除。

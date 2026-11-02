@@ -1,8 +1,11 @@
 package dev.qh.agent
 
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -16,21 +19,26 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewModelScope
 import androidx.navigation.compose.*
 import dev.qh.data.*
-import dev.qh.security.SecureTokens
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
+    private val notificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // Manual DI: one repository per retained ViewModel; release cannot select the mock.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            notificationPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        }
+        // Share the real session across foreground and boot work; release cannot select the mock.
         setContent {
             MaterialTheme {
                 val model: AgentModel = viewModel(factory = object : ViewModelProvider.Factory {
                     @Suppress("UNCHECKED_CAST")
                     override fun <T : ViewModel> create(modelClass: Class<T>): T = AgentModel(
                         if (BuildConfig.DEBUG && BuildConfig.USE_MOCK_API) MockRepository()
-                        else RealRepository(realApi(BuildConfig.API_BASE_URL), SecureTokens(applicationContext))
+                        else AppRepositories.real(applicationContext),
+                        ReminderAlarmScheduler(applicationContext)
                     ) as T
                 })
                 AgentApp(model)
@@ -38,16 +46,26 @@ class MainActivity : ComponentActivity() {
         }
     }
 }
-class AgentModel(private val repo: Repository) : ViewModel() {
+class AgentModel(private val repo: Repository, private val alarms: ReminderAlarmScheduler) : ViewModel() {
     var signedIn by mutableStateOf(repo.signedIn); private set
     var busy by mutableStateOf(false); private set
     var error by mutableStateOf<String?>(null); private set
     var notes by mutableStateOf(emptyList<Note>()); private set
+    var reminders by mutableStateOf(emptyList<ReminderDto>()); private set
     var answer by mutableStateOf<Answer?>(null); private set
     var invite by mutableStateOf("")
     var draft by mutableStateOf(""); private set
     var question by mutableStateOf("")
     private var pending: NoteCreate? = null
+    private fun clearUi() {
+        notes = emptyList(); reminders = emptyList(); answer = null; draft = ""; question = ""; pending = null
+    }
+    private fun clearSession() {
+        // Fence first so in-flight boot/foreground sync cannot re-apply alarms.
+        AppRepositories.bumpSession()
+        alarms.clear()
+        clearUi()
+    }
     private fun run(action: suspend () -> Unit) {
         if (busy) return
         viewModelScope.launch {
@@ -55,14 +73,30 @@ class AgentModel(private val repo: Repository) : ViewModel() {
             try { action() }
             catch (e: CancellationException) { throw e }
             catch (e: Exception) {
-                if (!repo.signedIn) { notes = emptyList(); answer = null; draft = ""; question = ""; pending = null }
+                if (!repo.signedIn) clearSession()
                 error = readableError(e)
             }
             finally { signedIn = repo.signedIn; busy = false }
         }
     }
-    fun login() = run { repo.login(invite); invite = "" }
-    fun reload() = run { notes = repo.notes() }
+    private suspend fun refresh() {
+        val generation = AppRepositories.sessionGeneration()
+        val sync = repo.sync()
+        if (!repo.signedIn || AppRepositories.sessionGeneration() != generation) {
+            if (!repo.signedIn) clearSession()
+            return
+        }
+        alarms.consume(sync)
+        reminders = sync.reminders.sortedWith(compareBy(nullsLast()) { it.fire_at })
+        notes = repo.notes()
+    }
+    fun login() = run { repo.login(invite); AppRepositories.bumpSession(); invite = "" }
+    fun reload() = run { refresh() }
+    fun confirmReminder(reminder: ReminderDto) = run {
+        val confirmed = repo.confirmReminder(reminder.id, reminder.rev)
+        alarms.confirmed(confirmed)
+        refresh()
+    }
     fun updateDraft(value: String) { draft = value; pending = null }
     fun save(done: () -> Unit) = run {
         // Preserve id on uncertain network failure: retry creates at most one server note.
@@ -71,21 +105,24 @@ class AgentModel(private val repo: Repository) : ViewModel() {
     }
     fun ask() = run { answer = null; answer = repo.ask(question) }
     fun logout() = run {
+        // Bump generation + clear alarms before network logout so in-flight boot cannot re-arm.
+        AppRepositories.bumpSession()
+        alarms.clear()
         try { repo.logout() }
-        finally { notes = emptyList(); answer = null; draft = ""; question = ""; pending = null }
+        finally { clearUi() }
     }
 }
 @Composable
 fun AgentApp(model: AgentModel) {
     Surface(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().imePadding().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("随记 · S1" + if (BuildConfig.USE_MOCK_API) " / 本地演示" else " / 服务器", style = MaterialTheme.typography.headlineSmall)
+            Text("随记 · S2" + if (BuildConfig.USE_MOCK_API) " / 本地演示" else " / 服务器", style = MaterialTheme.typography.headlineSmall)
             if (model.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
             model.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             if (!model.signedIn) {
                 OutlinedTextField(model.invite, { model.invite = it }, label = { Text("邀请码") },
                     enabled = !model.busy, modifier = Modifier.fillMaxWidth(), singleLine = true)
-                Text(if (BuildConfig.USE_MOCK_API) "演示模式：输入任意非空邀请码。记事仅保留在内存中。" else "请输入服务端签发的邀请码。")
+                Text(if (BuildConfig.USE_MOCK_API) "演示模式：输入任意非空邀请码。记事与提醒仅保留在内存中。" else "请输入服务端签发的邀请码。")
                 Button(model::login, enabled = !model.busy && model.invite.isNotBlank()) { Text("登录") }
             } else {
                 val nav = rememberNavController()
@@ -100,11 +137,28 @@ fun AgentApp(model: AgentModel) {
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 Button({ nav.navigate("capture") }, enabled = !model.busy) { Text("文字记事") }
                                 Button({ nav.navigate("ask") }, enabled = !model.busy) { Text("问一问") }
-                                TextButton(model::reload, enabled = !model.busy) { Text("刷新") }
+                                TextButton(model::reload, enabled = !model.busy) { Text("同步") }
                             }
-                            if (model.notes.isEmpty() && !model.busy) Text("还没有记事，试着记录第一条。")
                             LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                                items(model.notes, key = { it.id }) { note ->
+                                item { Text("提醒", style = MaterialTheme.typography.titleMedium) }
+                                if (model.reminders.isEmpty() && !model.busy) item { Text("暂无提醒。") }
+                                items(model.reminders, key = { "reminder:${it.id}" }) { reminder ->
+                                    Card(Modifier.fillMaxWidth()) {
+                                        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                            Text(reminder.title, style = MaterialTheme.typography.titleMedium)
+                                            Text("时间：${reminder.fire_at ?: "未设置"}")
+                                            Text("状态：${reminderStatus(reminder.status)} · rev ${reminder.rev}",
+                                                style = MaterialTheme.typography.bodySmall)
+                                            if (reminder.status == "suggested") {
+                                                Button({ model.confirmReminder(reminder) },
+                                                    enabled = !model.busy && reminder.fire_at != null) { Text("确认并设闹钟") }
+                                            }
+                                        }
+                                    }
+                                }
+                                item { Text("记事", style = MaterialTheme.typography.titleMedium) }
+                                if (model.notes.isEmpty() && !model.busy) item { Text("还没有记事，试着记录第一条。") }
+                                items(model.notes, key = { "note:${it.id}" }) { note ->
                                     Card(Modifier.fillMaxWidth()) {
                                         Column(Modifier.padding(12.dp)) {
                                             note.title?.let { Text(it, style = MaterialTheme.typography.titleMedium) }
@@ -141,4 +195,11 @@ fun AgentApp(model: AgentModel) {
             }
         }
     }
+}
+private fun reminderStatus(status: String) = when (status) {
+    "suggested" -> "待确认"
+    "scheduled" -> "已确认"
+    "done" -> "已完成"
+    "cancelled" -> "已取消"
+    else -> status
 }
