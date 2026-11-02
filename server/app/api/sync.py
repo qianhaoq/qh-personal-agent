@@ -2,7 +2,7 @@
 
 一致性设计（两条不变量，任一被破坏客户端按 cursor 续拉时都会丢数据）：
 
-1. 单快照读：notes 与 reminders 的本页选择用一条 UNION ALL 查询完成
+1. 单快照读：notes / reminders / actions 的本页选择用一条 UNION ALL 查询完成
    （单语句天然一个快照），并在同一事务里按 id 补取整行。PG 下整个
    读取跑在 REPEATABLE READ 事务里，且必须另开会话：auth 依赖已经在
    请求会话上执行过查询（事务已开始），而 SET TRANSACTION 必须是
@@ -31,8 +31,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db import get_sessionmaker
 from app.deps import get_current_user_id
 from app.jobs.queue import is_postgres
-from app.models import Note, Reminder
-from app.schemas import note_to_dict, reminder_to_dict
+from app.models import Note, Reminder, SaChannelAction
+from app.schemas import action_to_dict, note_to_dict, reminder_to_dict
 
 router = APIRouter(prefix="/v1/sync", tags=["sync"])
 
@@ -55,7 +55,12 @@ async def _page_keys(
         Reminder.change_seq.label("change_seq"),
         Reminder.id.label("id"),
     ).where(Reminder.user_id == user_id, Reminder.change_seq > since)
-    merged = union_all(notes_part, reminders_part).subquery()
+    actions_part = select(
+        literal("action").label("kind"),
+        SaChannelAction.change_seq.label("change_seq"),
+        SaChannelAction.id.label("id"),
+    ).where(SaChannelAction.user_id == user_id, SaChannelAction.change_seq > since)
+    merged = union_all(notes_part, reminders_part, actions_part).subquery()
     stmt = (
         select(merged.c.kind, merged.c.change_seq, merged.c.id)
         .order_by(merged.c.change_seq, merged.c.kind)
@@ -71,12 +76,12 @@ async def sync(
     user_id: str = Depends(get_current_user_id),
     limit: int = Query(default=100, ge=1, le=500),
 ):
-    """返回 cursor 之后变化的 notes/reminders 与被删除的 id。cursor 为全局单调序列。
+    """返回 cursor 之后变化的 notes/reminders/actions 与被删除的 id。
 
-    notes 与 reminders（含软删墓碑）合并为按 change_seq 升序的单一流分页：
-    UNION ALL 在 SQL 里直接排序截断，不存在“按表各自截断后一张表的热
-    更新把另一张表的变更挤出本页”的问题（排序键全局唯一，kind 只作同
-    seq 时的稳定 tiebreaker）。
+    notes、reminders 与 Channel actions（含软删墓碑）合并为按 change_seq
+    升序的单一流分页。actions 是端侧可消费的通知/闹钟载荷（如
+    schedule_reminder）；observe 下整理不会产生 schedule/alarm，只有用户
+    确认提醒后才会出现。
     """
     maker = get_sessionmaker()
     async with maker() as session, session.begin():
@@ -85,11 +90,12 @@ async def sync(
         rows = await _page_keys(session, user_id, since, limit)
         page = rows[:limit]
         has_more = len(rows) > limit
-        # 补取整行：同一个事务（PG 下同一快照），按主键查不会漏页内记录
         note_ids = [row.id for row in page if row.kind == "note"]
         reminder_ids = [row.id for row in page if row.kind == "reminder"]
+        action_ids = [row.id for row in page if row.kind == "action"]
         notes_by_id: dict[str, Note] = {}
         reminders_by_id: dict[str, Reminder] = {}
+        actions_by_id: dict[str, SaChannelAction] = {}
         if note_ids:
             found = (
                 await session.execute(select(Note).where(Note.id.in_(note_ids)))
@@ -100,11 +106,20 @@ async def sync(
                 await session.execute(select(Reminder).where(Reminder.id.in_(reminder_ids)))
             ).scalars()
             reminders_by_id = {r.id: r for r in found}
+        if action_ids:
+            found = (
+                await session.execute(
+                    select(SaChannelAction).where(SaChannelAction.id.in_(action_ids))
+                )
+            ).scalars()
+            actions_by_id = {a.id: a for a in found}
 
     live_notes: list[dict] = []
     live_reminders: list[dict] = []
+    live_actions: list[dict] = []
     deleted_notes: list[str] = []
     deleted_reminders: list[str] = []
+    deleted_actions: list[str] = []
     for row in page:
         if row.kind == "note":
             note = notes_by_id.get(row.id)
@@ -114,7 +129,7 @@ async def sync(
                 live_notes.append(note_to_dict(note))
             else:
                 deleted_notes.append(note.id)
-        else:
+        elif row.kind == "reminder":
             reminder = reminders_by_id.get(row.id)
             if reminder is None:
                 continue
@@ -122,11 +137,24 @@ async def sync(
                 live_reminders.append(reminder_to_dict(reminder))
             else:
                 deleted_reminders.append(reminder.id)
+        else:
+            action = actions_by_id.get(row.id)
+            if action is None:
+                continue
+            if action.deleted_at is None:
+                live_actions.append(action_to_dict(action))
+            else:
+                deleted_actions.append(action.id)
 
     return {
         "cursor": page[-1].change_seq if page else since,
         "notes": live_notes,
         "reminders": live_reminders,
-        "deleted": {"notes": deleted_notes, "reminders": deleted_reminders},
+        "actions": live_actions,
+        "deleted": {
+            "notes": deleted_notes,
+            "reminders": deleted_reminders,
+            "actions": deleted_actions,
+        },
         "has_more": has_more,
     }

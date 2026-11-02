@@ -14,13 +14,22 @@ dataclass 是事务外快照；权威状态持久化于 SQLAlchemy Store。
 from dataclasses import dataclass, field
 from datetime import datetime
 
-# Trigger kind（入口事件类型；v0 只实装 note_uploaded）
+# Trigger kind（入口事件类型）
 TRIGGER_NOTE_UPLOADED = "note_uploaded"
 TRIGGER_ASK_REQUESTED = "ask_requested"
+TRIGGER_USER_CONFIRMED_REMINDER = "user_confirmed_reminder"
 
-# WorkItem kind（授权工作单元类型；v0 只实装 organize_note）
+# WorkItem kind（授权工作单元类型）
 WORK_ITEM_ORGANIZE_NOTE = "organize_note"
 WORK_ITEM_ANSWER_ASK = "answer_ask"
+
+# Subscription kind（Thread 上后续事件直通原 Ticket，不经 Eval）
+SUBSCRIPTION_REMINDER_CONFIRM = "reminder_confirm"
+SUBSCRIPTION_ACTIVE = "active"
+SUBSCRIPTION_STOPPED = "stopped"
+
+# Channel action types（端侧可消费；服务端从不执行 OS 闹钟）
+CHANNEL_ACTION_SCHEDULE_REMINDER = "schedule_reminder"
 
 # WorkItem 状态机：pending → running → done | failed
 WORK_ITEM_PENDING = "pending"

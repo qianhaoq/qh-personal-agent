@@ -12,9 +12,17 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.common import new_id
 from app.config import get_settings
-from app.domain.model import Decision, Receipt, Trigger, WorkItem
+from app.domain.model import (
+    SUBSCRIPTION_ACTIVE,
+    SUBSCRIPTION_REMINDER_CONFIRM,
+    TRIGGER_USER_CONFIRMED_REMINDER,
+    Decision,
+    Receipt,
+    Trigger,
+    WorkItem,
+)
 from app.domain.store import Store, snapshot
-from app.models import SaThread, SaTrigger, SaWorkItem
+from app.models import SaSubscription, SaThread, SaTrigger, SaWorkItem
 from app.policy import PersonalPolicy
 from app.timeutil import utcnow
 
@@ -50,8 +58,16 @@ class Engine:
                     SaTrigger.dedupe_key == trigger.dedupe_key))).one()
                 item = (await session.scalars(select(SaWorkItem).where(
                     SaWorkItem.trigger_id == original.id))).one_or_none()
+                if item is None and original.kind == TRIGGER_USER_CONFIRMED_REMINDER:
+                    item = await _subscribed_work_item(session, original.thread_key)
                 return Receipt(original.id, True, Decision(**original.decision),
                                snapshot(item) if item else None)
+
+            # Subscription fast path: confirm/modify goes to the original Ticket
+            # without Policy Eval or a new WorkItem.
+            if trigger.kind == TRIGGER_USER_CONFIRMED_REMINDER:
+                return await self._receive_subscription_confirm(session, trigger)
+
             decision = self.policy.evaluate(trigger)
             await session.execute(update(SaTrigger).where(SaTrigger.id == trigger.id)
                                   .values(decision=asdict(decision)))
@@ -163,6 +179,74 @@ class Engine:
 
     async def work_items_for_note(self, note_id: str) -> list[WorkItem]:
         return await self.store.work_items_for_note(note_id)
+
+
+    async def _receive_subscription_confirm(self, session, trigger: Trigger) -> Receipt:
+        """Fan out user_confirmed_reminder via active Subscription → Channel."""
+        sub_row = await _active_subscription(session, trigger.thread_key)
+        if sub_row is None:
+            decision = Decision(
+                outcome="ignore",
+                reason="no active reminder_confirm subscription",
+                strength="explicit",
+                would_accept=False,
+            )
+            await session.execute(update(SaTrigger).where(SaTrigger.id == trigger.id)
+                                  .values(decision=asdict(decision)))
+            return Receipt(trigger.id, False, decision, None)
+        work_row = await session.get(SaWorkItem, sub_row.work_item_id)
+        if work_row is None or work_row.user_id != trigger.user_id:
+            decision = Decision(
+                outcome="ignore",
+                reason="subscription work item unavailable",
+                strength="explicit",
+                would_accept=False,
+            )
+            await session.execute(update(SaTrigger).where(SaTrigger.id == trigger.id)
+                                  .values(decision=asdict(decision)))
+            return Receipt(trigger.id, False, decision, None)
+        action = await self.channel.confirm_reminder(
+            session,
+            work_item_id=work_row.id,
+            user_id=trigger.user_id,
+            payload=trigger.payload,
+        )
+        if action is None:
+            decision = Decision(
+                outcome="ignore",
+                reason="reminder confirm closed predicate",
+                strength="explicit",
+                would_accept=False,
+            )
+            await session.execute(update(SaTrigger).where(SaTrigger.id == trigger.id)
+                                  .values(decision=asdict(decision)))
+            return Receipt(trigger.id, False, decision, snapshot(work_row))
+        decision = Decision(
+            outcome="accept",
+            reason="subscription fan-out reminder confirm",
+            strength="explicit",
+            would_accept=True,
+        )
+        await session.execute(update(SaTrigger).where(SaTrigger.id == trigger.id)
+                              .values(decision=asdict(decision)))
+        # Stash channel action on trigger payload result surface via work item
+        # is unnecessary — sync carries the action. Receipt points at original Ticket.
+        return Receipt(trigger.id, False, decision, snapshot(work_row))
+
+
+async def _active_subscription(session, thread_key: str) -> SaSubscription | None:
+    return (await session.scalars(select(SaSubscription).where(
+        SaSubscription.thread_key == thread_key,
+        SaSubscription.kind == SUBSCRIPTION_REMINDER_CONFIRM,
+        SaSubscription.status == SUBSCRIPTION_ACTIVE,
+    ))).one_or_none()
+
+
+async def _subscribed_work_item(session, thread_key: str) -> SaWorkItem | None:
+    sub = await _active_subscription(session, thread_key)
+    if sub is None:
+        return None
+    return await session.get(SaWorkItem, sub.work_item_id)
 
 
 def get_engine() -> Engine:

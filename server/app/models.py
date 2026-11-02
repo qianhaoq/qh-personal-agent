@@ -254,3 +254,45 @@ class SaWorkItem(Base):
     error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class SaSubscription(Base):
+    """Ticket↔Thread subscription for Eval bypass (reminder confirm fan-out)."""
+
+    __tablename__ = "sa_subscriptions"
+    __table_args__ = (
+        Index("uq_sa_subscriptions_thread_kind", "thread_key", "kind", unique=True),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    thread_key: Mapped[str] = mapped_column(ForeignKey("sa_threads.key"), index=True)
+    work_item_id: Mapped[str] = mapped_column(ForeignKey("sa_work_items.id"), index=True)
+    user_id: Mapped[str] = mapped_column(String(32))
+    kind: Mapped[str] = mapped_column(String(32))  # reminder_confirm
+    # active | stopped
+    status: Mapped[str] = mapped_column(String(16), default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class SaChannelAction(Base):
+    """Client-consumable Channel outlet (sync-visible). No OS side effects here."""
+
+    __tablename__ = "sa_channel_actions"
+    __table_args__ = (
+        Index("ix_sa_channel_actions_user_seq", "user_id", "change_seq"),
+        # One schedule action per reminder confirm intent (idempotent upsert key)
+        Index("uq_sa_channel_actions_dedupe", "dedupe_key", unique=True),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(32), index=True)
+    # schedule_reminder — client may set AlarmManager; never executed server-side
+    type: Mapped[str] = mapped_column(String(32))
+    payload: Mapped[dict] = mapped_column(JSON)
+    work_item_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    reminder_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    dedupe_key: Mapped[str] = mapped_column(String(256))
+    change_seq: Mapped[int] = mapped_column(BigInteger, default=0, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

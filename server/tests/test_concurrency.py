@@ -757,3 +757,27 @@ async def test_ask_slow_llm_single_connection_pool_still_serves(client, user, ru
         assert resp.status_code == 200, resp.text
     finally:
         await engine.dispose()
+
+
+@requires_postgres
+async def test_concurrent_confirm_same_rev_exactly_one_success(client, user):
+    from sqlalchemy import func, select
+
+    from app.db import get_sessionmaker
+    from app.models import Reminder, SaChannelAction
+    from tests.test_subscription_channel import _suggested
+
+    _, reminder_id, rev = await _suggested(client, user)
+
+    async def confirm():
+        return await client.post(f"/v1/reminders/{reminder_id}/confirm",
+                                 headers=auth_headers(user), json={"rev": rev})
+
+    results = await asyncio.gather(confirm(), confirm())
+    assert sorted(r.status_code for r in results) == [200, 409], [r.text for r in results]
+    async with get_sessionmaker()() as session:
+        reminder = await session.get(Reminder, reminder_id)
+        assert reminder.status == "scheduled" and reminder.rev == rev + 1
+        assert await session.scalar(select(func.count()).select_from(SaChannelAction).where(
+            SaChannelAction.reminder_id == reminder_id, SaChannelAction.deleted_at.is_(None),
+        )) == 1

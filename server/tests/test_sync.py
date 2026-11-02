@@ -19,7 +19,7 @@ async def test_sync_returns_changes_since_cursor(client, user, run_jobs):
     d1 = r1.json()
     assert d1["cursor"] > 0
     assert [n["id"] for n in d1["notes"]] == [first_id]
-    assert d1["deleted"] == {"notes": [], "reminders": []}
+    assert d1["deleted"] == {"notes": [], "reminders": [], "actions": []}
 
     # 第二次用 cursor 拉：无新变化
     r2 = await client.get(f"/v1/sync?since={d1['cursor']}", headers=auth_headers(user))
@@ -60,8 +60,10 @@ async def _walk(client, headers, limit: int) -> tuple[dict[str, dict], list[dict
         page_size = (
             len(page["notes"])
             + len(page["reminders"])
+            + len(page.get("actions") or [])
             + len(page["deleted"]["notes"])
             + len(page["deleted"]["reminders"])
+            + len(page["deleted"].get("actions") or [])
         )
         assert page_size <= limit, f"单页条数 {page_size} 超过 limit={limit}"
         for n in page["notes"]:
