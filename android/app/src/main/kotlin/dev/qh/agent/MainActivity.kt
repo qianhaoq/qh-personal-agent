@@ -31,7 +31,7 @@ class MainActivity : ComponentActivity() {
     private val microphonePermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
         voice?.permissionResult(it)
     }
-    override fun onStop() { voice?.cancel(); super.onStop() }
+    override fun onStop() { voice?.releaseForBackground(); super.onStop() }
     override fun onDestroy() { voice?.destroy(); voice = null; super.onDestroy() }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -195,7 +195,7 @@ fun AgentApp(model: AgentModel, voiceFactory: ((String) -> Unit) -> VoiceAsr, re
                         val captureLifecycle = LocalLifecycleOwner.current.lifecycle
                         DisposableEffect(voice, captureLifecycle) {
                             val observer = LifecycleEventObserver { _, event ->
-                                if (event == Lifecycle.Event.ON_PAUSE) voice.cancel()
+                                if (event == Lifecycle.Event.ON_PAUSE) voice.releaseForBackground()
                             }
                             captureLifecycle.addObserver(observer)
                             onDispose { captureLifecycle.removeObserver(observer); voice.destroy() }

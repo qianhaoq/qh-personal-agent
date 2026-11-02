@@ -12,3 +12,4 @@ fun reduceAsr(state: AsrUiState, event: AsrEvent): AsrUiState = when (event) {
     AsrEvent.Finish, AsrEvent.Cancel -> AsrUiState.Idle
 }
 fun AsrUiState.acceptsResult() = this == AsrUiState.Listening || this == AsrUiState.Processing
+fun AsrUiState.shouldCancelOnBackground() = this == AsrUiState.Listening || this == AsrUiState.Processing

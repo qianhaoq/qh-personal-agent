@@ -87,6 +87,10 @@ class VoiceAsr(private val activity: ComponentActivity, private val result: (Str
         try { recognizer?.stopListening() }
         catch (_: RuntimeException) { cancel(); message = "停止听写失败，请使用文字记事。" }
     }
+    fun releaseForBackground() {
+        // The system permission dialog can pause/stop the activity before delivering its result.
+        if (state.shouldCancelOnBackground()) cancel()
+    }
     fun cancel() {
         ++generation
         event(AsrEvent.Cancel)

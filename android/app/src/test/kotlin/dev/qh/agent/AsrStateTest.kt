@@ -4,6 +4,21 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class AsrStateTest {
+    @Test fun backgroundOnlyCancelsActiveRecognition() {
+        assertFalse(AsrUiState.Idle.shouldCancelOnBackground())
+        assertFalse(AsrUiState.Permission.shouldCancelOnBackground())
+        assertTrue(AsrUiState.Listening.shouldCancelOnBackground())
+        assertTrue(AsrUiState.Processing.shouldCancelOnBackground())
+    }
+    @Test fun permissionResultSurvivesPauseAndStop() {
+        var state = reduceAsr(AsrUiState.Idle, AsrEvent.RequestPermission)
+        repeat(2) { // ON_PAUSE followed by onStop while the permission dialog is visible.
+            if (state.shouldCancelOnBackground()) state = reduceAsr(state, AsrEvent.Cancel)
+        }
+        assertEquals(AsrUiState.Permission, state)
+        assertEquals(AsrUiState.Listening, reduceAsr(state, AsrEvent.Granted))
+        assertEquals(AsrUiState.Idle, reduceAsr(state, AsrEvent.Denied))
+    }
     @Test fun permissionThenListeningAndStopStillAcceptsFinalResult() {
         var state = reduceAsr(AsrUiState.Idle, AsrEvent.RequestPermission)
         assertEquals(AsrUiState.Permission, state)
