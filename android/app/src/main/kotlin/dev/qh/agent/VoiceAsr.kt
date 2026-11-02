@@ -13,7 +13,9 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 
 /** Main-thread only. A fresh recognizer per attempt fences callbacks from older attempts. */
-class VoiceAsr(private val activity: ComponentActivity, private val result: (String) -> Unit) {
+class VoiceAsr(private val activity: ComponentActivity, private val result: (String) -> Unit,
+    private val textFallback: String = "文字记事"
+) {
     var state by mutableStateOf(AsrUiState.Idle); private set
     var message by mutableStateOf<String?>(null); private set
     private var recognizer: SpeechRecognizer? = null
@@ -25,7 +27,7 @@ class VoiceAsr(private val activity: ComponentActivity, private val result: (Str
         if (disposed || state != AsrUiState.Idle) return
         message = null
         if (!SpeechRecognizer.isRecognitionAvailable(activity)) {
-            message = "系统语音引擎不可用，请使用文字记事。"; return
+            message = "系统语音引擎不可用，请使用${textFallback}。"; return
         }
         if (activity.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             event(AsrEvent.RequestPermission)
@@ -37,7 +39,7 @@ class VoiceAsr(private val activity: ComponentActivity, private val result: (Str
     fun permissionResult(granted: Boolean) {
         if (disposed || state != AsrUiState.Permission) return
         event(if (granted) AsrEvent.Granted else AsrEvent.Denied)
-        if (granted) listen() else message = "未授予麦克风权限，请使用文字记事。"
+        if (granted) listen() else message = "未授予麦克风权限，请使用${textFallback}。"
     }
     private fun listen() {
         val attempt = ++generation
@@ -55,10 +57,10 @@ class VoiceAsr(private val activity: ComponentActivity, private val result: (Str
                     if (!active()) return
                     cancel()
                     message = when (error) {
-                        SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "麦克风权限不可用，请使用文字记事。"
-                        SpeechRecognizer.ERROR_NO_MATCH, SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "未听清内容，请重试或使用文字记事。"
-                        SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "语音服务网络异常，请重试或使用文字记事。"
-                        else -> "系统语音识别失败，请重试或使用文字记事。"
+                        SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "麦克风权限不可用，请使用${textFallback}。"
+                        SpeechRecognizer.ERROR_NO_MATCH, SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "未听清内容，请重试或使用${textFallback}。"
+                        SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "语音服务网络异常，请重试或使用${textFallback}。"
+                        else -> "系统语音识别失败，请重试或使用${textFallback}。"
                     }
                 }
                 override fun onResults(results: Bundle?) {
@@ -66,7 +68,7 @@ class VoiceAsr(private val activity: ComponentActivity, private val result: (Str
                     val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                         ?.firstOrNull { it.isNotBlank() }?.trim()
                     cancel()
-                    if (text == null) message = "未识别到内容，请重试或使用文字记事。"
+                    if (text == null) message = "未识别到内容，请重试或使用${textFallback}。"
                     else result(text)
                 }
                 override fun onPartialResults(partialResults: Bundle?) {}
@@ -78,14 +80,14 @@ class VoiceAsr(private val activity: ComponentActivity, private val result: (Str
                 putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false)
             })
         } catch (_: RuntimeException) {
-            cancel(); message = "系统语音引擎不可用，请使用文字记事。"
+            cancel(); message = "系统语音引擎不可用，请使用${textFallback}。"
         }
     }
     fun stop() {
         if (state != AsrUiState.Listening) return
         event(AsrEvent.Stop)
         try { recognizer?.stopListening() }
-        catch (_: RuntimeException) { cancel(); message = "停止听写失败，请使用文字记事。" }
+        catch (_: RuntimeException) { cancel(); message = "停止听写失败，请使用${textFallback}。" }
     }
     fun releaseForBackground() {
         // The system permission dialog can pause/stop the activity before delivering its result.
