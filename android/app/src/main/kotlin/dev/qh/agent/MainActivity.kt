@@ -19,7 +19,6 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewModelScope
 import androidx.navigation.compose.*
 import dev.qh.data.*
-import dev.qh.security.SecureTokens
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 
@@ -31,14 +30,14 @@ class MainActivity : ComponentActivity() {
             checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             notificationPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS)
         }
-        // Manual DI: one repository per retained ViewModel; release cannot select the mock.
+        // Share the real session across foreground and boot work; release cannot select the mock.
         setContent {
             MaterialTheme {
                 val model: AgentModel = viewModel(factory = object : ViewModelProvider.Factory {
                     @Suppress("UNCHECKED_CAST")
                     override fun <T : ViewModel> create(modelClass: Class<T>): T = AgentModel(
                         if (BuildConfig.DEBUG && BuildConfig.USE_MOCK_API) MockRepository()
-                        else RealRepository(realApi(BuildConfig.API_BASE_URL), SecureTokens(applicationContext)),
+                        else AppRepositories.real(applicationContext),
                         ReminderAlarmScheduler(applicationContext)
                     ) as T
                 })
@@ -60,6 +59,7 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
     private var pending: NoteCreate? = null
     private fun clearSession() {
         notes = emptyList(); reminders = emptyList(); answer = null; draft = ""; question = ""; pending = null
+        AppRepositories.bumpSession()
         alarms.clear()
     }
     private fun run(action: suspend () -> Unit) {
@@ -76,7 +76,12 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
         }
     }
     private suspend fun refresh() {
+        val generation = AppRepositories.sessionGeneration()
         val sync = repo.sync()
+        if (!repo.signedIn || AppRepositories.sessionGeneration() != generation) {
+            if (!repo.signedIn) clearSession()
+            return
+        }
         alarms.consume(sync)
         reminders = sync.reminders.sortedWith(compareBy(nullsLast()) { it.fire_at })
         notes = repo.notes()
@@ -96,6 +101,9 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
     }
     fun ask() = run { answer = null; answer = repo.ask(question) }
     fun logout() = run {
+        // Bump generation and clear alarms before network logout so in-flight boot cannot re-arm.
+        AppRepositories.bumpSession()
+        alarms.clear()
         try { repo.logout() }
         finally { clearSession() }
     }

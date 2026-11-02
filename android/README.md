@@ -63,7 +63,9 @@ api.useMock=false
    因此可以按 action 墓碑找到并取消闹钟。
 4. 尚未触发的提醒以 action/reminder id、标题和触发时间保存在应用私有
    SharedPreferences；触发或退出登录时清除。开机后真实模式若本地会话仍有效，
-   先尝试全量同步，再重放持久化闹钟；无网络时也保留并重放已有闹钟。
+   先本地 restore 持久化闹钟，再以约 8 秒总预算尝试网络 sync；超时只保留本地重放。
+   仍 pending 的过期闹钟会立即重设，无本地记录的历史 action 则跳过（不当作已响）。
+   前台与开机共用 AppRepositories 单例仓库与会话代际；sync 分页按 id 合并并应用墓碑。
    mock 没有跨进程会话，开机任务会跳过。
 5. 精确闹钟使用 `setExactAndAllowWhileIdle`，权限不可用或检查后被撤销时退化为
    非精确闹钟。API 33+ 未授予通知权限时，系统闹钟仍会触发，但无法显示通知。
@@ -131,8 +133,9 @@ JAR SHA-256：`cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8`
 使用 `/home/box/.local/jdk/jdk-17.0.16+8` 与 `/home/box/.local/android-sdk`。
 `./gradlew :data:test :app:assembleDebug`：`BUILD SUCCESSFUL`。
 `./gradlew --no-daemon assembleDebug testDebugUnitTest`：`BUILD SUCCESSFUL`；
-`:data` 的 RepositoryTest 共 8 tests，0 failures / 0 errors / 0 skipped；`:app` 与
+`:data` 的 RepositoryTest 共 10 tests，0 failures / 0 errors / 0 skipped；`:app` 与
 `:core-security` 没有本地 unit test source（对应任务 `NO-SOURCE`）。
 已核对合并后的 debug manifest：S2 标签、四项权限和两个 receiver 均已注册，
 debug 允许明文、应用禁用备份。未运行模拟器/真机、Keystore instrumentation
 或连接实际服务的端到端测试。
+

@@ -166,6 +166,38 @@ class RepositoryTest {
             assertEquals("吃药（晚上）", body["title"].asString)
         }
     }
+    @Test fun syncKeepsLatestReminderAcrossPages() = runBlocking {
+        MockWebServer().use { server ->
+            server.start()
+            val store = Store().apply { tokens = Tokens("access", "refresh", 900, "u1") }
+            val repo = RealRepository(realApi(server.url("/").toString()), store)
+            server.json(syncPage(1, "[" + reminderJson("r1", 1, "Old") + "]", more = true))
+            server.json(syncPage(2, "[" + reminderJson("r1", 2, "Latest") + "]"))
+            val result = repo.sync()
+            assertEquals(2L, result.cursor)
+            assertFalse(result.has_more)
+            assertEquals("r1", result.reminders.single().id)
+            assertEquals(2, result.reminders.single().rev)
+            assertEquals("Latest", result.reminders.single().title)
+        }
+    }
+    @Test fun syncRemovesReminderWhenLaterPageContainsTombstone() = runBlocking {
+        MockWebServer().use { server ->
+            server.start()
+            val store = Store().apply { tokens = Tokens("access", "refresh", 900, "u1") }
+            val repo = RealRepository(realApi(server.url("/").toString()), store)
+            server.json(syncPage(1, "[" + reminderJson("r1", 1) + "]", more = true))
+            server.json(syncPage(2, "[]", deleted = """["r1"]"""))
+            val result = repo.sync()
+            assertTrue(result.reminders.isEmpty())
+            assertEquals(listOf("r1"), result.deleted.reminders)
+        }
+    }
+    private fun reminderJson(id: String, rev: Int, title: String = "提醒") =
+        """{"id":"$id","note_id":"n1","title":"$title","fire_at":"2099-01-01T00:00:00Z","rrule":null,"status":"suggested","rev":$rev,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"""
+    private fun syncPage(cursor: Long, reminders: String, deleted: String = "[]", more: Boolean = false) =
+        """{"cursor":$cursor,"notes":[],"reminders":$reminders,"actions":[],"deleted":{"notes":[],"reminders":$deleted,"actions":[]},"has_more":$more}"""
+
     @Test fun apiErrorsHaveReadableMessage() = runBlocking {
         MockWebServer().use { server ->
             server.start(); server.json("""{"error":{"code":"forbidden","message":"邀请码已过期"}}""", 403)

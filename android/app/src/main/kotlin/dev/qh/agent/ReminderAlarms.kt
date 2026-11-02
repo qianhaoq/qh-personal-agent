@@ -12,12 +12,10 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.widget.Toast
-import dev.qh.data.RealRepository
 import dev.qh.data.ReminderConfirmResponse
 import dev.qh.data.ReminderDto
 import dev.qh.data.SyncAction
 import dev.qh.data.SyncResponse
-import dev.qh.data.realApi
 import dev.qh.security.SecureTokens
 import java.time.Instant
 import java.time.format.DateTimeParseException
@@ -25,7 +23,9 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
 
 private const val ALARM_PREFS = "pending_reminder_alarms"
@@ -33,6 +33,7 @@ private const val ALARM_ACTION = "dev.qh.agent.action.REMINDER_ALARM"
 private const val EXTRA_REMINDER_ID = "reminder_id"
 private const val EXTRA_TITLE = "title"
 private const val NOTIFICATION_CHANNEL = "reminders"
+private const val BOOT_SYNC_BUDGET_MS = 8_000L
 private data class PendingReminder(val actionId: String, val reminderId: String,
     val title: String, val triggerAt: Long)
 
@@ -74,24 +75,25 @@ class ReminderAlarmScheduler(context: Context) {
         setAlarm(PendingReminder("", reminder.id, reminder.title.ifBlank { "随记提醒" }, triggerAt))
     }
     private fun setAlarm(reminder: PendingReminder) {
-        if (reminder.triggerAt <= System.currentTimeMillis()) {
-            // Full sync and boot replay include historical actions; never fire them twice.
-            cancel(reminder)
-            return
-        }
+        val now = System.currentTimeMillis()
+        val alreadyPending = prefs.contains(key(reminder.reminderId))
+        // Historical action with no local pending: skip. Do not treat overdue as already fired.
+        if (reminder.triggerAt <= now && !alreadyPending) return
+        // Overdue but still pending (inexact/Doze): re-schedule soon; keep prefs.
+        val triggerAt = if (reminder.triggerAt <= now) now else reminder.triggerAt
         prefs.edit().putString(key(reminder.reminderId), JSONObject()
             .put("action_id", reminder.actionId).put("reminder_id", reminder.reminderId)
             .put("title", reminder.title).put("trigger_at", reminder.triggerAt).toString()).apply()
         val intent = alarmIntent(reminder)
         try {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S || alarms.canScheduleExactAlarms()) {
-                alarms.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, reminder.triggerAt, intent)
+                alarms.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, intent)
             } else {
-                alarms.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, reminder.triggerAt, intent)
+                alarms.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, intent)
             }
         } catch (_: SecurityException) {
             // Exact-alarm access can be revoked between the check and scheduling.
-            alarms.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, reminder.triggerAt, intent)
+            alarms.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, intent)
         }
     }
     private fun cancelAction(actionId: String) = pending().filter { it.actionId == actionId }.forEach(::cancel)
@@ -122,6 +124,7 @@ class ReminderAlarmScheduler(context: Context) {
 
 class ReminderAlarmReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
+        if (SecureTokens(context).read() == null) return
         val reminderId = intent.getStringExtra(EXTRA_REMINDER_ID) ?: return
         val title = intent.getStringExtra(EXTRA_TITLE).orEmpty().ifBlank { "随记提醒" }
         ReminderAlarmScheduler(context).fired(reminderId)
@@ -153,19 +156,27 @@ class ReminderBootReceiver : BroadcastReceiver() {
         val appContext = context.applicationContext
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
             val scheduler = ReminderAlarmScheduler(appContext)
-            var repo: RealRepository? = null
             try {
-                val tokens = SecureTokens(appContext)
-                if (tokens.read() == null) return@launch
-                val repository = RealRepository(realApi(BuildConfig.API_BASE_URL), tokens)
-                repo = repository
-                scheduler.consume(repository.sync())
-            } catch (error: CancellationException) {
-                throw error
-            } catch (_: Exception) {
-                // A boot without connectivity must not discard alarms already persisted on device.
+                val repository = AppRepositories.real(appContext)
+                if (!repository.signedIn) return@launch
+                val generation = AppRepositories.sessionGeneration()
+                // Local prefs first so reboot never waits on network to restore alarms.
+                scheduler.restore()
+                try {
+                    withTimeout(BOOT_SYNC_BUDGET_MS) {
+                        val sync = repository.sync()
+                        AppRepositories.ifCurrent(generation) {
+                            if (repository.signedIn) scheduler.consume(sync)
+                        }
+                    }
+                } catch (_: TimeoutCancellationException) {
+                    // Keep local restore only; do not block finish on unbounded sync.
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (_: Exception) {
+                    // A boot without connectivity must not discard alarms already persisted on device.
+                }
             } finally {
-                if (repo?.signedIn == true) scheduler.restore()
                 pendingResult.finish()
             }
         }

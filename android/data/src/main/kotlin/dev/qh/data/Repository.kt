@@ -58,9 +58,13 @@ fun realApi(baseUrl: String): AgentApi = Retrofit.Builder().baseUrl(baseUrl)
         .readTimeout(60, TimeUnit.SECONDS).callTimeout(75, TimeUnit.SECONDS).build())
     .addConverterFactory(GsonConverterFactory.create()).build().create(AgentApi::class.java)
 
-class RealRepository(private val api: AgentApi, private val store: TokenStore) : Repository {
-    // Serialize session operations: a rotated refresh token must never be replayed concurrently.
-    private val mutex = Mutex()
+object SessionMutex {
+    val lock = Mutex()
+}
+
+class RealRepository(private val api: AgentApi, private val store: TokenStore,
+    private val mutex: Mutex = SessionMutex.lock) : Repository {
+    // Serialize session operations process-wide: a rotated refresh token must never be replayed concurrently.
     override val signedIn get() = store.read() != null
     override suspend fun login(invite: String) = mutex.withLock {
         validText(invite.trim(), 64)
@@ -74,7 +78,6 @@ class RealRepository(private val api: AgentApi, private val store: TokenStore) :
             // An ambiguous refresh failure cannot safely be retried (server replay detection).
             val fresh = try { api.refresh(RefreshRequest(tokens.refresh_token)).also(store::write) }
             catch (error: CancellationException) { store.write(null); throw error }
-            catch (error: kotlinx.coroutines.CancellationException) { store.write(null); throw error }
             catch (error: Exception) { store.write(null); throw SessionExpired() }
             try { block("Bearer ${fresh.access_token}") }
             catch (error: HttpException) {
@@ -111,18 +114,21 @@ class RealRepository(private val api: AgentApi, private val store: TokenStore) :
     override suspend fun sync(since: Long, limit: Int): SyncResponse {
         require(since >= 0 && limit in 1..500) { "同步参数无效" }
         return authorized { bearer ->
-            val notes = mutableListOf<Note>()
-            val reminders = mutableListOf<ReminderDto>()
-            val actions = mutableListOf<SyncAction>()
-            val deletedNotes = mutableListOf<String>()
-            val deletedReminders = mutableListOf<String>()
-            val deletedActions = mutableListOf<String>()
+            val notes = linkedMapOf<String, Note>()
+            val reminders = linkedMapOf<String, ReminderDto>()
+            val actions = linkedMapOf<String, SyncAction>()
+            val deletedNotes = linkedSetOf<String>()
+            val deletedReminders = linkedSetOf<String>()
+            val deletedActions = linkedSetOf<String>()
             var cursor = since
             while (true) {
                 val page = api.sync(bearer, cursor, limit)
-                notes.addAll(page.notes); reminders.addAll(page.reminders); actions.addAll(page.actions)
-                deletedNotes.addAll(page.deleted.notes); deletedReminders.addAll(page.deleted.reminders)
-                deletedActions.addAll(page.deleted.actions)
+                page.notes.forEach { notes[it.id] = it }
+                page.reminders.forEach { reminders[it.id] = it }
+                page.actions.forEach { actions[it.id] = it }
+                page.deleted.notes.forEach { notes.remove(it); deletedNotes += it }
+                page.deleted.reminders.forEach { reminders.remove(it); deletedReminders += it }
+                page.deleted.actions.forEach { actions.remove(it); deletedActions += it }
                 if (!page.has_more) {
                     cursor = page.cursor
                     break
@@ -130,8 +136,8 @@ class RealRepository(private val api: AgentApi, private val store: TokenStore) :
                 check(page.cursor > cursor) { "Invalid pagination" }
                 cursor = page.cursor
             }
-            SyncResponse(cursor, notes, reminders, actions,
-                SyncDeleted(deletedNotes, deletedReminders, deletedActions), has_more = false)
+            SyncResponse(cursor, notes.values.toList(), reminders.values.toList(), actions.values.toList(),
+                SyncDeleted(deletedNotes.toList(), deletedReminders.toList(), deletedActions.toList()), has_more = false)
         }
     }
     override suspend fun confirmReminder(id: String, rev: Int, fireAt: String?, title: String?) =
