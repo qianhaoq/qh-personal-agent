@@ -188,7 +188,7 @@ def _slow_llm(monkeypatch, entered: asyncio.Event, release: asyncio.Event) -> di
 
 
 async def test_patch_during_llm_not_blocked_and_stale_result_discarded(
-    client, user, monkeypatch
+    client, user, monkeypatch, run_jobs
 ):
     """LLM 调用期间可以对同一笔记完成 PATCH（不被行锁阻塞）；
     之后旧任务的结果被丢弃，PATCH 重新入队的任务用新文本正常抽取。"""
@@ -216,10 +216,7 @@ async def test_patch_during_llm_not_blocked_and_stale_result_discarded(
     release.set()
     await asyncio.wait_for(worker, timeout=10)
     # PATCH 开的 Ticket 由同进程 Worker 重整理
-    from app.workers.dispatch import drain_organize_tasks
-
-    await drain_organize_tasks()
-    await run_pending_jobs()
+    await run_jobs()
 
     assert calls["llm"] == 2  # 旧任务确实在 LLM 里等待过，新任务又调了一次
     async with get_sessionmaker()() as session:
@@ -229,7 +226,7 @@ async def test_patch_during_llm_not_blocked_and_stale_result_discarded(
     assert note.llm_calls == 1  # 旧结果在写事务复查 rev 时被丢弃，未落库
 
 
-async def test_other_user_writes_during_llm_and_memory_sync(client, user, monkeypatch):
+async def test_other_user_writes_during_llm_and_memory_sync(client, user, monkeypatch, run_jobs):
     """extract 在 LLM 调用阶段、memory_sync 在记忆写入阶段（mem0 内部
     还有 LLM/embedding）都不持有 sequences 行锁：别的用户创建笔记（要分配
     全局 seq）不被阻塞。"""
@@ -291,9 +288,8 @@ async def test_other_user_writes_during_llm_and_memory_sync(client, user, monkey
 
     release_memory.set()
     await asyncio.wait_for(worker, timeout=10)
-    from app.workers.dispatch import drain_organize_tasks
-
-    await drain_organize_tasks()
+    # 排空 Ticket 驱动的整理及其入队的 memory_sync jobs
+    await run_jobs()
 
     # 两个用户的笔记最终都抽取完成、记忆同步
     async with get_sessionmaker()() as session:
