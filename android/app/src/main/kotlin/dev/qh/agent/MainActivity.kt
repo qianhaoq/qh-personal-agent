@@ -13,6 +13,9 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -24,6 +27,12 @@ import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     private val notificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    private var voice: VoiceAsr? = null
+    private val microphonePermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+        voice?.permissionResult(it)
+    }
+    override fun onStop() { voice?.releaseForBackground(); super.onStop() }
+    override fun onDestroy() { voice?.destroy(); voice = null; super.onDestroy() }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
@@ -41,7 +50,9 @@ class MainActivity : ComponentActivity() {
                         ReminderAlarmScheduler(applicationContext)
                     ) as T
                 })
-                AgentApp(model)
+                AgentApp(model, { callback -> VoiceAsr(this, callback).also { voice = it } }, {
+                    microphonePermission.launch(android.Manifest.permission.RECORD_AUDIO)
+                }, { voice?.cancel() })
             }
         }
     }
@@ -57,8 +68,9 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
     var draft by mutableStateOf(""); private set
     var question by mutableStateOf("")
     private var pending: NoteCreate? = null
+    private var draftSource = "app"
     private fun clearUi() {
-        notes = emptyList(); reminders = emptyList(); answer = null; draft = ""; question = ""; pending = null
+        notes = emptyList(); reminders = emptyList(); answer = null; draft = ""; question = ""; pending = null; draftSource = "app"
     }
     private fun clearSession() {
         // Fence first so in-flight boot/foreground sync cannot re-apply alarms.
@@ -97,11 +109,16 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
         alarms.confirmed(confirmed)
         refresh()
     }
-    fun updateDraft(value: String) { draft = value; pending = null }
+    fun updateDraft(value: String) { draft = value; draftSource = "app"; pending = null }
+    fun createFromVoice(text: String, done: () -> Unit) {
+        if (busy) return
+        draft = text; draftSource = "voice_asr"; pending = null
+        save(done)
+    }
     fun save(done: () -> Unit) = run {
         // Preserve id on uncertain network failure: retry creates at most one server note.
-        val body = pending ?: noteDraft(draft).also { pending = it }
-        repo.create(body); draft = ""; pending = null; done()
+        val body = pending ?: noteDraft(draft, source = draftSource).also { pending = it }
+        repo.create(body); draft = ""; pending = null; draftSource = "app"; done()
     }
     fun ask() = run { answer = null; answer = repo.ask(question) }
     fun logout() = run {
@@ -113,10 +130,10 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
     }
 }
 @Composable
-fun AgentApp(model: AgentModel) {
+fun AgentApp(model: AgentModel, voiceFactory: ((String) -> Unit) -> VoiceAsr, requestMicrophone: () -> Unit, cancelVoice: () -> Unit) {
     Surface(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().imePadding().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("随记 · S2" + if (BuildConfig.USE_MOCK_API) " / 本地演示" else " / 服务器", style = MaterialTheme.typography.headlineSmall)
+            Text("随记 · S3" + if (BuildConfig.USE_MOCK_API) " / 本地演示" else " / 服务器", style = MaterialTheme.typography.headlineSmall)
             if (model.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
             model.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             if (!model.signedIn) {
@@ -127,15 +144,15 @@ fun AgentApp(model: AgentModel) {
             } else {
                 val nav = rememberNavController()
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    TextButton({ nav.navigate("timeline") { popUpTo("timeline") { inclusive = true } } }, enabled = !model.busy) { Text("时间线") }
-                    TextButton(model::logout, enabled = !model.busy) { Text("退出") }
+                    TextButton({ cancelVoice(); nav.navigate("timeline") { popUpTo("timeline") { inclusive = true } } }, enabled = !model.busy) { Text("时间线") }
+                    TextButton({ cancelVoice(); model.logout() }, enabled = !model.busy) { Text("退出") }
                 }
                 NavHost(nav, startDestination = "timeline", modifier = Modifier.weight(1f)) {
                     composable("timeline") {
                         LaunchedEffect(Unit) { model.reload() }
                         Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                Button({ nav.navigate("capture") }, enabled = !model.busy) { Text("文字记事") }
+                                Button({ nav.navigate("capture") }, enabled = !model.busy) { Text("记一条") }
                                 Button({ nav.navigate("ask") }, enabled = !model.busy) { Text("问一问") }
                                 TextButton(model::reload, enabled = !model.busy) { Text("同步") }
                             }
@@ -171,11 +188,37 @@ fun AgentApp(model: AgentModel) {
                         }
                     }
                     composable("capture") {
+                        val onVoiceResult by rememberUpdatedState<(String) -> Unit>({ text ->
+                            model.createFromVoice(text) { nav.popBackStack() }
+                        })
+                        val voice = remember { voiceFactory { onVoiceResult(it) } }
+                        val captureLifecycle = LocalLifecycleOwner.current.lifecycle
+                        DisposableEffect(voice, captureLifecycle) {
+                            val observer = LifecycleEventObserver { _, event ->
+                                if (event == Lifecycle.Event.ON_PAUSE) voice.releaseForBackground()
+                            }
+                            captureLifecycle.addObserver(observer)
+                            onDispose { captureLifecycle.removeObserver(observer); voice.destroy() }
+                        }
                         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                             OutlinedTextField(model.draft, model::updateDraft, label = { Text("记事内容（最多 5000 字）") },
-                                modifier = Modifier.fillMaxWidth().weight(1f), enabled = !model.busy)
-                            OutlinedButton({}, enabled = false) { Text("录音 · 后续阶段提供") }
-                            Button({ model.save { nav.popBackStack() } }, enabled = !model.busy && model.draft.isNotBlank()) { Text("保存") }
+                                modifier = Modifier.fillMaxWidth().weight(1f), enabled = !model.busy && voice.state == AsrUiState.Idle)
+                            voice.message?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                            when (voice.state) {
+                                AsrUiState.Idle -> OutlinedButton({ voice.start(requestMicrophone) }, enabled = !model.busy) { Text("语音记事") }
+                                else -> {
+                                    Text(when (voice.state) {
+                                        AsrUiState.Permission -> "等待麦克风权限…"
+                                        AsrUiState.Listening -> "正在听写，请说中文…"
+                                        else -> "正在识别…"
+                                    })
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        if (voice.state == AsrUiState.Listening) OutlinedButton(voice::stop) { Text("停止并识别") }
+                                        TextButton(voice::cancel) { Text("取消") }
+                                    }
+                                }
+                            }
+                            Button({ model.save { nav.popBackStack() } }, enabled = !model.busy && voice.state == AsrUiState.Idle && model.draft.isNotBlank()) { Text("保存") }
                         }
                     }
                     composable("ask") {
