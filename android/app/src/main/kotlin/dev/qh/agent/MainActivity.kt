@@ -95,6 +95,7 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
         organizingNoteIds = emptySet()
         clearDetail()
         editing = null; editText = ""
+        cancelConfirm()
         searchQuery = ""; searchHits = emptyList(); searchCompleted = false
         notes = emptyList(); reminders = emptyList(); answer = null; draft = ""; question = ""; pending = null; draftSource = "app"
     }
@@ -141,6 +142,7 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
     fun reload() = run { refresh() }
     fun confirmReminder(reminder: ReminderDto, overrides: ConfirmOverrides) = run {
         val confirmed = repo.confirmReminder(reminder.id, reminder.rev, overrides.fireAt, overrides.title)
+        cancelConfirm()
         alarms.confirmed(confirmed)
         refresh()
     }
@@ -160,6 +162,15 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
         done()
         waitForOrganize(created)
     }
+    var confirming by mutableStateOf<ReminderDto?>(null); private set
+    var confirmTitle by mutableStateOf(""); private set
+    var confirmFireAt by mutableStateOf(""); private set
+    fun beginConfirm(reminder: ReminderDto) {
+        confirming = reminder; confirmTitle = reminder.title; confirmFireAt = reminder.fire_at.orEmpty()
+    }
+    fun updateConfirmTitle(value: String) { confirmTitle = value }
+    fun updateConfirmFireAt(value: String) { confirmFireAt = value }
+    fun cancelConfirm() { confirming = null; confirmTitle = ""; confirmFireAt = "" }
     var editing by mutableStateOf<Note?>(null); private set
     var editText by mutableStateOf(""); private set
     fun beginEdit(note: Note) { editing = note; editText = note.text }
@@ -291,14 +302,13 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                 }
                 NavHost(nav, startDestination = "timeline", modifier = Modifier.weight(1f)) {
                     composable("timeline") {
-                        var confirming by remember { mutableStateOf<ReminderDto?>(null) }
-                        confirming?.let { reminder ->
+                        model.confirming?.let { reminder ->
                             ConfirmReminderDialog(reminder, model.busy,
-                                onDismiss = { confirming = null },
-                                onConfirm = { overrides ->
-                                    confirming = null
-                                    model.confirmReminder(reminder, overrides)
-                                })
+                                title = model.confirmTitle, fireAt = model.confirmFireAt,
+                                onTitleChange = model::updateConfirmTitle,
+                                onFireAtChange = model::updateConfirmFireAt,
+                                onDismiss = model::cancelConfirm,
+                                onConfirm = { overrides -> model.confirmReminder(reminder, overrides) })
                         }
                         var deleting by remember { mutableStateOf<Note?>(null) }
                         deleting?.let { note ->
@@ -332,7 +342,7 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                                                 TextButton({ openDetail(id) }, enabled = !model.busy) { Text("打开记事") }
                                             }
                                             if (reminder.status == "suggested") {
-                                                Button({ confirming = reminder },
+                                                Button({ model.beginConfirm(reminder) },
                                                     enabled = !model.busy) { Text("确认并设闹钟") }
                                             }
                                         }
@@ -573,20 +583,19 @@ private fun noteStatus(status: String) = when (status) {
 
 @Composable
 private fun ConfirmReminderDialog(
-    reminder: ReminderDto, busy: Boolean, onDismiss: () -> Unit,
-    onConfirm: (ConfirmOverrides) -> Unit
+    reminder: ReminderDto, busy: Boolean, title: String, fireAt: String,
+    onTitleChange: (String) -> Unit, onFireAtChange: (String) -> Unit,
+    onDismiss: () -> Unit, onConfirm: (ConfirmOverrides) -> Unit
 ) {
-    var title by remember(reminder) { mutableStateOf(reminder.title) }
-    var fireAt by remember(reminder) { mutableStateOf(reminder.fire_at.orEmpty()) }
     var error by remember(reminder) { mutableStateOf<String?>(null) }
     AlertDialog(
         onDismissRequest = { if (!busy) onDismiss() },
         title = { Text("确认并设闹钟") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedTextField(title, { title = it; error = null }, label = { Text("标题") },
+                OutlinedTextField(title, { onTitleChange(it); error = null }, label = { Text("标题") },
                     enabled = !busy, modifier = Modifier.fillMaxWidth())
-                OutlinedTextField(fireAt, { fireAt = it; error = null }, label = { Text("提醒时间（ISO）") },
+                OutlinedTextField(fireAt, { onFireAtChange(it); error = null }, label = { Text("提醒时间（ISO）") },
                     enabled = !busy, modifier = Modifier.fillMaxWidth())
                 Text("例如 2026-11-04T12:00:00Z；留空沿用原值。时间须在未来。")
                 error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
