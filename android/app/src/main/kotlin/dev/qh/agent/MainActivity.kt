@@ -26,6 +26,7 @@ import dev.qh.data.*
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.sync.Mutex
@@ -81,6 +82,7 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
     private fun clearUi() {
         organizeJobs.values.toList().forEach { it.cancel() }; organizeJobs.clear()
         organizingNoteIds = emptySet()
+        editing = null; editText = ""
         notes = emptyList(); reminders = emptyList(); answer = null; draft = ""; question = ""; pending = null; draftSource = "app"
     }
     private fun clearSession() {
@@ -137,6 +139,44 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
         done()
         waitForOrganize(created)
     }
+    var editing by mutableStateOf<Note?>(null); private set
+    var editText by mutableStateOf(""); private set
+    fun beginEdit(note: Note) { editing = note; editText = note.text }
+    fun updateEdit(value: String) { editText = value }
+    fun saveEdit(done: () -> Unit) = run {
+        val original = editing ?: return@run
+        try {
+            val updated = refreshMutex.withLock {
+                repo.patch(original.id, original.rev, editText).also { note ->
+                    notes = notes.map { if (it.id == note.id) note else it }
+                }
+            }
+            editing = null; editText = ""
+            done()
+            if (updated.rev > original.rev || (updated.status != original.status && updated.status == "uploaded")) {
+                organizeJobs[updated.id]?.cancelAndJoin()
+                waitForOrganize(Created(updated.id, updated.status, updated.rev))
+            }
+            refresh()
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            if ((e is retrofit2.HttpException && e.code() == 409) ||
+                (e is IllegalArgumentException && e.message?.contains("版本冲突") == true)) {
+                error = readableError(e)
+                refresh()
+                editing = notes.find { it.id == original.id }
+            } else throw e
+        }
+    }
+    fun deleteNote(note: Note) = run {
+        refreshMutex.withLock {
+            repo.delete(note.id)
+            organizeJobs.remove(note.id)?.cancel()
+            organizingNoteIds = organizingNoteIds - note.id
+            notes = notes.filterNot { it.id == note.id }
+        }
+        refresh()
+    }
     private fun waitForOrganize(created: Created) {
         val id = created.note_id
         val generation = AppRepositories.sessionGeneration()
@@ -192,7 +232,7 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
 fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> VoiceAsr, requestMicrophone: () -> Unit, cancelVoice: () -> Unit) {
     Surface(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().imePadding().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("随记 · S5" + if (BuildConfig.USE_MOCK_API) " / 本地演示" else " / 服务器", style = MaterialTheme.typography.headlineSmall)
+            Text("随记 · S6" + if (BuildConfig.USE_MOCK_API) " / 本地演示" else " / 服务器", style = MaterialTheme.typography.headlineSmall)
             if (model.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
             model.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             if (!model.signedIn) {
@@ -208,6 +248,16 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                 }
                 NavHost(nav, startDestination = "timeline", modifier = Modifier.weight(1f)) {
                     composable("timeline") {
+                        var deleting by remember { mutableStateOf<Note?>(null) }
+                        deleting?.let { note ->
+                            AlertDialog(onDismissRequest = { if (!model.busy) deleting = null },
+                                title = { Text("删除记事？") }, text = { Text("相关提醒也会删除，此操作不可撤销。") },
+                                confirmButton = {
+                                    TextButton({ deleting = null; model.deleteNote(note) }, enabled = !model.busy) { Text("删除") }
+                                }, dismissButton = {
+                                    TextButton({ deleting = null }, enabled = !model.busy) { Text("取消") }
+                                })
+                        }
                         LaunchedEffect(Unit) { model.reload() }
                         Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -238,6 +288,10 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                                     Card(Modifier.fillMaxWidth()) {
                                         Column(Modifier.padding(12.dp)) {
                                             note.title?.let { Text(it, style = MaterialTheme.typography.titleMedium) }
+                                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                                TextButton({ model.beginEdit(note); nav.navigate("edit") }, enabled = !model.busy) { Text("编辑") }
+                                                TextButton({ deleting = note }, enabled = !model.busy) { Text("删除") }
+                                            }
                                             Text(note.text)
                                             if (note.status == "uploaded") {
                                                 Text("整理中…", style = MaterialTheme.typography.bodySmall,
@@ -253,6 +307,15 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                                     }
                                 }
                             }
+                        }
+                    }
+                    composable("edit") {
+                        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                            OutlinedTextField(model.editText, model::updateEdit, label = { Text("记事内容（最多 5000 字）") },
+                                modifier = Modifier.fillMaxWidth().weight(1f), enabled = !model.busy)
+                            Button({ model.saveEdit { nav.popBackStack() } },
+                                enabled = !model.busy && model.editing != null && model.editText.isNotBlank()) { Text("保存") }
+                            TextButton({ nav.popBackStack() }, enabled = !model.busy) { Text("取消") }
                         }
                     }
                     composable("capture") {

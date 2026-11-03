@@ -1,6 +1,6 @@
-# Android S5 · 整理可见闭环
+# Android S6 · 记事编辑/删除
 
-紧凑的 Kotlin / Compose 客户端：登录、时间线、文字记事、问答、提醒同步与确认；
+紧凑的 Kotlin / Compose 客户端：登录、时间线、记事创建/编辑/删除、问答、提醒同步与确认；
 确认后的 `schedule_reminder` Channel action 会落到 AlarmManager，响铃时显示系统通知。
 系统 SpeechRecognizer 中文语音记事与语音问答。minSdk 26，compile/targetSdk 34，JDK 17，Gradle 8.7，AGP 8.5.2。
 
@@ -50,6 +50,15 @@ api.useMock=false
 默认地址为生产占位 `https://agent.pinhaoyun.com/`；debug 默认 mock 不访问该地址。
 切回 mock：删除 `api.useMock=false` 或改为 `api.useMock=true`。
 `local.properties` 在构建时读取，改动后需重新构建安装。
+
+## S6 记事编辑/删除
+
+时间线每条记事提供「编辑」「删除」，busy 时禁用；整理轮询期间仍可操作。
+编辑页预填正文，保存以原 rev 调用 PATCH；正文不变时保持 rev，变更后清空整理字段、
+显示「整理中…」并重新短轮询。版本冲突显示「版本冲突，请同步后重试」，刷新最新版本，
+保留编辑正文供检查后重试。不存在/已删除由服务端返回 404。
+删除须确认，再调用 DELETE；成功后取消该记事轮询、移除列表项并完整刷新，
+通过既有 sync 墓碑消费取消关联提醒的本地闹钟。不改 ASR、闹钟或确认核心路径。
 
 ## S5 整理可见闭环
 
@@ -114,7 +123,7 @@ pause/stop 保留 Permission 状态，允许权限结果继续启动识别。
 ## 模块与契约
 
 - `:app`：Compose Navigation、提醒列表与确认、AlarmManager、通知、开机重放、
-  S5 创建后短轮询与整理字段展示、系统 SpeechRecognizer 语音记事与语音提问、ViewModel 保留旋转期间状态、手动 DI。
+  S6 记事编辑/删除、创建后短轮询与整理字段展示、系统 SpeechRecognizer 语音记事与语音提问、ViewModel 保留旋转期间状态、手动 DI。
 - `:data`：纯 JVM DTO、Retrofit、仓库、mock、S5 轮询纯函数和测试。接口核对自当前服务端
   `app/schemas.py` 与 `app/api/{auth,notes,ask,sync,reminders}.py`，未知响应字段由 Gson 忽略。
 - `:core-security`：Android Keystore MasterKey + EncryptedSharedPreferences。
@@ -123,6 +132,7 @@ pause/stop 保留 Permission 状态，允许权限结果继续启动识别。
 
 真实路由：`POST /v1/auth/login`、`POST /v1/auth/refresh`、
 `POST /v1/auth/logout`、`POST /v1/notes`、`GET /v1/notes`、`POST /v1/ask`、
+`PATCH /v1/notes/{id}`、`DELETE /v1/notes/{id}`、
 `GET /v1/sync`、`POST /v1/reminders/{id}/confirm`。
 创建记事使用 `client_note_id/text/recorded_at/timezone/source`，返回 `note_id/status/rev`。
 记事列表遍历 `next_cursor` 分页；问答使用 `text/client_time/timezone` 并显示 citations。
@@ -138,7 +148,7 @@ Mock create 返回 client_note_id 作为 note_id，初始状态 uploaded；默�
 可用 organizeAfterReads=0 禁用自动整理，或 organizeNote 手动整理供 JVM 测试。
 Mock 登录后预置「给绿植浇水」「整理周报」两个 suggested 提醒。确认会将其改为
 scheduled、bump rev，生成 `schedule_reminder` action 并推进 cursor；重复确认当前
-scheduled rev 保持幂等。mock 还维护 action/reminder 删除墓碑供增量同步测试。
+scheduled rev 保持幂等。mock 维护 note/action/reminder 删除墓碑；编辑使 suggested 提醒失效，删除记事删除所有关联提醒与 actions。
 记事、提醒、actions 和 cursor 仅在当前进程内存保存，退出或进程结束后清空；
 已经设置的闹钟记录仍在私有 SharedPreferences，退出时会主动清除。
 
@@ -153,7 +163,7 @@ scheduled rev 保持幂等。mock 还维护 action/reminder 删除墓碑供增�
 - 不修改 `server/`，不部署服务端；服务端只负责产生 sync action，不执行系统闹钟。
 - 创建后自动短轮询；无常驻后台同步，另保留进入/刷新时间线、confirm 后刷新和 boot 同步。
 - `rrule` 目前只解析不执行，闹钟均为一次性；没有提醒编辑、贪睡或重复提醒 UI。
-- 尚无编辑/删除记事、推送或发布签名；自动短轮询结束后仍可手动同步。
+- 尚无推送或发布签名；自动短轮询结束后仍可手动同步。
 - 同一份未修改草稿在失败重试时保留 `client_note_id`，但编辑草稿会生成新 ID；
   网络结果不确定时请先刷新时间线，避免编辑后重复记录。
 - 页面状态可跨旋转保留，不能跨进程恢复；不保存邀请码或草稿到磁盘。
@@ -172,12 +182,12 @@ JAR SHA-256：`cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8`
 
 使用 `/home/box/.local/jdk/jdk-17.0.16+8` 与 `/home/box/.local/android-sdk`。
 `./gradlew --no-daemon :data:test :app:testDebugUnitTest :app:assembleDebug`：`BUILD SUCCESSFUL`。
-`:data` RepositoryTest：**13** + OrganizePollTest：**5**（共 18），0 failures / 0 errors / 0 skipped；
+`:data` RepositoryTest：**16** + OrganizePollTest：**9**（共 25），0 failures / 0 errors / 0 skipped；
 `:app` AsrStateTest：**6** + VoiceQuestionTest：**2**（共 8），0 failures / 0 errors / 0 skipped；
 `:core-security` unit tests：`NO-SOURCE`。
 `python3 scripts/check-invariants.py`：`0 error(s), 0 warning(s)`。
-应用标签更新为 S5；create 返回 `Created` 后短轮询 notes，终态/超时再完整 sync。
+应用标签更新为 S6；时间线可编辑/删除记事，PATCH 变更后复用短轮询。
 未运行模拟器/真机、Keystore instrumentation 或连接实际服务的端到端测试。
 会话与同步安全：前台与开机共用 `AppRepositories.real`（进程级单例仓库，同一 Mutex），
 并以 session generation 栅栏防止 logout 后在途 boot sync / 整理轮询再设闹钟或写回。
-分页 sync 按 ID 合并，后页覆盖前页，并应用 deleted 墓碑剔除。
+分页 sync 按 ID 合并，后页覆盖前页，并应用 deleted 墓碑剔除（含 note 墓碑）。
