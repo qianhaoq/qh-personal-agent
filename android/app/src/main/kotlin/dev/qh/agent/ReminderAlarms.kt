@@ -96,7 +96,7 @@ class ReminderAlarmScheduler(context: Context) {
         }
     }
     private fun cancelAction(actionId: String) = pending().filter { it.actionId == actionId }.forEach(::cancel)
-    private fun cancelReminder(reminderId: String) = pending().filter { it.reminderId == reminderId }.forEach(::cancel)
+    fun cancelReminder(reminderId: String) = pending().filter { it.reminderId == reminderId }.forEach(::cancel)
     private fun cancel(reminder: PendingReminder) {
         val intent = alarmIntent(reminder)
         alarms.cancel(intent)
@@ -159,13 +159,14 @@ class ReminderBootReceiver : BroadcastReceiver() {
         // Bound broadcast work: restore local alarms immediately; never wait on network here.
         scheduler.restore()
         val generation = AppRepositories.sessionGeneration()
+        val alarmGeneration = AppRepositories.alarmGeneration()
         // Network sync is best-effort background work outside the broadcast lifetime.
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
             try {
                 if (generation != AppRepositories.sessionGeneration()) return@launch
                 if (!repository.signedIn) return@launch
                 val response = withTimeoutOrNull(BOOT_SYNC_BUDGET_MS) { repository.sync() } ?: return@launch
-                AppRepositories.ifCurrent(generation) {
+                AppRepositories.consumeIfCurrent(generation, alarmGeneration) {
                     if (repository.signedIn) scheduler.consume(response)
                 }
             } catch (error: CancellationException) {

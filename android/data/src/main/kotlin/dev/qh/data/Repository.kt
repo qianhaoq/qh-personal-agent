@@ -114,7 +114,10 @@ class RealRepository(private val api: AgentApi, private val store: TokenStore,
         if (text != null) validText(text, 5000)
         return authorized { api.patchNote(it, noteId, NotePatch(rev, text)).note }
     }
-    override suspend fun delete(noteId: String) = authorized { api.deleteNote(it, noteId) }
+    override suspend fun delete(noteId: String) {
+        try { authorized { api.deleteNote(it, noteId) } }
+        catch (error: HttpException) { if (error.code() != 404) throw error }
+    }
     override suspend fun ask(text: String): Answer {
         validText(text, 2000)
         return authorized { api.ask(it, askBody(text)) }
@@ -230,7 +233,7 @@ class MockRepository(private val seedOnLogin: Boolean = true, private val organi
     }
     override suspend fun delete(noteId: String) {
         requireSession()
-        require(entries.remove(noteId) != null) { "记事不存在（404）" }
+        if (entries.remove(noteId) == null) return
         organizeReads.remove(noteId); noteChanges.remove(noteId)
         val related = reminders.values.filter { it.note_id == noteId }.map { it.id }.toSet()
         actions.values.filter { it.reminder_id in related || it.payload["note_id"] == noteId }

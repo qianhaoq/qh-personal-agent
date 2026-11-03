@@ -10,6 +10,7 @@ import java.util.concurrent.atomic.AtomicLong
 object AppRepositories {
     private val lock = Any()
     private val generation = AtomicLong(0)
+    private val alarmGeneration = AtomicLong(0)
     @Volatile private var real: RealRepository? = null
 
     fun sessionGeneration(): Long = generation.get()
@@ -20,6 +21,18 @@ object AppRepositories {
     /** Run [block] only if [expected] is still the current session generation. */
     fun ifCurrent(expected: Long, block: () -> Unit) = synchronized(lock) {
         if (generation.get() == expected) block()
+    }
+
+    fun alarmGeneration(): Long = alarmGeneration.get()
+
+    /** Invalidate stale sync responses and cancel deleted-note alarms under the consume lock. */
+    fun invalidateAlarms(block: () -> Unit) = synchronized(lock) {
+        alarmGeneration.incrementAndGet()
+        block()
+    }
+
+    fun consumeIfCurrent(session: Long, alarms: Long, block: () -> Unit) = synchronized(lock) {
+        if (generation.get() == session && alarmGeneration.get() == alarms) block()
     }
 
     fun real(context: Context): RealRepository {

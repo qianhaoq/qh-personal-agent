@@ -41,6 +41,9 @@ class RepositoryTest {
         val action = repo.confirmReminder(scheduled.id, scheduled.rev).action!!
         val cursor = repo.sync().cursor
         repo.delete("n1")
+        val deletedCursor = repo.sync().cursor
+        repo.delete("n1")
+        assertEquals(deletedCursor, repo.sync().cursor)
         assertTrue(repo.notes().isEmpty())
         val sync = repo.sync(cursor)
         assertEquals(listOf("n1"), sync.deleted.notes)
@@ -80,6 +83,21 @@ class RepositoryTest {
             server.json("""{"error":{"code":"conflict","message":"conflict"}}""", 409)
             try { repo.patch("n1", 2, "新文"); fail("Expected conflict") }
             catch (e: retrofit2.HttpException) { assertEquals("版本冲突，请同步后重试", readableError(e)) }
+        }
+    }
+
+    @Test fun retrofitDeleteTreatsOnly404AsSuccess() = runBlocking {
+        MockWebServer().use { server ->
+            server.start()
+            val store = Store().apply { tokens = Tokens("access", "refresh", 900, "u1") }
+            val repo = RealRepository(realApi(server.url("/").toString()), store)
+            server.enqueue(MockResponse().setResponseCode(404))
+            repo.delete("n1")
+            assertTrue(repo.signedIn)
+            server.enqueue(MockResponse().setResponseCode(500))
+            try { repo.delete("n1"); fail("Expected server error") }
+            catch (e: retrofit2.HttpException) { assertEquals(500, e.code()) }
+            assertEquals(2, server.requestCount)
         }
     }
 

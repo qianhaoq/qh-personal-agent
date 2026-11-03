@@ -5,6 +5,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
@@ -106,12 +107,15 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
     }
     private suspend fun refresh() = refreshMutex.withLock {
         val generation = AppRepositories.sessionGeneration()
+        val alarmGeneration = AppRepositories.alarmGeneration()
         val sync = repo.sync()
         if (!repo.signedIn || AppRepositories.sessionGeneration() != generation) {
             if (!repo.signedIn) clearSession()
             return@withLock
         }
-        alarms.consume(sync)
+        AppRepositories.consumeIfCurrent(generation, alarmGeneration) {
+            if (repo.signedIn) alarms.consume(sync)
+        }
         reminders = sync.reminders.sortedWith(compareBy(nullsLast()) { it.fire_at })
         val fresh = repo.notes()
         if (repo.signedIn && AppRepositories.sessionGeneration() == generation) notes = fresh
@@ -153,7 +157,7 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
             }
             editing = null; editText = ""
             done()
-            if (updated.rev > original.rev || (updated.status != original.status && updated.status == "uploaded")) {
+            if (updated.status == "uploaded") {
                 organizeJobs[updated.id]?.cancelAndJoin()
                 waitForOrganize(Created(updated.id, updated.status, updated.rev))
             }
@@ -171,6 +175,10 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
     fun deleteNote(note: Note) = run {
         refreshMutex.withLock {
             repo.delete(note.id)
+            AppRepositories.invalidateAlarms {
+                reminders.filter { it.note_id == note.id }.forEach { alarms.cancelReminder(it.id) }
+            }
+            reminders = reminders.filterNot { it.note_id == note.id }
             organizeJobs.remove(note.id)?.cancel()
             organizingNoteIds = organizingNoteIds - note.id
             notes = notes.filterNot { it.id == note.id }
@@ -310,10 +318,13 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                         }
                     }
                     composable("edit") {
+                        BackHandler(enabled = model.busy) { }
                         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                             OutlinedTextField(model.editText, model::updateEdit, label = { Text("记事内容（最多 5000 字）") },
                                 modifier = Modifier.fillMaxWidth().weight(1f), enabled = !model.busy)
-                            Button({ model.saveEdit { nav.popBackStack() } },
+                            Button({ model.saveEdit {
+                                if (nav.currentBackStackEntry?.destination?.route == "edit") nav.popBackStack()
+                            } },
                                 enabled = !model.busy && model.editing != null && model.editText.isNotBlank()) { Text("保存") }
                             TextButton({ nav.popBackStack() }, enabled = !model.busy) { Text("取消") }
                         }
