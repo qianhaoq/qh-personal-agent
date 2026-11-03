@@ -1,4 +1,4 @@
-# Android S10 · 问答答案系统 TTS 播报
+# Android S11 · ISO 时间本地可读展示
 
 紧凑的 Kotlin / Compose 客户端：登录、时间线、记事创建/编辑/删除、问答、提醒同步与确认；
 确认后的 `schedule_reminder` Channel action 会落到 AlarmManager，响铃时显示系统通知。
@@ -50,6 +50,24 @@ api.useMock=false
 默认地址为生产占位 `https://agent.pinhaoyun.com/`；debug 默认 mock 不访问该地址。
 切回 mock：删除 `api.useMock=false` 或改为 `api.useMock=true`。
 `local.properties` 在构建时读取，改动后需重新构建安装。
+
+## S11 可读本地时间
+
+提醒卡片与详情关联提醒的 fire_at、时间线与详情的 recorded_at、todos due
+统一通过 `:app` 的纯函数 `DisplayTime.kt` 展示。`formatDisplayTime(iso, zone)`
+默认使用设备 `ZoneId.systemDefault()`，可注入固定时区；Instant / OffsetDateTime
+转为本地墙钟 `2026年11月3日 20:00`，省略秒，不硬编码 +08:00。
+纯日期显示 `2026年11月3日`，不做时区位移。不含偏移的日期时间不猜测时区。
+null / blank 返回空串，解析失败返回 trim 后原文且不抛解析异常；
+`formatDisplayTimeOrUnset(iso, zone)` 对空串返回「未设置」。待办空 due 不显示括号。
+仅改变展示，排序继续用原始 ISO 字符串，DTO、请求与闹钟时间不变。
+JVM 单测覆盖空值、Zulu、偏移、固定时区、纯日期、非法输入、surrogate 与奇怪空白。
+
+不做清单：不改 ASR / VoiceAsr / AsrState、AlarmManager / ReminderAlarms /
+ReminderAlarmReceiver / ReminderBootReceiver、confirmReminder 调用体 / body、boot restore 核心路径；
+不提供 confirm 时修改 fire_at/title 的 UI；不改 server、不部署、不碰拼好运；
+不引入 FCM / Room / Hilt / Pipecat、小组件、语音搜索、提醒完成/取消 API 或云端 TTS。
+保留手动 DI，不新增 Gradle 依赖或权限。
 
 ## S10 问答 TTS
 
@@ -174,7 +192,7 @@ pause/stop 保留 Permission 状态，允许权限结果继续启动识别。
 ## 模块与契约
 
 - `:app`：Compose Navigation、提醒列表与确认、AlarmManager、通知、开机重放、
-  S10 系统 TTS 答案播报、S9 提醒↔记事跳转与只读关联提醒、S8 记事详情与搜索/问答引用跳转、S7 记忆搜索、S6 记事编辑/删除、创建后短轮询与整理字段展示、系统 SpeechRecognizer 语音记事与语音提问、ViewModel 保留旋转期间状态、手动 DI。
+  S11 本地可读时间、S10 系统 TTS 答案播报、S9 提醒↔记事跳转与只读关联提醒、S8 记事详情与搜索/问答引用跳转、S7 记忆搜索、S6 记事编辑/删除、创建后短轮询与整理字段展示、系统 SpeechRecognizer 语音记事与语音提问、ViewModel 保留旋转期间状态、手动 DI。
 - `:data`：纯 JVM DTO、Retrofit、仓库、mock、S5 轮询纯函数和测试。接口核对自当前服务端
   `app/schemas.py` 与 `app/api/{auth,notes,ask,sync,reminders}.py`，未知响应字段由 Gson 忽略。
 - `:core-security`：Android Keystore MasterKey + EncryptedSharedPreferences。
@@ -232,12 +250,12 @@ JAR SHA-256：`cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8`
 ## 本次环境验证
 
 使用 `/home/box/.local/jdk/jdk-17.0.16+8` 与 `/home/box/.local/android-sdk`
-（`GRADLE_USER_HOME=/tmp/s10-gradle`）。
+（`GRADLE_USER_HOME=/tmp/s11-gradle`）。
 `./gradlew --no-daemon :data:test :app:testDebugUnitTest :app:assembleDebug`：`BUILD SUCCESSFUL`。
 `:data` RepositoryTest：**26** + OrganizePollTest：**9**（共 35），0 failures / 0 errors / 0 skipped；
-`:app` AnswerTtsTest：**7** + AsrStateTest：**6** + VoiceQuestionTest：**2** + EditBehaviorTest：**5** + ReminderNoteLinkTest：**4** + AppRepositoriesTest：**2**（共 26），0 failures / 0 errors / 0 skipped；
+`:app` DisplayTimeTest：**6** + AnswerTtsTest：**7** + AsrStateTest：**6** + VoiceQuestionTest：**2** + EditBehaviorTest：**5** + ReminderNoteLinkTest：**4** + AppRepositoriesTest：**2**（共 32），0 failures / 0 errors / 0 skipped；
 `:core-security` unit tests：`NO-SOURCE`。
 `python3 scripts/check-invariants.py`：`0 error(s), 0 warning(s)`。
-应用标签与标题更新为 S10；问答成功后自动播报 answer，可停止播报。
-未运行模拟器/真机、Keystore instrumentation 或连接实际服务的端到端测试；
-中文引擎缺失、后台停止、旋转、连续问答、听写前停播仍需设备验收。
+应用标签与标题更新为 S11；提醒/记事/待办时间改为本地中文墙钟展示，排序仍用原始 ISO。
+未运行模拟器/真机或连接实际服务的端到端测试；
+设备时区切换与墙钟对照仍需真机验收。

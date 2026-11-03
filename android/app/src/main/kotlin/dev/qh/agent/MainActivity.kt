@@ -274,7 +274,7 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
 fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> VoiceAsr, requestMicrophone: () -> Unit, cancelVoice: () -> Unit) {
     Surface(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().imePadding().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("随记 · S10" + if (BuildConfig.USE_MOCK_API) " / 本地演示" else " / 服务器", style = MaterialTheme.typography.headlineSmall)
+            Text("随记 · S11" + if (BuildConfig.USE_MOCK_API) " / 本地演示" else " / 服务器", style = MaterialTheme.typography.headlineSmall)
             if (model.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
             model.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             if (!model.signedIn) {
@@ -316,7 +316,7 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                                     Card(Modifier.fillMaxWidth()) {
                                         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                                             Text(reminder.title, style = MaterialTheme.typography.titleMedium)
-                                            Text("时间：${reminder.fire_at ?: "未设置"}")
+                                            Text("时间：${formatDisplayTimeOrUnset(reminder.fire_at)}")
                                             Text("状态：${reminderStatus(reminder.status)} · rev ${reminder.rev}",
                                                 style = MaterialTheme.typography.bodySmall)
                                             reminderNoteIdForOpen(reminder.note_id)?.let { id ->
@@ -347,10 +347,10 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                                             }
                                             note.tags?.takeIf { it.isNotEmpty() }?.let { Text("标签：${it.joinToString(", ")}") }
                                             note.todos.orEmpty().forEach { todo ->
-                                                Text("• ${todo.text}" + (todo.due?.let { "（$it）" } ?: ""))
+                                                Text("• ${todo.text}" + (formatDisplayTime(todo.due).takeIf { it.isNotEmpty() }?.let { "（$it）" } ?: ""))
                                             }
                                             note.category?.let { Text("分类：$it") }
-                                            Text("${note.recorded_at.orEmpty()} · ${noteStatus(note.status)}", style = MaterialTheme.typography.bodySmall)
+                                            Text("${formatDisplayTime(note.recorded_at)} · ${noteStatus(note.status)}", style = MaterialTheme.typography.bodySmall)
                                         }
                                     }
                                 }
@@ -410,11 +410,11 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                                     Text("待办：")
                                     if (note.todos.isNullOrEmpty()) Text("无")
                                     note.todos.orEmpty().forEach { todo ->
-                                        Text("• ${todo.text}" + (todo.due?.let { "（$it）" } ?: ""))
+                                        Text("• ${todo.text}" + (formatDisplayTime(todo.due).takeIf { it.isNotEmpty() }?.let { "（$it）" } ?: ""))
                                     }
                                     Text("分类：${note.category ?: "未分类"}")
                                     Text("状态：${noteStatus(note.status)}")
-                                    Text("记录时间：${note.recorded_at ?: "未设置"}")
+                                    Text("记录时间：${formatDisplayTimeOrUnset(note.recorded_at)}")
                                     Text("rev：${note.rev}")
                                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                         TextButton({ model.beginEdit(note); nav.navigate("edit") }, enabled = !model.busy) { Text("编辑") }
@@ -428,7 +428,7 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                                         Card(Modifier.fillMaxWidth()) {
                                             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                                                 Text(reminder.title, style = MaterialTheme.typography.titleMedium)
-                                                Text("时间：${reminder.fire_at ?: "未设置"}")
+                                                Text("时间：${formatDisplayTimeOrUnset(reminder.fire_at)}")
                                                 Text("状态：${reminderStatus(reminder.status)}", style = MaterialTheme.typography.bodySmall)
                                             }
                                         }
