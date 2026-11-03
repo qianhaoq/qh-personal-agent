@@ -8,6 +8,30 @@ import org.junit.Test
 import com.google.gson.JsonParser
 
 class RepositoryTest {
+    @Test fun mockLoginSyncReminderLinksLoadDemoNoteDetails() = runBlocking {
+        val repo = MockRepository()
+        repo.login("demo")
+        val synced = repo.sync(0, 100)
+        val demoIds = setOf("note-demo-1", "note-demo-2")
+        assertEquals(2, synced.reminders.size)
+        assertEquals(demoIds, synced.reminders.map { it.note_id }.toSet())
+        assertEquals(demoIds, synced.notes.map { it.id }.toSet())
+        val listedNotes = repo.notes().associateBy { it.id }
+        assertEquals(demoIds, listedNotes.keys)
+        for (reminder in synced.reminders) {
+            val noteId = reminder.note_id
+            if (!noteId.isNullOrBlank()) {
+                val detail = repo.note(noteId)
+                assertEquals(noteId, detail.id)
+                assertEquals(reminder.title, detail.title)
+                assertEquals(listedNotes[noteId], detail)
+                assertEquals(synced.notes.single { it.id == noteId }, detail)
+            }
+        }
+        assertEquals("note-demo-1", repo.search("绿植").single().note_id)
+        assertEquals("note-demo-2", repo.search("周报").single().note_id)
+    }
+
     @Test fun mockNoteDetailTracksDeletionAndSession() = runBlocking {
         val repo = MockRepository(organizeAfterReads = 0)
         repo.login("demo")
@@ -252,10 +276,12 @@ class RepositoryTest {
         val first = noteDraft("买牛奶", "client-1")
         repo.create(first); repo.create(first.copy(text = "重复提交"))
         repo.create(noteDraft("写日记", "client-2"))
-        assertEquals(listOf("写日记", "买牛奶"), repo.notes().map { it.text })
+        assertEquals(listOf("写日记", "买牛奶", "周五整理周报，回顾本周工作", "每周给绿植浇水"),
+            repo.notes().map { it.text })
         assertTrue(repo.ask("今天做什么？").answer.contains("本地演示"))
         repo.logout(); assertFalse(repo.signedIn)
-        repo.login("another-demo"); assertTrue(repo.notes().isEmpty())
+        repo.login("another-demo")
+        assertEquals(setOf("note-demo-1", "note-demo-2"), repo.notes().map { it.id }.toSet())
     }
     @Test fun mockRejectsEmptyAndOversizeInput() = runBlocking {
         val repo = MockRepository(); repo.login("demo")
@@ -263,7 +289,7 @@ class RepositoryTest {
             try { repo.create(noteDraft(text)); fail("Expected validation") } catch (_: IllegalArgumentException) { }
         }
         try { repo.ask("x".repeat(2001)); fail("Expected validation") } catch (_: IllegalArgumentException) { }
-        assertTrue(repo.notes().isEmpty())
+        assertEquals(setOf("note-demo-1", "note-demo-2"), repo.notes().map { it.id }.toSet())
     }
     @Test fun mockSyncConfirmPaginationAndDeletedChanges() = runBlocking {
         val repo = MockRepository(seedOnLogin = false); repo.login("demo")

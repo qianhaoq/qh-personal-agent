@@ -190,8 +190,14 @@ class MockRepository(private val seedOnLogin: Boolean = true, private val organi
         require(invite.isNotBlank()) { "请输入邀请码" }
         active = true
         if (seedOnLogin && reminders.isEmpty()) {
-            memories["demo-plants"] = SearchHit("memory-demo-plants", null, "每周给绿植浇水", 1.0)
-            memories["demo-report"] = SearchHit("memory-demo-report", null, "周五整理周报，回顾本周工作", 1.0)
+            listOf(
+                Note("note-demo-1", "每周给绿植浇水", "organized", 1, title = "给绿植浇水"),
+                Note("note-demo-2", "周五整理周报，回顾本周工作", "organized", 1, title = "整理周报")
+            ).forEach { note ->
+                entries[note.id] = note
+                noteChanges[note.id] = nextSeq()
+                remember(note)
+            }
             seedReminder("给绿植浇水", Instant.now().plusSeconds(3600).toString())
             seedReminder("整理周报", Instant.now().plusSeconds(7200).toString())
         }

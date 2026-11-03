@@ -8,7 +8,7 @@
     <queries>
         <intent><action android:name="android.speech.RecognitionService" /></intent>
     </queries>
-    <application android:label="随记 S8" android:theme="@android:style/Theme.Material.Light.NoActionBar"
+    <application android:label="随记 S9" android:theme="@android:style/Theme.Material.Light.NoActionBar"
         android:allowBackup="false" android:usesCleartextTraffic="false" android:supportsRtl="true">
         <activity android:name=".MainActivity" android:exported="true">
             <intent-filter>
