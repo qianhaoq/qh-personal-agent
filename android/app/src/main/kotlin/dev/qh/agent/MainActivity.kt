@@ -70,6 +70,9 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
     var busy by mutableStateOf(false); private set
     var error by mutableStateOf<String?>(null); private set
     var notes by mutableStateOf(emptyList<Note>()); private set
+    var detailNote by mutableStateOf<Note?>(null); private set
+    fun clearDetail() { detailNote = null }
+    fun openNote(noteId: String) = run { clearDetail(); detailNote = repo.note(noteId) }
     var reminders by mutableStateOf(emptyList<ReminderDto>()); private set
     var answer by mutableStateOf<Answer?>(null); private set
     var invite by mutableStateOf("")
@@ -86,6 +89,7 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
     private fun clearUi() {
         organizeJobs.values.toList().forEach { it.cancel() }; organizeJobs.clear()
         organizingNoteIds = emptySet()
+        clearDetail()
         editing = null; editText = ""
         searchQuery = ""; searchHits = emptyList(); searchCompleted = false
         notes = emptyList(); reminders = emptyList(); answer = null; draft = ""; question = ""; pending = null; draftSource = "app"
@@ -124,7 +128,10 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
             }
         }
         val fresh = repo.notes()
-        if (repo.signedIn && AppRepositories.sessionGeneration() == generation) notes = fresh
+        if (repo.signedIn && AppRepositories.sessionGeneration() == generation) {
+            notes = fresh
+            detailNote = syncedDetailNote(detailNote, fresh)
+        }
     }
     fun login() = run { repo.login(invite); AppRepositories.bumpSession(); invite = "" }
     fun reload() = run { refresh() }
@@ -159,6 +166,7 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
             val updated = refreshMutex.withLock {
                 repo.patch(original.id, original.rev, editText).also { note ->
                     notes = notes.map { if (it.id == note.id) note else it }
+                    if (detailNote?.id == note.id) detailNote = note
                 }
             }
             editing = null; editText = ""
@@ -178,7 +186,7 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
             } else throw e
         }
     }
-    fun deleteNote(note: Note) = run {
+    fun deleteNote(note: Note, done: () -> Unit = {}) = run {
         refreshMutex.withLock {
             repo.delete(note.id)
             AppRepositories.invalidateAlarms {
@@ -190,7 +198,9 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
             organizeJobs.remove(note.id)?.cancel()
             organizingNoteIds = organizingNoteIds - note.id
             notes = notes.filterNot { it.id == note.id }
+            if (detailNote?.id == note.id) clearDetail()
         }
+        done()
         refresh()
     }
     private fun waitForOrganize(created: Created) {
@@ -209,6 +219,7 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
                             val fresh = repo.notes()
                             if (!repo.signedIn || AppRepositories.sessionGeneration() != generation) return@withTimeoutOrNull
                             notes = fresh
+                            detailNote = syncedDetailNote(detailNote, fresh)
                             status = fresh.find { it.id == id }?.status
                         }
                         attempt++
@@ -252,7 +263,7 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
 fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> VoiceAsr, requestMicrophone: () -> Unit, cancelVoice: () -> Unit) {
     Surface(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().imePadding().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("随记 · S7" + if (BuildConfig.USE_MOCK_API) " / 本地演示" else " / 服务器", style = MaterialTheme.typography.headlineSmall)
+            Text("随记 · S8" + if (BuildConfig.USE_MOCK_API) " / 本地演示" else " / 服务器", style = MaterialTheme.typography.headlineSmall)
             if (model.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
             model.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             if (!model.signedIn) {
@@ -262,6 +273,7 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                 Button(model::login, enabled = !model.busy && model.invite.isNotBlank()) { Text("登录") }
             } else {
                 val nav = rememberNavController()
+                val openDetail: (String) -> Unit = { id -> model.openNote(id); nav.navigate("detail") }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     TextButton({ cancelVoice(); nav.navigate("timeline") { popUpTo("timeline") { inclusive = true } } }, enabled = !model.busy) { Text("时间线") }
                     TextButton({ cancelVoice(); model.logout() }, enabled = !model.busy) { Text("退出") }
@@ -310,6 +322,7 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                                         Column(Modifier.padding(12.dp)) {
                                             note.title?.let { Text(it, style = MaterialTheme.typography.titleMedium) }
                                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                                TextButton({ openDetail(note.id) }, enabled = !model.busy) { Text("详情") }
                                                 TextButton({ model.beginEdit(note); nav.navigate("edit") }, enabled = !model.busy) { Text("编辑") }
                                                 TextButton({ deleting = note }, enabled = !model.busy) { Text("删除") }
                                             }
@@ -343,11 +356,58 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                                 Card(Modifier.fillMaxWidth()) {
                                     Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                                         Text(hit.text)
-                                        hit.note_id?.let { Text("记事：$it", style = MaterialTheme.typography.bodySmall) }
+                                        hit.note_id?.takeIf { it.isNotBlank() }?.let { id ->
+                                            Text("记事：$id", style = MaterialTheme.typography.bodySmall)
+                                            TextButton({ openDetail(id) }, enabled = !model.busy) { Text("打开记事") }
+                                        }
                                         hit.score?.let { Text("相关度：$it", style = MaterialTheme.typography.bodySmall) }
                                     }
                                 }
                             }
+                        }
+                    }
+                    composable("detail") {
+                        BackHandler(enabled = model.busy) { }
+                        var deleting by remember { mutableStateOf(false) }
+                        val note = model.detailNote
+                        if (deleting && note != null) {
+                            AlertDialog(onDismissRequest = { if (!model.busy) deleting = false },
+                                title = { Text("删除记事？") }, text = { Text("相关提醒也会删除，此操作不可撤销。") },
+                                confirmButton = {
+                                    TextButton({
+                                        deleting = false
+                                        model.deleteNote(note) {
+                                            if (nav.currentBackStackEntry?.destination?.route == "detail") nav.popBackStack()
+                                        }
+                                    }, enabled = !model.busy) { Text("删除") }
+                                }, dismissButton = {
+                                    TextButton({ deleting = false }, enabled = !model.busy) { Text("取消") }
+                                })
+                        }
+                        LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            item {
+                                TextButton({ model.clearDetail(); nav.popBackStack() }, enabled = !model.busy) { Text("返回") }
+                            }
+                            if (note != null) {
+                                item {
+                                    Text("标题：${note.title ?: "未整理"}", style = MaterialTheme.typography.titleMedium)
+                                    Text(note.text)
+                                    Text("标签：${note.tags.orEmpty().joinToString(", ").ifEmpty { "无" }}")
+                                    Text("待办：")
+                                    if (note.todos.isNullOrEmpty()) Text("无")
+                                    note.todos.orEmpty().forEach { todo ->
+                                        Text("• ${todo.text}" + (todo.due?.let { "（$it）" } ?: ""))
+                                    }
+                                    Text("分类：${note.category ?: "未分类"}")
+                                    Text("状态：${noteStatus(note.status)}")
+                                    Text("记录时间：${note.recorded_at ?: "未设置"}")
+                                    Text("rev：${note.rev}")
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        TextButton({ model.beginEdit(note); nav.navigate("edit") }, enabled = !model.busy) { Text("编辑") }
+                                        TextButton({ deleting = true }, enabled = !model.busy) { Text("删除") }
+                                    }
+                                }
+                            } else if (!model.busy) item { Text("未能加载记事，请返回重试。") }
                         }
                     }
                     composable("edit") {
@@ -430,7 +490,12 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                             }
                             model.answer?.let { answer ->
                                 item { Text(answer.answer) }
-                                items(answer.citations) { Text("来源 ${it.note_id}：${it.text}") }
+                                items(answer.citations) { citation ->
+                                    Text("来源 ${citation.note_id?.takeIf { it.isNotBlank() } ?: "未知记事"}：${citation.text}")
+                                    citation.note_id?.takeIf { it.isNotBlank() }?.let { id ->
+                                        TextButton({ openDetail(id) }, enabled = !model.busy) { Text("打开记事") }
+                                    }
+                                }
                             }
                         }
                     }

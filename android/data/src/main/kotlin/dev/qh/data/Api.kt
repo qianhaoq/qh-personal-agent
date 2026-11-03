@@ -20,7 +20,7 @@ data class NotePatch(val rev: Int, val text: String? = null)
 data class NotePatchResponse(val note: Note, val rev: Int)
 data class NotePage(val items: List<Note>, val next_cursor: Long?)
 data class AskRequest(val text: String, val client_time: String, val timezone: String)
-data class Citation(val memory_id: String, val note_id: String, val text: String)
+data class Citation(val memory_id: String, val note_id: String?, val text: String)
 data class SearchHit(val memory_id: String, val note_id: String?, val text: String, val score: Double?)
 data class SearchResponse(val items: List<SearchHit>)
 data class Answer(val answer: String, val citations: List<Citation>)
@@ -46,6 +46,7 @@ interface AgentApi {
     @POST("v1/auth/refresh") suspend fun refresh(@Body body: RefreshRequest): Tokens
     @POST("v1/auth/logout") suspend fun logout(@Header("Authorization") bearer: String)
     @POST("v1/notes") suspend fun create(@Header("Authorization") bearer: String, @Body body: NoteCreate): Created
+    @GET("v1/notes/{id}") suspend fun getNote(@Header("Authorization") bearer: String, @Path("id") id: String): Note
     @PATCH("v1/notes/{id}") suspend fun patchNote(@Header("Authorization") bearer: String,
         @Path("id") id: String, @Body body: NotePatch): NotePatchResponse
     @DELETE("v1/notes/{id}") suspend fun deleteNote(@Header("Authorization") bearer: String,

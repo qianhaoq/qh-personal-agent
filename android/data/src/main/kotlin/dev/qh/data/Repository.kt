@@ -24,6 +24,7 @@ interface Repository {
     val signedIn: Boolean
     suspend fun login(invite: String)
     suspend fun logout()
+    suspend fun note(noteId: String): Note
     suspend fun notes(): List<Note>
     suspend fun create(body: NoteCreate): Created
     suspend fun patch(noteId: String, rev: Int, text: String?): Note
@@ -48,6 +49,7 @@ fun readableError(error: Throwable): String = when (error) {
         val body = runCatching { Gson().fromJson(error.response()?.errorBody()?.string(), ErrorEnvelope::class.java) }.getOrNull()
         when (error.code()) {
             401 -> "登录已失效或邀请码无效，请重新登录"
+            404 -> body?.error?.message?.take(240) ?: "记事不存在（404）"
             409 -> "版本冲突，请同步后重试"
             422 -> "输入不符合要求，请检查长度和格式"
             else -> body?.error?.message?.take(240) ?: "服务请求失败（HTTP ${error.code()}），请重试"
@@ -94,6 +96,10 @@ class RealRepository(private val api: AgentApi, private val store: TokenStore,
         try { store.read()?.let { api.logout("Bearer ${it.access_token}") } }
         finally { store.write(null) }
         Unit
+    }
+    override suspend fun note(noteId: String): Note {
+        require(noteId.isNotBlank()) { "记事 ID 不能为空" }
+        return authorized { api.getNote(it, noteId) }
     }
     override suspend fun notes(): List<Note> = authorized { bearer ->
         val result = mutableListOf<Note>()
@@ -198,6 +204,11 @@ class MockRepository(private val seedOnLogin: Boolean = true, private val organi
     }
     private fun requireSession() { if (!active) throw SessionExpired() }
     private fun nextSeq() = ++cursor
+    override suspend fun note(noteId: String): Note {
+        requireSession()
+        require(noteId.isNotBlank()) { "记事 ID 不能为空" }
+        return entries[noteId] ?: throw IllegalArgumentException("记事不存在（404）")
+    }
     override suspend fun notes(): List<Note> {
         requireSession()
         organizeReads.keys.toList().forEach { id ->

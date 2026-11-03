@@ -1,4 +1,4 @@
-# Android S7 · 记忆搜索
+# Android S8 · 记事详情与引用跳转
 
 紧凑的 Kotlin / Compose 客户端：登录、时间线、记事创建/编辑/删除、问答、提醒同步与确认；
 确认后的 `schedule_reminder` Channel action 会落到 AlarmManager，响铃时显示系统通知。
@@ -50,6 +50,17 @@ api.useMock=false
 默认地址为生产占位 `https://agent.pinhaoyun.com/`；debug 默认 mock 不访问该地址。
 切回 mock：删除 `api.useMock=false` 或改为 `api.useMock=true`。
 `local.properties` 在构建时读取，改动后需重新构建安装。
+
+## S8 记事详情
+
+时间线「详情」、搜记忆中带非空 note_id 的「打开记事」、问答 citations 的
+「打开记事」均通过 Repository.note 调用 `GET /v1/notes/{id}`，沿用 Bearer 与
+401 refresh。详情展示 title/text/tags/todos/category/status/recorded_at/rev；
+加载期间禁用操作，404 显示可读错误，旧详情在新请求前清空，退出清空详情。
+详情可复用编辑页与删除确认；编辑成功更新详情，删除成功返回来源页。
+无 note_id 的搜索结果不提供跳转；已删除或不可访问的引用不会降级展示缓存正文。
+页面状态仅保留在 ViewModel 内存，不做离线缓存；不改 server、不部署，
+不改 ASR、AlarmManager、confirm 或 boot 核心逻辑，无语音搜索、提醒完成/取消 API 或小组件。
 
 ## S7 记忆搜索
 
@@ -132,7 +143,7 @@ pause/stop 保留 Permission 状态，允许权限结果继续启动识别。
 ## 模块与契约
 
 - `:app`：Compose Navigation、提醒列表与确认、AlarmManager、通知、开机重放、
-  S7 记忆搜索、S6 记事编辑/删除、创建后短轮询与整理字段展示、系统 SpeechRecognizer 语音记事与语音提问、ViewModel 保留旋转期间状态、手动 DI。
+  S8 记事详情与搜索/问答引用跳转、S7 记忆搜索、S6 记事编辑/删除、创建后短轮询与整理字段展示、系统 SpeechRecognizer 语音记事与语音提问、ViewModel 保留旋转期间状态、手动 DI。
 - `:data`：纯 JVM DTO、Retrofit、仓库、mock、S5 轮询纯函数和测试。接口核对自当前服务端
   `app/schemas.py` 与 `app/api/{auth,notes,ask,sync,reminders}.py`，未知响应字段由 Gson 忽略。
 - `:core-security`：Android Keystore MasterKey + EncryptedSharedPreferences。
@@ -141,7 +152,7 @@ pause/stop 保留 Permission 状态，允许权限结果继续启动识别。
 
 真实路由：`POST /v1/auth/login`、`POST /v1/auth/refresh`、
 `POST /v1/auth/logout`、`POST /v1/notes`、`GET /v1/notes`、`POST /v1/ask`、
-`PATCH /v1/notes/{id}`、`DELETE /v1/notes/{id}`、
+`GET /v1/notes/{id}`、`PATCH /v1/notes/{id}`、`DELETE /v1/notes/{id}`、
 `GET /v1/search`、`GET /v1/sync`、`POST /v1/reminders/{id}/confirm`。
 创建记事使用 `client_note_id/text/recorded_at/timezone/source`，返回 `note_id/status/rev`。
 记事列表遍历 `next_cursor` 分页；问答使用 `text/client_time/timezone` 并显示 citations。
@@ -191,11 +202,11 @@ JAR SHA-256：`cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8`
 
 使用 `/home/box/.local/jdk/jdk-17.0.16+8` 与 `/home/box/.local/android-sdk`。
 `./gradlew --no-daemon :data:test :app:testDebugUnitTest :app:assembleDebug`：`BUILD SUCCESSFUL`。
-`:data` RepositoryTest：**21** + OrganizePollTest：**9**（共 30），0 failures / 0 errors / 0 skipped；
+`:data` RepositoryTest：**24** + OrganizePollTest：**9**（共 33），0 failures / 0 errors / 0 skipped；
 `:app` AsrStateTest：**6** + VoiceQuestionTest：**2** + EditBehaviorTest：**2** + AppRepositoriesTest：**2**（共 12），0 failures / 0 errors / 0 skipped；
 `:core-security` unit tests：`NO-SOURCE`。
 `python3 scripts/check-invariants.py`：`0 error(s), 0 warning(s)`。
-应用标签更新为 S7；时间线可进入「搜记忆」，对接 `GET /v1/search`。
+应用标签更新为 S8；时间线/搜记忆/问答引用可进入记事详情，对接 `GET /v1/notes/{id}`。
 未运行模拟器/真机、Keystore instrumentation 或连接实际服务的端到端测试。
 会话与同步安全：前台与开机共用 `AppRepositories.real`（进程级单例仓库，同一 Mutex），
 并以 session generation 栅栏防止 logout 后在途 boot sync / 整理轮询再设闹钟或写回。
