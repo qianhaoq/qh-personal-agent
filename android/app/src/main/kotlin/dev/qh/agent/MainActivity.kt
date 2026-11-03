@@ -17,6 +17,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -86,7 +87,10 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
     private val refreshMutex = Mutex()
     private var pending: NoteCreate? = null
     private var draftSource = "app"
+    var onAnswer: ((String) -> Unit)? = null
+    var stopAnswerSpeech: (() -> Unit)? = null
     private fun clearUi() {
+        stopAnswerSpeech?.invoke()
         organizeJobs.values.toList().forEach { it.cancel() }; organizeJobs.clear()
         organizingNoteIds = emptySet()
         clearDetail()
@@ -248,8 +252,15 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
         searchCompleted = false; searchHits = emptyList()
         searchHits = repo.search(searchQuery); searchCompleted = true
     }
-    fun ask() = run { answer = null; answer = repo.ask(question) }
+    fun ask() = run {
+        stopAnswerSpeech?.invoke()
+        answer = null
+        answer = repo.ask(question).also { result ->
+            speakTextForAnswer(result.answer)?.let { onAnswer?.invoke(it) }
+        }
+    }
     fun logout() = run {
+        stopAnswerSpeech?.invoke()
         // Bump generation + clear alarms before network logout so in-flight boot cannot re-arm.
         AppRepositories.bumpSession()
         organizeJobs.values.toList().forEach { it.cancel() }; organizeJobs.clear()
@@ -263,7 +274,7 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
 fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> VoiceAsr, requestMicrophone: () -> Unit, cancelVoice: () -> Unit) {
     Surface(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().imePadding().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("随记 · S9" + if (BuildConfig.USE_MOCK_API) " / 本地演示" else " / 服务器", style = MaterialTheme.typography.headlineSmall)
+            Text("随记 · S10" + if (BuildConfig.USE_MOCK_API) " / 本地演示" else " / 服务器", style = MaterialTheme.typography.headlineSmall)
             if (model.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
             model.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             if (!model.signedIn) {
@@ -475,13 +486,25 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                     composable("ask") {
                         val onVoiceResult by rememberUpdatedState<(String) -> Unit>(model::askFromVoice)
                         val voice = remember { voiceFactory("文字提问") { onVoiceResult(it) } }
+                        val context = LocalContext.current
+                        val speaker = remember { AnswerSpeaker(context) }
                         val askLifecycle = LocalLifecycleOwner.current.lifecycle
-                        DisposableEffect(voice, askLifecycle) {
+                        DisposableEffect(voice, speaker, askLifecycle) {
+                            model.stopAnswerSpeech = speaker::stop
+                            model.onAnswer = { text ->
+                                if (askLifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) speaker.speak(text)
+                            }
                             val observer = LifecycleEventObserver { _, event ->
-                                if (event == Lifecycle.Event.ON_PAUSE) voice.releaseForBackground()
+                                if (event == Lifecycle.Event.ON_PAUSE) {
+                                    voice.releaseForBackground()
+                                    speaker.releaseForBackground()
+                                }
                             }
                             askLifecycle.addObserver(observer)
-                            onDispose { askLifecycle.removeObserver(observer); voice.destroy() }
+                            onDispose {
+                                model.onAnswer = null; model.stopAnswerSpeech = null
+                                askLifecycle.removeObserver(observer); voice.destroy(); speaker.destroy()
+                            }
                         }
                         LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                             item {
@@ -489,7 +512,7 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                                     modifier = Modifier.fillMaxWidth(), enabled = !model.busy && voice.state == AsrUiState.Idle)
                                 voice.message?.let { Text(it, color = MaterialTheme.colorScheme.error) }
                                 when (voice.state) {
-                                    AsrUiState.Idle -> OutlinedButton({ voice.start(requestMicrophone) }, enabled = !model.busy) { Text("语音提问") }
+                                    AsrUiState.Idle -> OutlinedButton({ speaker.stop(); voice.start(requestMicrophone) }, enabled = !model.busy) { Text("语音提问") }
                                     else -> {
                                         Text(when (voice.state) {
                                             AsrUiState.Permission -> "等待麦克风权限…"
@@ -501,6 +524,10 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                                             TextButton(voice::cancel) { Text("取消") }
                                         }
                                     }
+                                }
+                                speaker.message?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                                if (speaker.state == AnswerTtsState.Speaking) {
+                                    OutlinedButton(speaker::stop) { Text("停止播报") }
                                 }
                                 Button(model::ask, enabled = !model.busy && voice.state == AsrUiState.Idle && model.question.isNotBlank()) { Text("提问") }
                             }

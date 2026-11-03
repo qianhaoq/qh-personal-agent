@@ -1,8 +1,8 @@
-# Android S9 · 提醒↔记事双向跳转
+# Android S10 · 问答答案系统 TTS 播报
 
 紧凑的 Kotlin / Compose 客户端：登录、时间线、记事创建/编辑/删除、问答、提醒同步与确认；
 确认后的 `schedule_reminder` Channel action 会落到 AlarmManager，响铃时显示系统通知。
-系统 SpeechRecognizer 中文语音记事与语音问答。minSdk 26，compile/targetSdk 34，JDK 17，Gradle 8.7，AGP 8.5.2。
+系统 SpeechRecognizer 中文语音记事与语音问答，系统 TextToSpeech 中文答案播报。minSdk 26，compile/targetSdk 34，JDK 17，Gradle 8.7，AGP 8.5.2。
 
 ## 安装与运行
 
@@ -50,6 +50,25 @@ api.useMock=false
 默认地址为生产占位 `https://agent.pinhaoyun.com/`；debug 默认 mock 不访问该地址。
 切回 mock：删除 `api.useMock=false` 或改为 `api.useMock=true`。
 `local.properties` 在构建时读取，改动后需重新构建安装。
+
+## S10 问答 TTS
+
+文字「提问」与语音自动提问成功后，客户端 trim `Answer.answer`，非空才用系统
+TextToSpeech 自动播报，不读取 citations；DTO 只有 answer + citations，无 speak 字段。
+优先简体中文（zh-CN），无引擎、缺中文语音数据或播报失败时显示可读提示，文字答案仍可阅读。
+初始化期间只保留最新答案；新提问停止旧播报，新答案替换队列；长答案按系统单次长度上限分段，
+保留完整正文且不拆开 surrogate pair。播报期间显示「停止播报」。
+
+开始语音提问前在页面层 stop TTS；ON_PAUSE 停播并清除待播答案，离开问答页或
+onDispose 销毁引擎，logout / clearUi 停播。仅在问答页 RESUMED 时自动播报新答案；
+旋转由 ViewModel 保留答案文字，引擎重建，不重播历史答案，不恢复播报进度。
+手动 DI，不新增 Gradle 依赖或权限；Manifest queries 与 RecognitionService 并列声明 TTS_SERVICE。
+不保存音频文件；使用设备系统引擎，是否联网由系统引擎及设备语音数据决定。
+
+不做清单：不改 ASR / VoiceAsr / AsrState、AlarmManager / ReminderAlarms /
+ReminderAlarmReceiver / ReminderBootReceiver、confirmReminder body、boot restore 核心路径；
+不改 server、不部署、不碰拼好运；无云端 TTS 接入，不引入 Pipecat / FCM / Room / Hilt、
+小组件、语音搜索或提醒完成/取消 API。
 
 ## S9 提醒↔记事双向跳转
 
@@ -155,7 +174,7 @@ pause/stop 保留 Permission 状态，允许权限结果继续启动识别。
 ## 模块与契约
 
 - `:app`：Compose Navigation、提醒列表与确认、AlarmManager、通知、开机重放、
-  S9 提醒↔记事跳转与只读关联提醒、S8 记事详情与搜索/问答引用跳转、S7 记忆搜索、S6 记事编辑/删除、创建后短轮询与整理字段展示、系统 SpeechRecognizer 语音记事与语音提问、ViewModel 保留旋转期间状态、手动 DI。
+  S10 系统 TTS 答案播报、S9 提醒↔记事跳转与只读关联提醒、S8 记事详情与搜索/问答引用跳转、S7 记忆搜索、S6 记事编辑/删除、创建后短轮询与整理字段展示、系统 SpeechRecognizer 语音记事与语音提问、ViewModel 保留旋转期间状态、手动 DI。
 - `:data`：纯 JVM DTO、Retrofit、仓库、mock、S5 轮询纯函数和测试。接口核对自当前服务端
   `app/schemas.py` 与 `app/api/{auth,notes,ask,sync,reminders}.py`，未知响应字段由 Gson 忽略。
 - `:core-security`：Android Keystore MasterKey + EncryptedSharedPreferences。
@@ -167,7 +186,7 @@ pause/stop 保留 Permission 状态，允许权限结果继续启动识别。
 `GET /v1/notes/{id}`、`PATCH /v1/notes/{id}`、`DELETE /v1/notes/{id}`、
 `GET /v1/search`、`GET /v1/sync`、`POST /v1/reminders/{id}/confirm`。
 创建记事使用 `client_note_id/text/recorded_at/timezone/source`，返回 `note_id/status/rev`。
-记事列表遍历 `next_cursor` 分页；问答使用 `text/client_time/timezone` 并显示 citations。
+记事列表遍历 `next_cursor` 分页；问答使用 `text/client_time/timezone` 并显示 citations；S10 仅在客户端播报 answer 正文，不增加 API 字段。
 受保护请求发送 Bearer；401 后串行轮换 refresh 并重试一次。刷新失败即清本地会话，
 避免不确定网络结果下重放旧 refresh 导致服务端吊销设备。没有后台刷新或无限重试。
 退出尝试服务端吊销并始终清本地会话和闹钟；离线时服务端凭证可能仍有效至过期。
@@ -213,14 +232,12 @@ JAR SHA-256：`cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8`
 ## 本次环境验证
 
 使用 `/home/box/.local/jdk/jdk-17.0.16+8` 与 `/home/box/.local/android-sdk`
-（`GRADLE_USER_HOME=/tmp/s9-gradle`）。
+（`GRADLE_USER_HOME=/tmp/s10-gradle`）。
 `./gradlew --no-daemon :data:test :app:testDebugUnitTest :app:assembleDebug`：`BUILD SUCCESSFUL`。
-`:data` RepositoryTest：**25** + OrganizePollTest：**9**（共 34），0 failures / 0 errors / 0 skipped；
-`:app` AsrStateTest：**6** + VoiceQuestionTest：**2** + EditBehaviorTest：**5** + ReminderNoteLinkTest：**4** + AppRepositoriesTest：**2**（共 19），0 failures / 0 errors / 0 skipped；
+`:data` RepositoryTest：**26** + OrganizePollTest：**9**（共 35），0 failures / 0 errors / 0 skipped；
+`:app` AnswerTtsTest：**7** + AsrStateTest：**6** + VoiceQuestionTest：**2** + EditBehaviorTest：**5** + ReminderNoteLinkTest：**4** + AppRepositoriesTest：**2**（共 26），0 failures / 0 errors / 0 skipped；
 `:core-security` unit tests：`NO-SOURCE`。
 `python3 scripts/check-invariants.py`：`0 error(s), 0 warning(s)`。
-应用标签更新为 S9；提醒可进入记事详情，详情展示只读关联提醒。
-未运行模拟器/真机、Keystore instrumentation 或连接实际服务的端到端测试。
-会话与同步安全：前台与开机共用 `AppRepositories.real`（进程级单例仓库，同一 Mutex），
-并以 session generation 栅栏防止 logout 后在途 boot sync / 整理轮询再设闹钟或写回。
-分页 sync 按 ID 合并，后页覆盖前页，并应用 deleted 墓碑剔除（含 note 墓碑）。
+应用标签与标题更新为 S10；问答成功后自动播报 answer，可停止播报。
+未运行模拟器/真机、Keystore instrumentation 或连接实际服务的端到端测试；
+中文引擎缺失、后台停止、旋转、连续问答、听写前停播仍需设备验收。
