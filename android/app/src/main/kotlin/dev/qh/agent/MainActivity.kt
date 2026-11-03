@@ -263,7 +263,7 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
 fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> VoiceAsr, requestMicrophone: () -> Unit, cancelVoice: () -> Unit) {
     Surface(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().imePadding().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("随记 · S8" + if (BuildConfig.USE_MOCK_API) " / 本地演示" else " / 服务器", style = MaterialTheme.typography.headlineSmall)
+            Text("随记 · S9" + if (BuildConfig.USE_MOCK_API) " / 本地演示" else " / 服务器", style = MaterialTheme.typography.headlineSmall)
             if (model.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
             model.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             if (!model.signedIn) {
@@ -308,6 +308,9 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                                             Text("时间：${reminder.fire_at ?: "未设置"}")
                                             Text("状态：${reminderStatus(reminder.status)} · rev ${reminder.rev}",
                                                 style = MaterialTheme.typography.bodySmall)
+                                            reminderNoteIdForOpen(reminder.note_id)?.let { id ->
+                                                TextButton({ openDetail(id) }, enabled = !model.busy) { Text("打开记事") }
+                                            }
                                             if (reminder.status == "suggested") {
                                                 Button({ model.confirmReminder(reminder) },
                                                     enabled = !model.busy && reminder.fire_at != null) { Text("确认并设闹钟") }
@@ -405,6 +408,19 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                         TextButton({ model.beginEdit(note); nav.navigate("edit") }, enabled = !model.busy) { Text("编辑") }
                                         TextButton({ deleting = true }, enabled = !model.busy) { Text("删除") }
+                                    }
+                                }
+                                val relatedReminders = remindersForNote(note.id, model.reminders)
+                                if (relatedReminders.isNotEmpty()) {
+                                    item { Text("关联提醒", style = MaterialTheme.typography.titleMedium) }
+                                    items(relatedReminders, key = { "reminder:${it.id}" }) { reminder ->
+                                        Card(Modifier.fillMaxWidth()) {
+                                            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                                Text(reminder.title, style = MaterialTheme.typography.titleMedium)
+                                                Text("时间：${reminder.fire_at ?: "未设置"}")
+                                                Text("状态：${reminderStatus(reminder.status)}", style = MaterialTheme.typography.bodySmall)
+                                            }
+                                        }
                                     }
                                 }
                             } else if (!model.busy) item { Text("未能加载记事，请返回重试。") }
