@@ -1,4 +1,4 @@
-# Android S11 · ISO 时间本地可读展示
+# Android S12 · 确认前编辑标题与时间
 
 紧凑的 Kotlin / Compose 客户端：登录、时间线、记事创建/编辑/删除、问答、提醒同步与确认；
 确认后的 `schedule_reminder` Channel action 会落到 AlarmManager，响铃时显示系统通知。
@@ -51,6 +51,16 @@ api.useMock=false
 切回 mock：删除 `api.useMock=false` 或改为 `api.useMock=true`。
 `local.properties` 在构建时读取，改动后需重新构建安装。
 
+## S12 确认前编辑标题与时间
+
+时间线 suggested 提醒点击「确认并设闹钟」打开对话框，预填标题与原始 ISO 时间。
+空白或未改字段不传覆盖，沿用原值；原时间为空也可补填。时间经 Instant.parse
+校验，修改后归一化；非法格式、缺失时间、标题超过 256 码点或含 NUL 提示可读错误。
+未来时间仍由 data / 服务端校验。取消不提交，busy 时禁用操作；确认通过 Repository
+传可选 fireAt/title，成功沿用 alarms.confirmed + refresh。详情关联提醒继续只读。
+ConfirmOverrideTest 纯 JVM 测试覆盖无覆盖、单字段、双字段、空白、补填及非法输入。
+不改 ASR、闹钟/boot 核心、server，不部署，不新增依赖或权限。
+
 ## S11 可读本地时间
 
 提醒卡片与详情关联提醒的 fire_at、时间线与详情的 recorded_at、todos due
@@ -64,8 +74,8 @@ null / blank 返回空串，解析失败返回 trim 后原文且不抛解析异�
 JVM 单测覆盖空值、Zulu、偏移、固定时区、纯日期、非法输入、surrogate 与奇怪空白。
 
 不做清单：不改 ASR / VoiceAsr / AsrState、AlarmManager / ReminderAlarms /
-ReminderAlarmReceiver / ReminderBootReceiver、confirmReminder 调用体 / body、boot restore 核心路径；
-不提供 confirm 时修改 fire_at/title 的 UI；不改 server、不部署、不碰拼好运；
+ReminderAlarmReceiver / ReminderBootReceiver、boot restore 核心路径；
+不改 server、不部署、不碰拼好运；
 不引入 FCM / Room / Hilt / Pipecat、小组件、语音搜索、提醒完成/取消 API 或云端 TTS。
 保留手动 DI，不新增 Gradle 依赖或权限。
 
@@ -84,7 +94,7 @@ onDispose 销毁引擎，logout / clearUi 停播。仅在问答页 RESUMED 时�
 不保存音频文件；使用设备系统引擎，是否联网由系统引擎及设备语音数据决定。
 
 不做清单：不改 ASR / VoiceAsr / AsrState、AlarmManager / ReminderAlarms /
-ReminderAlarmReceiver / ReminderBootReceiver、confirmReminder body、boot restore 核心路径；
+ReminderAlarmReceiver / ReminderBootReceiver、boot restore 核心路径；
 不改 server、不部署、不碰拼好运；无云端 TTS 接入，不引入 Pipecat / FCM / Room / Hilt、
 小组件、语音搜索或提醒完成/取消 API。
 
@@ -96,7 +106,7 @@ ReminderAlarmReceiver / ReminderBootReceiver、confirmReminder body、boot resto
 纯函数 JVM 测试覆盖空/空白 id、trim、匹配/不匹配/空列表及顺序与状态保留。
 
 不做清单：不改 ASR / VoiceAsr / AsrState、AlarmManager / ReminderAlarms、
-confirmReminder body、boot restore 核心路径；不改 server、不部署、不触碰拼好运；
+boot restore 核心路径；不改 server、不部署、不触碰拼好运；
 不引入 FCM / Room / Hilt、小组件、语音搜索或提醒完成/取消 API。
 退出登录与 clearDetail 行为保持原样。
 
@@ -170,7 +180,7 @@ pause/stop 保留 Permission 状态，允许权限结果继续启动识别。
 
 1. 进入时间线或点「同步」时调用 `GET /v1/sync?since=0&limit=100`，真实仓库遍历
    `has_more` 并合并全部分页；界面显示 reminders，suggested 状态提供确认按钮。
-2. 「确认并设闹钟」调用 `POST /v1/reminders/{id}/confirm`，body 携带当前 `rev`。
+2. 「确认并设闹钟」调用 `POST /v1/reminders/{id}/confirm`，body 携带当前 `rev`；S12 确认前可编辑 title/fire_at，仅修改时传覆盖。
    成功后立即消费响应中的 `schedule_reminder` action 设置闹钟，再刷新列表。
 3. 同步返回的同类型 action 也会设置/更新闹钟；`deleted.actions`、
    `deleted.reminders` 以及 done/cancelled reminder 会取消对应本地闹钟。
@@ -192,7 +202,7 @@ pause/stop 保留 Permission 状态，允许权限结果继续启动识别。
 ## 模块与契约
 
 - `:app`：Compose Navigation、提醒列表与确认、AlarmManager、通知、开机重放、
-  S11 本地可读时间、S10 系统 TTS 答案播报、S9 提醒↔记事跳转与只读关联提醒、S8 记事详情与搜索/问答引用跳转、S7 记忆搜索、S6 记事编辑/删除、创建后短轮询与整理字段展示、系统 SpeechRecognizer 语音记事与语音提问、ViewModel 保留旋转期间状态、手动 DI。
+  S12 确认前编辑标题/时间、S11 本地可读时间、S10 系统 TTS 答案播报、S9 提醒↔记事跳转与只读关联提醒、S8 记事详情与搜索/问答引用跳转、S7 记忆搜索、S6 记事编辑/删除、创建后短轮询与整理字段展示、系统 SpeechRecognizer 语音记事与语音提问、ViewModel 保留旋转期间状态、手动 DI。
 - `:data`：纯 JVM DTO、Retrofit、仓库、mock、S5 轮询纯函数和测试。接口核对自当前服务端
   `app/schemas.py` 与 `app/api/{auth,notes,ask,sync,reminders}.py`，未知响应字段由 Gson 忽略。
 - `:core-security`：Android Keystore MasterKey + EncryptedSharedPreferences。
@@ -231,7 +241,7 @@ scheduled rev 保持幂等。mock 维护 note/action/reminder 删除墓碑；编
 - 不引入 FCM、Room、离线写队列、Hilt；不做 Backfill confirmation subscriptions。
 - 不修改 `server/`，不部署服务端；服务端只负责产生 sync action，不执行系统闹钟。
 - 创建后自动短轮询；无常驻后台同步，另保留进入/刷新时间线、confirm 后刷新和 boot 同步。
-- `rrule` 目前只解析不执行，闹钟均为一次性；没有提醒编辑、贪睡或重复提醒 UI。
+- `rrule` 目前只解析不执行，闹钟均为一次性；仅确认前可改标题/时间，没有已确认提醒编辑、贪睡或重复提醒 UI。
 - 尚无推送或发布签名；自动短轮询结束后仍可手动同步。
 - 同一份未修改草稿在失败重试时保留 `client_note_id`，但编辑草稿会生成新 ID；
   网络结果不确定时请先刷新时间线，避免编辑后重复记录。
@@ -250,12 +260,12 @@ JAR SHA-256：`cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8`
 ## 本次环境验证
 
 使用 `/home/box/.local/jdk/jdk-17.0.16+8` 与 `/home/box/.local/android-sdk`
-（`GRADLE_USER_HOME=/tmp/s11-gradle`）。
+（`GRADLE_USER_HOME=/tmp/s12-gradle`）。
 `./gradlew --no-daemon :data:test :app:testDebugUnitTest :app:assembleDebug`：`BUILD SUCCESSFUL`。
 `:data` RepositoryTest：**26** + OrganizePollTest：**9**（共 35），0 failures / 0 errors / 0 skipped；
-`:app` DisplayTimeTest：**6** + AnswerTtsTest：**7** + AsrStateTest：**6** + VoiceQuestionTest：**2** + EditBehaviorTest：**5** + ReminderNoteLinkTest：**4** + AppRepositoriesTest：**2**（共 32），0 failures / 0 errors / 0 skipped；
+`:app` ConfirmOverrideTest：**8** + DisplayTimeTest：**6** + AnswerTtsTest：**7** + AsrStateTest：**6** + VoiceQuestionTest：**2** + EditBehaviorTest：**5** + ReminderNoteLinkTest：**4** + AppRepositoriesTest：**2**（共 40），0 failures / 0 errors / 0 skipped；
 `:core-security` unit tests：`NO-SOURCE`。
 `python3 scripts/check-invariants.py`：`0 error(s), 0 warning(s)`。
-应用标签与标题更新为 S11；提醒/记事/待办时间改为本地中文墙钟展示，排序仍用原始 ISO。
+应用标签与标题更新为 S12；确认前可编辑标题与 ISO 时间。
 未运行模拟器/真机或连接实际服务的端到端测试；
-设备时区切换与墙钟对照仍需真机验收。
+确认对话框交互与闹钟触发仍需真机验收。
