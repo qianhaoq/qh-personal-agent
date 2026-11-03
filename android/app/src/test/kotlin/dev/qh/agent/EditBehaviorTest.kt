@@ -17,20 +17,21 @@ class EditBehaviorTest {
         assertFalse(shouldPopEditRoute("notes"))
         assertFalse(shouldPopEditRoute(null))
     }
+
     @Test fun detailSyncPropagatesOrganizedFieldsAndRevision() {
         val detail = Note("n1", "正文", "uploaded", 2)
         val organized = detail.copy(status = "organized", rev = 3, title = "标题",
             tags = listOf("标签"), todos = listOf(NoteTodo("待办")), category = "生活")
-        assertEquals(organized, syncDetailNote(detail, listOf(Note("n2", "其他", "uploaded", 1), organized)))
+        assertEquals(organized, syncedDetailNote(detail, listOf(Note("n2", "其他", "uploaded", 1), organized)))
     }
 
-    @Test fun detailSyncKeepsDetailWhenMissingFromList() {
+    @Test fun detailSyncClearsDetailWhenMissingFromList() {
         val detail = Note("n1", "正文", "uploaded", 2)
-        assertSame(detail, syncDetailNote(detail, listOf(Note("n2", "其他", "organized", 3))))
-        assertSame(detail, syncDetailNote(detail, emptyList()))
+        assertNull(syncedDetailNote(detail, listOf(Note("n2", "其他", "organized", 3))))
+        assertNull(syncedDetailNote(detail, emptyList()))
     }
 
     @Test fun detailSyncKeepsNullDetail() {
-        assertNull(syncDetailNote(null, listOf(Note("n1", "正文", "organized", 3))))
+        assertNull(syncedDetailNote(null, listOf(Note("n1", "正文", "organized", 3))))
     }
 }

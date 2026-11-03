@@ -130,7 +130,7 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
         val fresh = repo.notes()
         if (repo.signedIn && AppRepositories.sessionGeneration() == generation) {
             notes = fresh
-            detailNote = syncDetailNote(detailNote, fresh)
+            detailNote = syncedDetailNote(detailNote, fresh)
         }
     }
     fun login() = run { repo.login(invite); AppRepositories.bumpSession(); invite = "" }
@@ -219,7 +219,7 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
                             val fresh = repo.notes()
                             if (!repo.signedIn || AppRepositories.sessionGeneration() != generation) return@withTimeoutOrNull
                             notes = fresh
-                            detailNote = syncDetailNote(detailNote, fresh)
+                            detailNote = syncedDetailNote(detailNote, fresh)
                             status = fresh.find { it.id == id }?.status
                         }
                         attempt++
@@ -492,8 +492,9 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                                 item { Text(answer.answer) }
                                 items(answer.citations) { citation ->
                                     Text("来源 ${citation.note_id?.takeIf { it.isNotBlank() } ?: "未知记事"}：${citation.text}")
-                                    TextButton({ citation.note_id?.takeIf { it.isNotBlank() }?.let { openDetail(it) } },
-                                        enabled = !model.busy && citation.note_id?.isNotBlank() == true) { Text("打开记事") }
+                                    citation.note_id?.takeIf { it.isNotBlank() }?.let { id ->
+                                        TextButton({ openDetail(id) }, enabled = !model.busy) { Text("打开记事") }
+                                    }
                                 }
                             }
                         }
