@@ -25,7 +25,7 @@ interface Repository {
     suspend fun login(invite: String)
     suspend fun logout()
     suspend fun notes(): List<Note>
-    suspend fun create(body: NoteCreate)
+    suspend fun create(body: NoteCreate): Created
     suspend fun ask(text: String): Answer
     suspend fun sync(since: Long = 0, limit: Int = 100): SyncResponse
     suspend fun confirmReminder(id: String, rev: Int, fireAt: String? = null,
@@ -103,9 +103,9 @@ class RealRepository(private val api: AgentApi, private val store: TokenStore,
         } while (true)
         result.distinctBy { it.id }.reversed()
     }
-    override suspend fun create(body: NoteCreate) {
+    override suspend fun create(body: NoteCreate): Created {
         validText(body.text, 5000)
-        authorized { api.create(it, body) }
+        return authorized { api.create(it, body) }
     }
     override suspend fun ask(text: String): Answer {
         validText(text, 2000)
@@ -143,8 +143,9 @@ class RealRepository(private val api: AgentApi, private val store: TokenStore,
     override suspend fun confirmReminder(id: String, rev: Int, fireAt: String?, title: String?) =
         authorized { api.confirmReminder(it, id, ReminderConfirmRequest(rev, fireAt, title)) }
 }
-class MockRepository(private val seedOnLogin: Boolean = true) : Repository {
+class MockRepository(private val seedOnLogin: Boolean = true, private val organizeAfterReads: Int = 3) : Repository {
     private data class Change(val seq: Long, val kind: String, val id: String)
+    private val organizeReads = mutableMapOf<String, Int>()
     private var active = false
     private var cursor = 0L
     private val entries = linkedMapOf<String, Note>()
@@ -166,16 +167,42 @@ class MockRepository(private val seedOnLogin: Boolean = true) : Repository {
     }
     override suspend fun logout() {
         active = false; cursor = 0
+        organizeReads.clear()
         entries.clear(); noteChanges.clear(); reminders.clear(); reminderChanges.clear()
         deletedReminders.clear(); actions.clear(); actionChanges.clear(); deletedActions.clear()
     }
     private fun requireSession() { if (!active) throw SessionExpired() }
     private fun nextSeq() = ++cursor
-    override suspend fun notes(): List<Note> { requireSession(); return entries.values.reversed() }
-    override suspend fun create(body: NoteCreate) {
+    override suspend fun notes(): List<Note> {
+        requireSession()
+        organizeReads.keys.toList().forEach { id ->
+            val reads = organizeReads.getValue(id) + 1
+            organizeReads[id] = reads
+            if (organizeAfterReads > 0 && reads >= organizeAfterReads) {
+                organizeNote(id, entries.getValue(id).text.take(24), listOf("本地演示"),
+                    listOf(NoteTodo("回顾这条记事")))
+                seedReminder("回顾记事（本地演示）", Instant.now().plusSeconds(3600).toString(), id)
+            }
+        }
+        return entries.values.reversed()
+    }
+    fun organizeNote(id: String, title: String, tags: List<String>, todos: List<NoteTodo>) {
+        requireSession()
+        val current = entries.getValue(id)
+        entries[id] = current.copy(status = "organized", rev = current.rev + 1,
+            title = title, tags = tags, todos = todos)
+        organizeReads.remove(id)
+        noteChanges[id] = nextSeq()
+    }
+    override suspend fun create(body: NoteCreate): Created {
         requireSession(); validText(body.text, 5000)
         val note = Note(body.client_note_id, body.text, "uploaded", 1, recorded_at = body.recorded_at)
-        if (entries.putIfAbsent(body.client_note_id, note) == null) noteChanges[note.id] = nextSeq()
+        if (entries.putIfAbsent(body.client_note_id, note) == null) {
+            noteChanges[note.id] = nextSeq()
+            organizeReads[note.id] = 0
+        }
+        val current = entries.getValue(body.client_note_id)
+        return Created(current.id, current.status, current.rev)
     }
     override suspend fun ask(text: String): Answer {
         requireSession(); validText(text, 2000)

@@ -1,4 +1,4 @@
-# Android S4 · 语音问答
+# Android S5 · 整理可见闭环
 
 紧凑的 Kotlin / Compose 客户端：登录、时间线、文字记事、问答、提醒同步与确认；
 确认后的 `schedule_reminder` Channel action 会落到 AlarmManager，响铃时显示系统通知。
@@ -50,6 +50,17 @@ api.useMock=false
 默认地址为生产占位 `https://agent.pinhaoyun.com/`；debug 默认 mock 不访问该地址。
 切回 mock：删除 `api.useMock=false` 或改为 `api.useMock=true`。
 `local.properties` 在构建时读取，改动后需重新构建安装。
+
+## S5 整理可见闭环
+
+文字或语音 create 成功后立即返回时间线，按响应的 `note_id` 自动短轮询
+`GET /v1/notes`：每 1.5 秒一次，最多 20 次、总预算 30 秒（含请求等待）。
+列表暂未找到目标时继续等待；状态离开 `uploaded`（包括 organized / failed）即停止。
+轮询使用独立协程，不占用全局 busy；仍可浏览、记录、提问及手动「同步」。
+终态或超时后完整 sync + notes 刷新，让 suggested 提醒出现并沿用「确认并设闹钟」。
+最后一次完整刷新不计入轮询预算。超时保留列表，不作为硬错误，可继续手动同步。
+网络失败停止本轮并显示既有可读错误，可手动同步重试；退出登录取消轮询，旋转由 ViewModel 保留。
+时间线显示「整理中…」、可读状态、title / tags / todos（含可选 due）与 category。
 
 ## S4 语音问答
 
@@ -103,12 +114,12 @@ pause/stop 保留 Permission 状态，允许权限结果继续启动识别。
 ## 模块与契约
 
 - `:app`：Compose Navigation、提醒列表与确认、AlarmManager、通知、开机重放、
-  系统 SpeechRecognizer 语音记事与语音提问、ViewModel 保留旋转期间状态、手动 DI。
-- `:data`：纯 JVM DTO、Retrofit、仓库、mock 和测试。接口核对自当前服务端
+  S5 创建后短轮询与整理字段展示、系统 SpeechRecognizer 语音记事与语音提问、ViewModel 保留旋转期间状态、手动 DI。
+- `:data`：纯 JVM DTO、Retrofit、仓库、mock、S5 轮询纯函数和测试。接口核对自当前服务端
   `app/schemas.py` 与 `app/api/{auth,notes,ask,sync,reminders}.py`，未知响应字段由 Gson 忽略。
 - `:core-security`：Android Keystore MasterKey + EncryptedSharedPreferences。
   access/refresh 成对保存；稳定随机设备 UUID 在退出后保留。应用禁用备份。
-- 不为 S4 新建 `:sync`、`:feature-reminder` 等空壳模块。
+- 不为 S5 新建 `:sync`、`:feature-reminder` 等空壳模块。
 
 真实路由：`POST /v1/auth/login`、`POST /v1/auth/refresh`、
 `POST /v1/auth/logout`、`POST /v1/notes`、`GET /v1/notes`、`POST /v1/ask`、
@@ -122,6 +133,9 @@ pause/stop 保留 Permission 状态，允许权限结果继续启动识别。
 
 ## Mock 行为与测试
 
+Mock create 返回 client_note_id 作为 note_id，初始状态 uploaded；默认第 3 次 notes()
+查询自动整理并填入 title/tags/todos，新增一条关联的 suggested 演示提醒。
+可用 organizeAfterReads=0 禁用自动整理，或 organizeNote 手动整理供 JVM 测试。
 Mock 登录后预置「给绿植浇水」「整理周报」两个 suggested 提醒。确认会将其改为
 scheduled、bump rev，生成 `schedule_reminder` action 并推进 cursor；重复确认当前
 scheduled rev 保持幂等。mock 还维护 action/reminder 删除墓碑供增量同步测试。
@@ -137,9 +151,9 @@ scheduled rev 保持幂等。mock 还维护 action/reminder 删除墓碑供增�
 
 - 不引入 FCM、Room、离线写队列、Hilt；不做 Backfill confirmation subscriptions。
 - 不修改 `server/`，不部署服务端；服务端只负责产生 sync action，不执行系统闹钟。
-- 没有自动轮询或常驻后台同步，只有进入/刷新时间线、confirm 后刷新和 boot 同步。
+- 创建后自动短轮询；无常驻后台同步，另保留进入/刷新时间线、confirm 后刷新和 boot 同步。
 - `rrule` 目前只解析不执行，闹钟均为一次性；没有提醒编辑、贪睡或重复提醒 UI。
-- 尚无编辑/删除记事、推送或发布签名；后台提取完成后需手动同步。
+- 尚无编辑/删除记事、推送或发布签名；自动短轮询结束后仍可手动同步。
 - 同一份未修改草稿在失败重试时保留 `client_note_id`，但编辑草稿会生成新 ID；
   网络结果不确定时请先刷新时间线，避免编辑后重复记录。
 - 页面状态可跨旋转保留，不能跨进程恢复；不保存邀请码或草稿到磁盘。
@@ -158,16 +172,12 @@ JAR SHA-256：`cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8`
 
 使用 `/home/box/.local/jdk/jdk-17.0.16+8` 与 `/home/box/.local/android-sdk`。
 `./gradlew --no-daemon :data:test :app:testDebugUnitTest :app:assembleDebug`：`BUILD SUCCESSFUL`。
-`:data` RepositoryTest：**11** tests，0 failures / 0 errors / 0 skipped；
+`:data` RepositoryTest：**13** + OrganizePollTest：**5**（共 18），0 failures / 0 errors / 0 skipped；
 `:app` AsrStateTest：**6** + VoiceQuestionTest：**2**（共 8），0 failures / 0 errors / 0 skipped；
 `:core-security` unit tests：`NO-SOURCE`。
-`:app` JVM 测试覆盖 ASR 状态机（含 Permission 跨 pause/stop）与语音问题填入/自动提问决策，
-不依赖真实 SpeechRecognizer 引擎；`:data:test` 保留 mock 与 Retrofit 问答契约覆盖。
 `python3 scripts/check-invariants.py`：`0 error(s), 0 warning(s)`。
-应用标签更新为 S4，保留 `RECORD_AUDIO`、麦克风 feature optional、RecognitionService queries
-与既有四项权限/两个 receiver。未运行模拟器/真机、Keystore instrumentation
-或连接实际服务的端到端测试。语音权限拒绝、无引擎、中文听写、停止/取消、
-页面离开/旋转/后台与退出登录的设备行为仍需验收。
+应用标签更新为 S5；create 返回 `Created` 后短轮询 notes，终态/超时再完整 sync。
+未运行模拟器/真机、Keystore instrumentation 或连接实际服务的端到端测试。
 会话与同步安全：前台与开机共用 `AppRepositories.real`（进程级单例仓库，同一 Mutex），
-并以 session generation 栅栏防止 logout 后在途 boot sync 再设闹钟。分页 sync 按 ID 合并，
-后页覆盖前页，并应用 deleted 墓碑剔除。
+并以 session generation 栅栏防止 logout 后在途 boot sync / 整理轮询再设闹钟或写回。
+分页 sync 按 ID 合并，后页覆盖前页，并应用 deleted 墓碑剔除。

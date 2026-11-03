@@ -3,6 +3,7 @@ package dev.qh.agent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -24,6 +25,11 @@ import androidx.navigation.compose.*
 import dev.qh.data.*
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 class MainActivity : ComponentActivity() {
     private val notificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
@@ -67,9 +73,14 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
     var invite by mutableStateOf("")
     var draft by mutableStateOf(""); private set
     var question by mutableStateOf("")
+    var organizingNoteIds by mutableStateOf(emptySet<String>()); private set
+    private val organizeJobs = mutableMapOf<String, Job>()
+    private val refreshMutex = Mutex()
     private var pending: NoteCreate? = null
     private var draftSource = "app"
     private fun clearUi() {
+        organizeJobs.values.toList().forEach { it.cancel() }; organizeJobs.clear()
+        organizingNoteIds = emptySet()
         notes = emptyList(); reminders = emptyList(); answer = null; draft = ""; question = ""; pending = null; draftSource = "app"
     }
     private fun clearSession() {
@@ -91,16 +102,17 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
             finally { signedIn = repo.signedIn; busy = false }
         }
     }
-    private suspend fun refresh() {
+    private suspend fun refresh() = refreshMutex.withLock {
         val generation = AppRepositories.sessionGeneration()
         val sync = repo.sync()
         if (!repo.signedIn || AppRepositories.sessionGeneration() != generation) {
             if (!repo.signedIn) clearSession()
-            return
+            return@withLock
         }
         alarms.consume(sync)
         reminders = sync.reminders.sortedWith(compareBy(nullsLast()) { it.fire_at })
-        notes = repo.notes()
+        val fresh = repo.notes()
+        if (repo.signedIn && AppRepositories.sessionGeneration() == generation) notes = fresh
     }
     fun login() = run { repo.login(invite); AppRepositories.bumpSession(); invite = "" }
     fun reload() = run { refresh() }
@@ -118,7 +130,47 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
     fun save(done: () -> Unit) = run {
         // Preserve id on uncertain network failure: retry creates at most one server note.
         val body = pending ?: noteDraft(draft, source = draftSource).also { pending = it }
-        repo.create(body); draft = ""; pending = null; draftSource = "app"; done()
+        val created = repo.create(body)
+        draft = ""; pending = null; draftSource = "app"
+        notes = listOf(Note(created.note_id, body.text, created.status, created.rev,
+            recorded_at = body.recorded_at)) + notes.filterNot { it.id == created.note_id }
+        done()
+        waitForOrganize(created)
+    }
+    private fun waitForOrganize(created: Created) {
+        val id = created.note_id
+        val generation = AppRepositories.sessionGeneration()
+        organizingNoteIds = organizingNoteIds + id
+        organizeJobs[id] = viewModelScope.launch {
+            try {
+                withTimeoutOrNull(ORGANIZE_POLL_TIMEOUT_MS) {
+                    val start = SystemClock.elapsedRealtime()
+                    var attempt = 0
+                    var status: String? = created.status
+                    while (shouldContinueOrganizePoll(status, attempt, SystemClock.elapsedRealtime() - start)) {
+                        delay(nextOrganizePollDelayMs(attempt))
+                        refreshMutex.withLock {
+                            val fresh = repo.notes()
+                            if (!repo.signedIn || AppRepositories.sessionGeneration() != generation) return@withTimeoutOrNull
+                            notes = fresh
+                            status = fresh.find { it.id == id }?.status
+                        }
+                        attempt++
+                    }
+                }
+                requireSessionAfterOrganizePoll(AppRepositories.sessionGeneration() == generation, repo.signedIn)
+                if (repo.signedIn && AppRepositories.sessionGeneration() == generation) refresh()
+            } catch (e: CancellationException) { throw e }
+            catch (e: Exception) {
+                if (AppRepositories.sessionGeneration() == generation) {
+                    if (!repo.signedIn) { clearSession(); signedIn = false }
+                    error = readableError(e)
+                }
+            } finally {
+                organizingNoteIds = organizingNoteIds - id
+                organizeJobs.remove(id)
+            }
+        }
     }
     fun askFromVoice(text: String) {
         val result = voiceQuestion(text, busy)
@@ -129,6 +181,8 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
     fun logout() = run {
         // Bump generation + clear alarms before network logout so in-flight boot cannot re-arm.
         AppRepositories.bumpSession()
+        organizeJobs.values.toList().forEach { it.cancel() }; organizeJobs.clear()
+        organizingNoteIds = emptySet()
         alarms.clear()
         try { repo.logout() }
         finally { clearUi() }
@@ -138,7 +192,7 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
 fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> VoiceAsr, requestMicrophone: () -> Unit, cancelVoice: () -> Unit) {
     Surface(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().imePadding().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("随记 · S4" + if (BuildConfig.USE_MOCK_API) " / 本地演示" else " / 服务器", style = MaterialTheme.typography.headlineSmall)
+            Text("随记 · S5" + if (BuildConfig.USE_MOCK_API) " / 本地演示" else " / 服务器", style = MaterialTheme.typography.headlineSmall)
             if (model.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
             model.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             if (!model.signedIn) {
@@ -185,7 +239,16 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                                         Column(Modifier.padding(12.dp)) {
                                             note.title?.let { Text(it, style = MaterialTheme.typography.titleMedium) }
                                             Text(note.text)
-                                            Text("${note.recorded_at.orEmpty()} · ${note.status}", style = MaterialTheme.typography.bodySmall)
+                                            if (note.status == "uploaded") {
+                                                Text("整理中…", style = MaterialTheme.typography.bodySmall,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                            }
+                                            note.tags?.takeIf { it.isNotEmpty() }?.let { Text("标签：${it.joinToString(", ")}") }
+                                            note.todos.orEmpty().forEach { todo ->
+                                                Text("• ${todo.text}" + (todo.due?.let { "（$it）" } ?: ""))
+                                            }
+                                            note.category?.let { Text("分类：$it") }
+                                            Text("${note.recorded_at.orEmpty()} · ${noteStatus(note.status)}", style = MaterialTheme.typography.bodySmall)
                                         }
                                     }
                                 }
@@ -274,5 +337,12 @@ private fun reminderStatus(status: String) = when (status) {
     "scheduled" -> "已确认"
     "done" -> "已完成"
     "cancelled" -> "已取消"
+    else -> status
+}
+
+private fun noteStatus(status: String) = when (status) {
+    "uploaded" -> "整理中"
+    "organized" -> "已整理"
+    "failed" -> "整理失败"
     else -> status
 }

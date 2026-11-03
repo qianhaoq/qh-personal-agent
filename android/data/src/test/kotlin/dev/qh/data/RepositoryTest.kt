@@ -74,6 +74,29 @@ class RepositoryTest {
         repo.logout()
         try { repo.sync(); fail("Expected session error") } catch (_: SessionExpired) { }
     }
+    @Test fun mockOrganizesAfterReadsAndSyncsSuggestedReminder() = runBlocking {
+        val repo = MockRepository(seedOnLogin = false, organizeAfterReads = 2)
+        repo.login("demo")
+        assertEquals(Created("client", "uploaded", 1), repo.create(noteDraft("买牛奶", "client")))
+        assertEquals("uploaded", repo.notes().single().status)
+        val note = repo.notes().single()
+        assertEquals("organized", note.status)
+        assertEquals(listOf("本地演示"), note.tags)
+        assertEquals("回顾这条记事", note.todos!!.single().text)
+        assertEquals(note, repo.sync().notes.single())
+        assertEquals("client", repo.sync().reminders.single().note_id)
+        assertEquals("suggested", repo.sync().reminders.single().status)
+    }
+    @Test fun gsonParsesOrganizedFieldsInListAndSync() {
+        val json = """{"id":"n","text":"正文","status":"organized","rev":2,"tags":["生活"],"todos":[{"text":"买奶","due":"2099-01-01"},{"text":"散步"}]}"""
+        val gson = com.google.gson.Gson()
+        val note = gson.fromJson(json, Note::class.java)
+        assertEquals(listOf("生活"), note.tags)
+        assertEquals("2099-01-01", note.todos!![0].due)
+        assertNull(note.todos!![1].due)
+        assertEquals(note, gson.fromJson("""{"cursor":1,"notes":[$json]}""", SyncResponse::class.java).notes.single())
+        assertEquals(note, gson.fromJson("""{"items":[$json]}""", NotePage::class.java).items.single())
+    }
     private class Store : TokenStore {
         var tokens: Tokens? = null
         override fun read() = tokens
@@ -96,7 +119,7 @@ class RepositoryTest {
             assertEquals("stable-device", body["device_id"].asString)
             assertEquals("android", body["platform"].asString)
             server.json("""{"note_id":"n1","status":"uploaded","rev":1}""", 202)
-            repo.create(noteDraft("你好", "client-1"))
+            assertEquals(Created("n1", "uploaded", 1), repo.create(noteDraft("你好", "client-1")))
             val create = server.takeRequest()
             assertEquals("/v1/notes", create.path); assertEquals("Bearer access-1", create.getHeader("Authorization"))
             val note = JsonParser.parseString(create.body.readUtf8()).asJsonObject
