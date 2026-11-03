@@ -8,6 +8,110 @@ import org.junit.Test
 import com.google.gson.JsonParser
 
 class RepositoryTest {
+    @Test fun mockPatchChecksRevAndInvalidatesDerivedFields() = runBlocking {
+        val repo = MockRepository(false, 0); repo.login("demo")
+        repo.create(noteDraft("原文", "n1"))
+        repo.organizeNote("n1", "标题", listOf("标签"), listOf(NoteTodo("待办")))
+        val reminder = repo.seedReminder("建议", "2099-01-01T00:00:00Z", "n1")
+        val scheduled = repo.seedReminder("已确认", "2099-01-01T00:00:00Z", "n1")
+        repo.confirmReminder(scheduled.id, scheduled.rev)
+        val current = repo.notes().single()
+        val cursor = repo.sync().cursor
+        assertEquals(current, repo.patch("n1", current.rev, current.text))
+        assertEquals(current, repo.patch("n1", current.rev, null))
+        assertEquals(cursor, repo.sync().cursor)
+        for (text in listOf(null, current.text, "新文")) {
+            try { repo.patch("n1", current.rev - 1, text); fail("Expected conflict") }
+            catch (e: IllegalArgumentException) { assertTrue(readableError(e).contains("版本冲突")) }
+        }
+        val updated = repo.patch("n1", current.rev, "新文")
+        assertEquals(current.rev + 1, updated.rev); assertEquals("uploaded", updated.status)
+        assertEquals("新文", updated.text)
+        assertNull(updated.title); assertNull(updated.tags); assertNull(updated.todos); assertNull(updated.category)
+        val sync = repo.sync(cursor)
+        assertEquals(listOf(reminder.id), sync.deleted.reminders)
+        assertEquals(updated, sync.notes.single())
+        assertEquals(scheduled.id, repo.sync().reminders.single().id)
+    }
+    @Test fun mockDeleteTombstonesNoteRemindersAndActions() = runBlocking {
+        val repo = MockRepository(false, 1); repo.login("demo")
+        repo.create(noteDraft("原文", "n1"))
+        val suggested = repo.seedReminder("建议", "2099-01-01T00:00:00Z", "n1")
+        val scheduled = repo.seedReminder("已确认", "2099-01-01T00:00:00Z", "n1")
+        val action = repo.confirmReminder(scheduled.id, scheduled.rev).action!!
+        val cursor = repo.sync().cursor
+        repo.delete("n1")
+        val deletedCursor = repo.sync().cursor
+        repo.delete("n1")
+        assertEquals(deletedCursor, repo.sync().cursor)
+        assertTrue(repo.notes().isEmpty())
+        val sync = repo.sync(cursor)
+        assertEquals(listOf("n1"), sync.deleted.notes)
+        assertEquals(setOf(suggested.id, scheduled.id), sync.deleted.reminders.toSet())
+        assertEquals(listOf(action.id), sync.deleted.actions)
+        assertTrue(sync.cursor > cursor)
+        assertTrue(repo.sync().reminders.isEmpty()); assertTrue(repo.sync().actions.isEmpty())
+        var since = cursor
+        val deleted = mutableListOf<String>()
+        do {
+            val page = repo.sync(since, 1); since = page.cursor; deleted += page.deleted.notes
+        } while (page.has_more)
+        assertEquals(listOf("n1"), deleted)
+        repo.logout(); repo.login("demo")
+        assertTrue(repo.sync().deleted.notes.isEmpty())
+        repo.logout()
+        try { repo.patch("n1", 1, null); fail("Expected session error") } catch (_: SessionExpired) { }
+        try { repo.delete("n1"); fail("Expected session error") } catch (_: SessionExpired) { }
+    }
+    @Test fun mockDeleteUnknownNoteIsANoOp() = runBlocking {
+        val repo = MockRepository(seedOnLogin = false)
+        repo.login("demo")
+        repo.create(noteDraft("保留这条", "keep"))
+        val before = repo.sync()
+        repo.delete("missing")
+        repo.delete("missing")
+        assertEquals(before, repo.sync())
+        assertEquals(listOf("keep"), repo.notes().map { it.id })
+    }
+
+    @Test fun retrofitPatchDeleteAndConflictContract() = runBlocking {
+        MockWebServer().use { server ->
+            server.start()
+            val store = Store().apply { tokens = Tokens("access", "refresh", 900, "u1") }
+            val repo = RealRepository(realApi(server.url("/").toString()), store)
+            server.json("""{"note":{"id":"n1","text":"新文","status":"uploaded","rev":3},"rev":3}""")
+            assertEquals(3, repo.patch("n1", 2, "新文").rev)
+            val patch = server.takeRequest()
+            assertEquals("PATCH", patch.method); assertEquals("/v1/notes/n1", patch.path)
+            assertEquals("Bearer access", patch.getHeader("Authorization"))
+            val body = JsonParser.parseString(patch.body.readUtf8()).asJsonObject
+            assertEquals(2, body["rev"].asInt); assertEquals("新文", body["text"].asString)
+            server.enqueue(MockResponse().setResponseCode(204))
+            repo.delete("n1")
+            val delete = server.takeRequest()
+            assertEquals("DELETE", delete.method); assertEquals("/v1/notes/n1", delete.path)
+            assertEquals("Bearer access", delete.getHeader("Authorization"))
+            server.json("""{"error":{"code":"conflict","message":"conflict"}}""", 409)
+            try { repo.patch("n1", 2, "新文"); fail("Expected conflict") }
+            catch (e: retrofit2.HttpException) { assertEquals("版本冲突，请同步后重试", readableError(e)) }
+        }
+    }
+
+    @Test fun retrofitDeleteTreatsOnly404AsSuccess() = runBlocking {
+        MockWebServer().use { server ->
+            server.start()
+            val store = Store().apply { tokens = Tokens("access", "refresh", 900, "u1") }
+            val repo = RealRepository(realApi(server.url("/").toString()), store)
+            server.enqueue(MockResponse().setResponseCode(404))
+            repo.delete("n1")
+            assertTrue(repo.signedIn)
+            server.enqueue(MockResponse().setResponseCode(500))
+            try { repo.delete("n1"); fail("Expected server error") }
+            catch (e: retrofit2.HttpException) { assertEquals(500, e.code()) }
+            assertEquals(2, server.requestCount)
+        }
+    }
+
     @Test fun draftSourceDefaultsToAppAndSupportsVoice() {
         assertEquals("app", noteDraft("文字").source)
         val voice = noteDraft("  语音内容  ", "voice-id", source = "voice_asr")

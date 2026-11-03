@@ -35,7 +35,7 @@ private const val NOTIFICATION_CHANNEL = "reminders"
 // Soft budget for optional post-boot network sync (does not hold the broadcast).
 private const val BOOT_SYNC_BUDGET_MS = 10_000L
 private data class PendingReminder(val actionId: String, val reminderId: String,
-    val title: String, val triggerAt: Long)
+    val title: String, val triggerAt: Long, val noteId: String? = null)
 
 class ReminderAlarmScheduler(context: Context) {
     private val appContext = context.applicationContext
@@ -44,6 +44,7 @@ class ReminderAlarmScheduler(context: Context) {
 
     fun consume(response: SyncResponse) {
         response.actions.filter { it.type == "schedule_reminder" }.forEach(::schedule)
+        response.deleted.notes.forEach(::cancelForNote)
         response.deleted.actions.forEach(::cancelAction)
         response.deleted.reminders.forEach(::cancelReminder)
         response.reminders.filter { it.status == "done" || it.status == "cancelled" }
@@ -65,14 +66,15 @@ class ReminderAlarmScheduler(context: Context) {
         val title = (action.payload["title"] as? String).orEmpty().ifBlank { "随记提醒" }
         val triggerAt = try { Instant.parse(fireAt).toEpochMilli() }
         catch (_: DateTimeParseException) { return }
-        setAlarm(PendingReminder(action.id, reminderId, title, triggerAt))
+        setAlarm(PendingReminder(action.id, reminderId, title, triggerAt,
+            action.payload["note_id"] as? String))
     }
     private fun schedule(reminder: ReminderDto) {
         if (reminder.status != "scheduled") return
         val fireAt = reminder.fire_at ?: return
         val triggerAt = try { Instant.parse(fireAt).toEpochMilli() }
         catch (_: DateTimeParseException) { return }
-        setAlarm(PendingReminder("", reminder.id, reminder.title.ifBlank { "随记提醒" }, triggerAt))
+        setAlarm(PendingReminder("", reminder.id, reminder.title.ifBlank { "随记提醒" }, triggerAt, reminder.note_id))
     }
     private fun setAlarm(reminder: PendingReminder) {
         val now = System.currentTimeMillis()
@@ -80,9 +82,11 @@ class ReminderAlarmScheduler(context: Context) {
         // alarm may still be waiting for inexact/Doze delivery even after triggerAt.
         if (reminder.triggerAt <= now && !prefs.contains(key(reminder.reminderId))) return
         val triggerAt = maxOf(reminder.triggerAt, now)
-        prefs.edit().putString(key(reminder.reminderId), JSONObject()
+        val payload = JSONObject()
             .put("action_id", reminder.actionId).put("reminder_id", reminder.reminderId)
-            .put("title", reminder.title).put("trigger_at", reminder.triggerAt).toString()).apply()
+            .put("title", reminder.title).put("trigger_at", reminder.triggerAt)
+        reminder.noteId?.let { payload.put("note_id", it) }
+        prefs.edit().putString(key(reminder.reminderId), payload.toString()).apply()
         val intent = alarmIntent(reminder)
         try {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S || alarms.canScheduleExactAlarms()) {
@@ -96,7 +100,8 @@ class ReminderAlarmScheduler(context: Context) {
         }
     }
     private fun cancelAction(actionId: String) = pending().filter { it.actionId == actionId }.forEach(::cancel)
-    private fun cancelReminder(reminderId: String) = pending().filter { it.reminderId == reminderId }.forEach(::cancel)
+    fun cancelForNote(noteId: String) = pending().filter { it.noteId == noteId }.forEach(::cancel)
+    fun cancelReminder(reminderId: String) = pending().filter { it.reminderId == reminderId }.forEach(::cancel)
     private fun cancel(reminder: PendingReminder) {
         val intent = alarmIntent(reminder)
         alarms.cancel(intent)
@@ -116,7 +121,8 @@ class ReminderAlarmScheduler(context: Context) {
         val triggerAt = json.optLong("trigger_at")
         if (reminderId.isBlank() || triggerAt <= 0) return@mapNotNull null
         PendingReminder(json.optString("action_id"), reminderId,
-            json.optString("title").ifBlank { "随记提醒" }, triggerAt)
+            json.optString("title").ifBlank { "随记提醒" }, triggerAt,
+            json.optString("note_id").takeIf { it.isNotBlank() })
     }
     private fun key(reminderId: String) = "reminder:$reminderId"
 }
@@ -159,13 +165,14 @@ class ReminderBootReceiver : BroadcastReceiver() {
         // Bound broadcast work: restore local alarms immediately; never wait on network here.
         scheduler.restore()
         val generation = AppRepositories.sessionGeneration()
+        val alarmGeneration = AppRepositories.alarmGeneration()
         // Network sync is best-effort background work outside the broadcast lifetime.
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
             try {
                 if (generation != AppRepositories.sessionGeneration()) return@launch
                 if (!repository.signedIn) return@launch
                 val response = withTimeoutOrNull(BOOT_SYNC_BUDGET_MS) { repository.sync() } ?: return@launch
-                AppRepositories.ifCurrent(generation) {
+                AppRepositories.consumeIfCurrent(generation, alarmGeneration) {
                     if (repository.signedIn) scheduler.consume(response)
                 }
             } catch (error: CancellationException) {

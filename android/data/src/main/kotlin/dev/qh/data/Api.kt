@@ -16,6 +16,8 @@ data class NoteTodo(val text: String, val due: String? = null)
 data class Note(val id: String, val text: String, val status: String,
     val rev: Int, val title: String? = null, val recorded_at: String? = null,
     val tags: List<String>? = null, val todos: List<NoteTodo>? = null, val category: String? = null)
+data class NotePatch(val rev: Int, val text: String? = null)
+data class NotePatchResponse(val note: Note, val rev: Int)
 data class NotePage(val items: List<Note>, val next_cursor: Long?)
 data class AskRequest(val text: String, val client_time: String, val timezone: String)
 data class Citation(val memory_id: String, val note_id: String, val text: String)
@@ -42,6 +44,10 @@ interface AgentApi {
     @POST("v1/auth/refresh") suspend fun refresh(@Body body: RefreshRequest): Tokens
     @POST("v1/auth/logout") suspend fun logout(@Header("Authorization") bearer: String)
     @POST("v1/notes") suspend fun create(@Header("Authorization") bearer: String, @Body body: NoteCreate): Created
+    @PATCH("v1/notes/{id}") suspend fun patchNote(@Header("Authorization") bearer: String,
+        @Path("id") id: String, @Body body: NotePatch): NotePatchResponse
+    @DELETE("v1/notes/{id}") suspend fun deleteNote(@Header("Authorization") bearer: String,
+        @Path("id") id: String)
     @GET("v1/notes") suspend fun notes(@Header("Authorization") bearer: String,
         @Query("cursor") cursor: Long = 0, @Query("limit") limit: Int = 100): NotePage
     @POST("v1/ask") suspend fun ask(@Header("Authorization") bearer: String, @Body body: AskRequest): Answer

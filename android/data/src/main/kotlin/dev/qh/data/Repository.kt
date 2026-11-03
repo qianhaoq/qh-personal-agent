@@ -26,6 +26,8 @@ interface Repository {
     suspend fun logout()
     suspend fun notes(): List<Note>
     suspend fun create(body: NoteCreate): Created
+    suspend fun patch(noteId: String, rev: Int, text: String?): Note
+    suspend fun delete(noteId: String)
     suspend fun ask(text: String): Answer
     suspend fun sync(since: Long = 0, limit: Int = 100): SyncResponse
     suspend fun confirmReminder(id: String, rev: Int, fireAt: String? = null,
@@ -45,6 +47,7 @@ fun readableError(error: Throwable): String = when (error) {
         val body = runCatching { Gson().fromJson(error.response()?.errorBody()?.string(), ErrorEnvelope::class.java) }.getOrNull()
         when (error.code()) {
             401 -> "登录已失效或邀请码无效，请重新登录"
+            409 -> "版本冲突，请同步后重试"
             422 -> "输入不符合要求，请检查长度和格式"
             else -> body?.error?.message?.take(240) ?: "服务请求失败（HTTP ${error.code()}），请重试"
         }
@@ -107,6 +110,14 @@ class RealRepository(private val api: AgentApi, private val store: TokenStore,
         validText(body.text, 5000)
         return authorized { api.create(it, body) }
     }
+    override suspend fun patch(noteId: String, rev: Int, text: String?): Note {
+        if (text != null) validText(text, 5000)
+        return authorized { api.patchNote(it, noteId, NotePatch(rev, text)).note }
+    }
+    override suspend fun delete(noteId: String) {
+        try { authorized { api.deleteNote(it, noteId) } }
+        catch (error: HttpException) { if (error.code() != 404) throw error }
+    }
     override suspend fun ask(text: String): Answer {
         validText(text, 2000)
         return authorized { api.ask(it, askBody(text)) }
@@ -149,6 +160,7 @@ class MockRepository(private val seedOnLogin: Boolean = true, private val organi
     private var active = false
     private var cursor = 0L
     private val entries = linkedMapOf<String, Note>()
+    private val deletedNotes = mutableMapOf<String, Long>()
     private val noteChanges = mutableMapOf<String, Long>()
     private val reminders = linkedMapOf<String, ReminderDto>()
     private val reminderChanges = mutableMapOf<String, Long>()
@@ -168,7 +180,7 @@ class MockRepository(private val seedOnLogin: Boolean = true, private val organi
     override suspend fun logout() {
         active = false; cursor = 0
         organizeReads.clear()
-        entries.clear(); noteChanges.clear(); reminders.clear(); reminderChanges.clear()
+        entries.clear(); noteChanges.clear(); deletedNotes.clear(); reminders.clear(); reminderChanges.clear()
         deletedReminders.clear(); actions.clear(); actionChanges.clear(); deletedActions.clear()
     }
     private fun requireSession() { if (!active) throw SessionExpired() }
@@ -204,6 +216,31 @@ class MockRepository(private val seedOnLogin: Boolean = true, private val organi
         val current = entries.getValue(body.client_note_id)
         return Created(current.id, current.status, current.rev)
     }
+    override suspend fun patch(noteId: String, rev: Int, text: String?): Note {
+        requireSession()
+        if (text != null) validText(text, 5000)
+        val current = entries[noteId] ?: throw IllegalArgumentException("记事不存在（404）")
+        require(rev >= 1 && current.rev == rev) { "版本冲突，请同步后重试" }
+        if (text == null || text == current.text) return current
+        val updated = current.copy(text = text, rev = current.rev + 1, status = "uploaded",
+            title = null, tags = null, todos = null, category = null)
+        entries[noteId] = updated
+        organizeReads[noteId] = 0
+        reminders.values.filter { it.note_id == noteId && it.status == "suggested" }
+            .map { it.id }.forEach(::deleteReminder)
+        noteChanges[noteId] = nextSeq()
+        return updated
+    }
+    override suspend fun delete(noteId: String) {
+        requireSession()
+        if (entries.remove(noteId) == null) return
+        organizeReads.remove(noteId); noteChanges.remove(noteId)
+        val related = reminders.values.filter { it.note_id == noteId }.map { it.id }.toSet()
+        actions.values.filter { it.reminder_id in related || it.payload["note_id"] == noteId }
+            .map { it.id }.forEach(::deleteAction)
+        related.forEach(::deleteReminder)
+        deletedNotes[noteId] = nextSeq()
+    }
     override suspend fun ask(text: String): Answer {
         requireSession(); validText(text, 2000)
         return Answer("这是本地演示回答：你的记事已保存在本次会话中。接入服务器后可根据相关记录回答。", emptyList())
@@ -237,6 +274,7 @@ class MockRepository(private val seedOnLogin: Boolean = true, private val organi
         requireSession(); require(since >= 0 && limit in 1..500) { "同步参数无效" }
         val changes = mutableListOf<Change>()
         noteChanges.forEach { (id, seq) -> if (seq > since) changes += Change(seq, "note", id) }
+        deletedNotes.forEach { (id, seq) -> if (seq > since) changes += Change(seq, "deleted_note", id) }
         reminderChanges.forEach { (id, seq) -> if (seq > since) changes += Change(seq, "reminder", id) }
         deletedReminders.forEach { (id, seq) -> if (seq > since) changes += Change(seq, "deleted_reminder", id) }
         actionChanges.forEach { (id, seq) -> if (seq > since) changes += Change(seq, "action", id) }
@@ -246,6 +284,7 @@ class MockRepository(private val seedOnLogin: Boolean = true, private val organi
         val notes = mutableListOf<Note>()
         val liveReminders = mutableListOf<ReminderDto>()
         val liveActions = mutableListOf<SyncAction>()
+        val removedNotes = mutableListOf<String>()
         val removedReminders = mutableListOf<String>()
         val removedActions = mutableListOf<String>()
         page.forEach { change ->
@@ -253,12 +292,13 @@ class MockRepository(private val seedOnLogin: Boolean = true, private val organi
                 "note" -> entries[change.id]?.let(notes::add)
                 "reminder" -> reminders[change.id]?.let(liveReminders::add)
                 "action" -> actions[change.id]?.let(liveActions::add)
+                "deleted_note" -> removedNotes += change.id
                 "deleted_reminder" -> removedReminders += change.id
                 "deleted_action" -> removedActions += change.id
             }
         }
         return SyncResponse(page.lastOrNull()?.seq ?: since, notes, liveReminders, liveActions,
-            SyncDeleted(reminders = removedReminders, actions = removedActions), changes.size > limit)
+            SyncDeleted(notes = removedNotes, reminders = removedReminders, actions = removedActions), changes.size > limit)
     }
     override suspend fun confirmReminder(id: String, rev: Int, fireAt: String?, title: String?): ReminderConfirmResponse {
         requireSession()
