@@ -314,14 +314,20 @@ async def test_stale_candidate_claim_rechecks_retry_backoff_pg():
                                   retry=True, retry_delay_seconds=3600)
         saved = await engine_b.get_work_item(item.id)
         assert saved.status == "pending" and saved.attempts == 1
-        assert saved.run_after > utcnow()
+        # run_after 不在 WorkItem 快照上，从表里读提交后的退避时刻。
+        async with get_sessionmaker()() as session:
+            run_after = await session.scalar(
+                select(SaWorkItem.run_after).where(SaWorkItem.id == item.id))
+        assert run_after > utcnow()
         retry_committed.set()
-        return saved
+        return run_after
 
-    claimed, retried = await asyncio.wait_for(
+    claimed, run_after = await asyncio.wait_for(
         asyncio.gather(stale_claimant(), retrying_worker()), 15)
     assert claimed is False
     saved = await engine_a.get_work_item(item.id)
     assert saved.status == "pending" and saved.worker_id is None
-    assert saved.attempts == retried.attempts == 1
-    assert saved.run_after == retried.run_after
+    assert saved.attempts == 1
+    async with get_sessionmaker()() as session:
+        row = await session.get(SaWorkItem, item.id)
+    assert row.run_after == run_after

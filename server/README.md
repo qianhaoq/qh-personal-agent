@@ -51,6 +51,7 @@ cp .env.example .env          # 默认即 mock + sqlite + inmemory，可直接�
 .venv/bin/python -m app.cli create-invite --uses 5   # 创建邀请码
 .venv/bin/uvicorn app.main:app --reload --no-access-log   # api（--no-access-log：请求行含完整 query，INV-14）
 .venv/bin/python -m app.jobs.worker                  # 整理 worker（另开一个终端）
+.venv/bin/python -m app.jobs.watchdog                # 可选：Watchdog 只做修复（过期回收 + intake 补扫）
 ```
 
 本地默认的记忆后端是 `inmemory`（不装额外依赖也能跑），但它**只属于单进程**：

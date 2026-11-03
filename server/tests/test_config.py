@@ -643,9 +643,11 @@ def test_settings_builds_pg_url_from_pg_env_vars(monkeypatch):
 
     from app.config import DbSettings, Settings
 
-    # compose 形态下 DATABASE_URL 不设（或由 environment 置空压过 .env 的
-    # SQLite 默认）；conftest 给测试进程设置的 DATABASE_URL 需先摘掉
-    monkeypatch.delenv("DATABASE_URL", raising=False)
+    # compose 形态下 DATABASE_URL 由 environment 置空压过 dotenv（含开发者
+    # 按 README `cp .env.example .env` 得到的本地 SQLite 默认）：空串在
+    # _apply_pg_env_database_url 里视为「未显式配置」，分项 PG* 变量才触发
+    # 拼接。单纯 delenv 不够——pydantic-settings 仍会读 cwd 的 .env。
+    monkeypatch.setenv("DATABASE_URL", "")
     for key in ("PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE"):
         monkeypatch.delenv(key, raising=False)
 
@@ -701,7 +703,7 @@ def test_postgres_url_from_env_missing_password_is_config_error(monkeypatch):
 
     # Settings/DbSettings 的 before-validator 同路径：pydantic 不吞非
     # ValueError，ConfigError 直接出界（与 get_settings 的脱敏出口同型）
-    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("DATABASE_URL", "")  # 置空压过 dotenv 的本地 .env（见上一测试）
     for key in ("PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE"):
         monkeypatch.delenv(key, raising=False)
     with pytest.raises(ConfigError, match="PGPASSWORD"):
