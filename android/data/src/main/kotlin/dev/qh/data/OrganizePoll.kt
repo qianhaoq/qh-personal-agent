@@ -10,3 +10,7 @@ fun shouldContinueOrganizePoll(status: String?, attempt: Int, elapsedMs: Long,
     (status == null || status == "uploaded") && attempt < maxAttempts && elapsedMs < timeoutMs
 
 fun nextOrganizePollDelayMs(@Suppress("UNUSED_PARAMETER") attempt: Int): Long = 1_500L
+
+fun requireSessionAfterOrganizePoll(generationMatches: Boolean, signedIn: Boolean) {
+    if (generationMatches && !signedIn) throw SessionExpired()
+}

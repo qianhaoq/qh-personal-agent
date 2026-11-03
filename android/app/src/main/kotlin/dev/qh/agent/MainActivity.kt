@@ -158,6 +158,7 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
                         attempt++
                     }
                 }
+                requireSessionAfterOrganizePoll(AppRepositories.sessionGeneration() == generation, repo.signedIn)
                 if (repo.signedIn && AppRepositories.sessionGeneration() == generation) refresh()
             } catch (e: CancellationException) { throw e }
             catch (e: Exception) {

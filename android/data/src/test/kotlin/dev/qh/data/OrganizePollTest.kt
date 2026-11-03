@@ -4,6 +4,18 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class OrganizePollTest {
+    @Test(expected = SessionExpired::class) fun currentGenerationSignedOutExpires() {
+        requireSessionAfterOrganizePoll(generationMatches = true, signedIn = false)
+    }
+    @Test fun currentGenerationSignedInContinues() {
+        requireSessionAfterOrganizePoll(generationMatches = true, signedIn = true)
+    }
+    @Test fun staleGenerationSignedOutDoesNotExpire() {
+        requireSessionAfterOrganizePoll(generationMatches = false, signedIn = false)
+    }
+    @Test fun staleGenerationSignedInDoesNotExpire() {
+        requireSessionAfterOrganizePoll(generationMatches = false, signedIn = true)
+    }
     @Test fun uploadedAndMissingContinue() {
         assertTrue(shouldContinueOrganizePoll("uploaded", 0, 0))
         assertTrue(shouldContinueOrganizePoll(null, 1, 1500))
