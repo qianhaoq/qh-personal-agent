@@ -8,6 +8,62 @@ import org.junit.Test
 import com.google.gson.JsonParser
 
 class RepositoryTest {
+    @Test fun mockNoteDetailTracksDeletionAndSession() = runBlocking {
+        val repo = MockRepository(organizeAfterReads = 0)
+        repo.login("demo")
+        val created = repo.create(noteDraft("详情正文", "detail-note"))
+        assertEquals("详情正文", repo.note(created.note_id).text)
+        for (id in listOf("missing", created.note_id)) {
+            if (id == created.note_id) repo.delete(id)
+            try { repo.note(id); fail("Expected missing note") }
+            catch (e: IllegalArgumentException) { assertTrue(readableError(e).contains("不存在")) }
+        }
+        repo.logout()
+        try { repo.note(created.note_id); fail("Expected expired session") }
+        catch (_: SessionExpired) { }
+    }
+    @Test fun noteDetailUsesGetAndBearerAndReadable404() = runBlocking {
+        MockWebServer().use { server ->
+            server.start()
+            val store = Store().apply { tokens = Tokens("access", "refresh", 900, "u1") }
+            val repo = RealRepository(realApi(server.url("/").toString()), store)
+            server.json("""{"id":"n1","text":"正文","status":"organized","rev":3,"title":"标题","recorded_at":"2026-11-03T00:00:00Z","tags":["标签"],"todos":[{"text":"待办","due":"明天"}],"category":"生活"}""")
+            val note = repo.note("n1")
+            assertEquals("n1", note.id); assertEquals("正文", note.text)
+            assertEquals("organized", note.status); assertEquals(3, note.rev)
+            assertEquals("标题", note.title); assertEquals(listOf("标签"), note.tags)
+            assertEquals(listOf(NoteTodo("待办", "明天")), note.todos)
+            assertEquals("生活", note.category)
+            assertEquals("2026-11-03T00:00:00Z", note.recorded_at)
+            val request = server.takeRequest()
+            assertEquals("GET", request.method); assertEquals("/v1/notes/n1", request.path)
+            assertEquals("Bearer access", request.getHeader("Authorization"))
+            server.json("""{"error":{"code":"not_found","message":"记事不存在"}}""", 404)
+            try { repo.note("missing"); fail("Expected HTTP error") }
+            catch (e: retrofit2.HttpException) {
+                assertEquals(404, e.code()); assertTrue(readableError(e).contains("不存在"))
+            }
+            server.takeRequest()
+            server.json("{}", 404)
+            try { repo.note("deleted"); fail("Expected HTTP error") }
+            catch (e: retrofit2.HttpException) { assertTrue(readableError(e).contains("不存在")) }
+        }
+    }
+    @Test fun noteDetailRejectsBlankIdWithoutNetwork() = runBlocking {
+        MockWebServer().use { server ->
+            server.start()
+            val mock = MockRepository(); mock.login("demo")
+            val real = RealRepository(realApi(server.url("/").toString()), Store())
+            for (repo in listOf(mock, real)) {
+                for (id in listOf("", "   ")) {
+                    try { repo.note(id); fail("Expected invalid id") }
+                    catch (e: IllegalArgumentException) { assertTrue(readableError(e).contains("不能为空")) }
+                }
+            }
+            assertEquals(0, server.requestCount)
+        }
+    }
+
     @Test fun mockSearchTracksMemoriesAndSession() = runBlocking {
         val repo = MockRepository(organizeAfterReads = 0); repo.login("demo")
         assertTrue(repo.search("  绿植 ").isNotEmpty())
