@@ -12,8 +12,10 @@ data class NoteCreate(val client_note_id: String, val text: String,
     val recorded_at: String? = null, val timezone: String? = null, val source: String = "app",
     val asr: Map<String, Any?>? = null)
 data class Created(val note_id: String, val status: String, val rev: Int)
+data class NoteTodo(val text: String, val due: String? = null)
 data class Note(val id: String, val text: String, val status: String,
-    val rev: Int, val title: String? = null, val recorded_at: String? = null)
+    val rev: Int, val title: String? = null, val recorded_at: String? = null,
+    val tags: List<String>? = null, val todos: List<NoteTodo>? = null, val category: String? = null)
 data class NotePage(val items: List<Note>, val next_cursor: Long?)
 data class AskRequest(val text: String, val client_time: String, val timezone: String)
 data class Citation(val memory_id: String, val note_id: String, val text: String)
