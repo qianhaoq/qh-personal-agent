@@ -368,6 +368,18 @@ class RepositoryTest {
             assertEquals("/v1/auth/logout", server.takeRequest().path); assertFalse(repo.signedIn)
         }
     }
+    @Test fun askParsesNullableAndLinkedCitationNoteIds() = runBlocking {
+        MockWebServer().use { server ->
+            server.start()
+            val store = Store().apply { tokens = Tokens("access", "refresh", 900, "u1") }
+            val repo = RealRepository(realApi(server.url("/").toString()), store)
+            server.json("""{"answer":"回答","citations":[{"memory_id":"m1","note_id":null,"text":"未关联正文"},{"memory_id":"m2","note_id":"n1","text":"关联正文"}]}""")
+            val citations = repo.ask("记了什么").citations
+            assertEquals(2, citations.size)
+            assertNull(citations[0].note_id); assertEquals("未关联正文", citations[0].text)
+            assertEquals("n1", citations[1].note_id); assertEquals("关联正文", citations[1].text)
+        }
+    }
     @Test fun refreshRotatesOnceAndRetriesWithNewBearer() = runBlocking {
         MockWebServer().use { server ->
             server.start(); val store = Store().apply { tokens = Tokens("old", "rotation-1", 1, "u1") }
