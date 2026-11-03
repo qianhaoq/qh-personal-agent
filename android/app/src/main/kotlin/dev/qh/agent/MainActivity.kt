@@ -166,11 +166,12 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
     var confirmTitle by mutableStateOf(""); private set
     var confirmFireAt by mutableStateOf(""); private set
     fun beginConfirm(reminder: ReminderDto) {
+        error = null
         confirming = reminder; confirmTitle = reminder.title; confirmFireAt = reminder.fire_at.orEmpty()
     }
-    fun updateConfirmTitle(value: String) { confirmTitle = value }
-    fun updateConfirmFireAt(value: String) { confirmFireAt = value }
-    fun cancelConfirm() { confirming = null; confirmTitle = ""; confirmFireAt = "" }
+    fun updateConfirmTitle(value: String) { confirmTitle = value; error = null }
+    fun updateConfirmFireAt(value: String) { confirmFireAt = value; error = null }
+    fun cancelConfirm() { confirming = null; confirmTitle = ""; confirmFireAt = ""; error = null }
     var editing by mutableStateOf<Note?>(null); private set
     var editText by mutableStateOf(""); private set
     fun beginEdit(note: Note) { editing = note; editText = note.text }
@@ -305,6 +306,7 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                         model.confirming?.let { reminder ->
                             ConfirmReminderDialog(reminder, model.busy,
                                 title = model.confirmTitle, fireAt = model.confirmFireAt,
+                                submitError = model.error,
                                 onTitleChange = model::updateConfirmTitle,
                                 onFireAtChange = model::updateConfirmFireAt,
                                 onDismiss = model::cancelConfirm,
@@ -584,6 +586,7 @@ private fun noteStatus(status: String) = when (status) {
 @Composable
 private fun ConfirmReminderDialog(
     reminder: ReminderDto, busy: Boolean, title: String, fireAt: String,
+    submitError: String?,
     onTitleChange: (String) -> Unit, onFireAtChange: (String) -> Unit,
     onDismiss: () -> Unit, onConfirm: (ConfirmOverrides) -> Unit
 ) {
@@ -598,7 +601,7 @@ private fun ConfirmReminderDialog(
                 OutlinedTextField(fireAt, { onFireAtChange(it); error = null }, label = { Text("提醒时间（ISO）") },
                     enabled = !busy, modifier = Modifier.fillMaxWidth())
                 Text("例如 2026-11-04T12:00:00Z；留空沿用原值。时间须在未来。")
-                error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                (error ?: submitError)?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             }
         },
         confirmButton = {
