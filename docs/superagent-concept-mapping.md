@@ -23,17 +23,17 @@ dsh 面向 GitHub/Feishu coding 协作；本产品面向钱浩个人语音随手
 | Worker / Executor | OrganizeNoteWorker、AnswerAskWorker | 事务外 LLM/Memory 工具；只向 Engine report，不能直接通知 |
 | Channel | SyncChannel + `SaChannelAction` | 写 note/建议提醒/订阅；确认后 sync 可见 `schedule_reminder`；ask 返回持久 result |
 | Store | `domain/store.py` + SQLAlchemy models | SQLite/PG 同实现，create_all/init-db 自动注册 |
-| Effects / 恢复调度 | `runtime.py` 数据库轮询 | 缺 intake 补扫、pending 认领、过期 Assignment 恢复、整理失败重试 |
+| Effects / 恢复调度 | `runtime.py` repair + `app/jobs/watchdog.py` | Watchdog Control Loop（独立进程）只做恢复：过期 Assignment 回收、缺 intake 补扫；Worker 进程先 repair 再认领 pending 整理 Ticket；整理失败重试随认领执行 |
 | Memory | `memory/*` + 独立 memory_sync job | 仅工具端口；按 note_id/source_rev 收敛，mem0 infer=False |
 | observe | PersonalPolicy 默认模式 | 只整理+建议；不静默建系统闹钟，不外发 |
-| Subscription（提醒确认） | `SaSubscription` + `POST /v1/reminders/{id}/confirm` | 直通原 WorkItem，不经 Eval；Watchdog/Panel 仍未做 |
+| Subscription（提醒确认） | `SaSubscription` + `POST /v1/reminders/{id}/confirm` | 直通原 WorkItem，不经 Eval；Panel 仍未做（Watchdog 已落地） |
 
 ## 当前链路
 
 1. POST note 提交 → Source → Engine 原子建持久 Ticket → Runtime 轮询 → OrganizeWorker → Engine CAS report → Channel 写整理产物、建议提醒与 memory_sync。
 2. PATCH 正文同事务清旧 title/tags/todos、作废 suggested、memory_sync 清旧记忆；提交后开新 rev 的整理 Ticket，旧结果受 rev 栅栏约束。
 3. ask → Trigger/Ticket → 同请求 await AnswerAskWorker → Memory 检索/LLM → Engine/Channel → answer/citations。HTTP 形状保持。
-4. 重启后从 Store 读取 pending/done；多进程靠条件 UPDATE 竞争，同一 Ticket 仅一个认领成功。notes 提交后 intake 缺口由轮询补扫，不靠进程内 task 保证可靠性。
+4. 重启后从 Store 读取 pending/done；多进程靠条件 UPDATE 竞争，同一 Ticket 仅一个认领成功。notes 提交后 intake 缺口由轮询补扫（`runtime.repair`：Worker 进程每轮自带，独立 Watchdog 进程专责），不靠进程内 task 保证可靠性。
 
 ## 本刀替换记录
 

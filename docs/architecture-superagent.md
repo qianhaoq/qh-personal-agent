@@ -12,11 +12,16 @@ POST /v1/notes / PATCH 正文
   → Store 事务：Thread 串行化 → dedupe → Policy Eval → Mandate → pending Ticket
 
 python -m app.jobs.worker 每轮
-  → Runtime：补扫缺 Trigger 的 uploaded note → 回收过期 Assignment
+  → Runtime.repair：补扫缺 Trigger 的 uploaded note → 回收过期 Assignment
   → pending Ticket → OrganizeNoteWorker
     → CAS claim → 短读 note → 事务外 LLM → report Engine.complete
     → 同事务 CAS running+worker_id → Channel → note/reminders/memory_sync → seq → commit
   → 独立 memory_sync 队列：事务外 MemoryStore 同步 → 租约与 rev 复查
+
+python -m app.jobs.watchdog（Control Loop，独立进程，可与 Worker 并存）
+  → 只跑 Runtime.repair：回收过期 Assignment + 补扫缺 Trigger 的 uploaded note
+  → 不认领 Ticket、不碰 memory 队列；与 Worker 扫同一 Store，CAS 保证同一
+    Ticket 至多一个执行者（单进程部署时 Worker 自带 repair，不必另起）
 
 POST /v1/ask
   → HttpApiSource → Trigger → Engine → pending answer_ask Ticket
@@ -35,7 +40,7 @@ LLM 与 Memory 都是 Worker 工具端口。Engine 是 Runtime 状态的唯一�
 | `app/domain/engine.py` | 原子 intake、版本化 Mandate、Assignment claim/complete/fail、过期恢复 |
 | `app/policy/personal_policy.py` | off/observe/auto 准入；显式问答与被动整理权限隔离 |
 | `app/sources/base.py, voice_http.py` | HTTP 事件构造；VoiceIngress 接口占位；提交后 note 钩子安全失败 |
-| `app/runtime.py` | 持久化 Ticket 轮询、缺失 intake 补扫、过期恢复，多个进程竞争同一 Store |
+| `app/runtime.py` | `repair`（缺失 intake 补扫 + 过期 Assignment 恢复，可复用）+ pending Ticket 认领执行；多个进程竞争同一 Store |
 | `app/workers/organize.py` | 认领整理 Ticket、调用工具、向 Engine report |
 | `app/workers/extract_impl.py` | 整理快照、prompt、解析/清洗、Channel 使用的写适配器 |
 | `app/workers/answer.py` | 问答 Ticket 同请求执行、Memory/LLM 调用、Engine report |
@@ -43,7 +48,8 @@ LLM 与 Memory 都是 Worker 工具端口。Engine 是 Runtime 状态的唯一�
 | `app/models.py::SaSubscription/SaChannelAction` | 订阅与 sync 可见 Channel actions；CAS/幂等 dedupe |
 | `app/api/reminders.py` | `POST /v1/reminders/{id}/confirm` 薄适配 → Trigger → Engine 订阅直通 |
 | `app/pipeline/memory_sync.py` | Memory 端口同步执行体，原有收敛/租约补偿协议保留 |
-| `app/jobs/worker.py` | 进程入口：先轮询 Runtime，再轮询独立 Memory 队列 |
+| `app/jobs/watchdog.py` | Control Loop 进程入口：只轮询 `runtime.repair`，不认领 Ticket、不碰 memory 队列 |
+| `app/jobs/worker.py` | 进程入口：先 repair，再 pending Ticket，再轮询独立 Memory 队列 |
 
 ## 持久化与事务语义
 
@@ -71,6 +77,9 @@ cd server
 .venv/bin/uvicorn app.main:app --no-access-log
 # 另一个终端（SQLite 的 inmemory Memory 仅供开发；生产 PG 用 mem0/disabled）
 .venv/bin/python -m app.jobs.worker
+# 可选第三个终端：Watchdog 只做修复（过期 Assignment 回收 + intake 补扫），
+# 与 Worker 并存安全；单进程跑 Worker 时不比另起（Worker 自带 repair）
+.venv/bin/python -m app.jobs.watchdog
 .venv/bin/python -m pytest
 .venv/bin/ruff check app tests
 cd ..
@@ -97,4 +106,4 @@ POST /v1/reminders/{id}/confirm   body?: { fire_at?, title? }
 
 ## 本刀未做
 
-不部署、不自动合并；Android AlarmManager / UI、Panel、多 agent、电脑操控、外部推送、独立 Watchdog、删尽 pipeline alias 均不在本刀。`auto` 仍无主动执行器。
+不部署、不自动合并；Android AlarmManager / UI、Panel、多 agent、电脑操控、外部推送、删尽 pipeline alias 均不在本刀。`auto` 仍无主动执行器。

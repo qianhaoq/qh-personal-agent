@@ -1,7 +1,10 @@
-"""Durable scheduling: repair post-commit intake gaps, recover leases, run Tickets.
+"""Durable scheduling: repair (lease recovery + intake gap rescan) and Ticket execution.
 
 No task/dict is authoritative. Multiple processes scan the same Store; CAS picks
-one executor. Run this from the service worker poll, independently of memory jobs.
+one executor. `repair` is the reusable infrastructure half: the standalone
+Watchdog Control Loop (`app.jobs.watchdog`) polls it alone, while the Worker
+poll (`app.jobs.worker`) runs it before claiming Tickets so the single-process
+path keeps repairing too.
 """
 from sqlalchemy import String, cast, exists, literal, select
 
@@ -11,7 +14,15 @@ from app.sources.base import build_note_uploaded_trigger
 from app.workers.organize import OrganizeNoteWorker
 
 
-async def run_pending_work(limit: int = 100, retry_delay_seconds: int = 30) -> int:
+async def repair(limit: int = 100) -> int:
+    """Recover expired Assignments + rescan uploaded notes missing Trigger.
+
+    Infrastructure repair only — no Ticket execution, no memory queue. Same
+    idempotency, lock order and INV semantics as before the Watchdog split:
+    Engine.recover keeps its per-item CAS reopening, intake keeps the stable
+    `note_uploaded:{id}:{rev}` dedupe key. Returns the number of intake
+    repairs attempted (recover re-openings are not counted).
+    """
     engine = get_engine()
     await engine.recover()
     # Trigger presence, rather than Ticket presence, respects policy ignore.
@@ -26,6 +37,12 @@ async def run_pending_work(limit: int = 100, retry_delay_seconds: int = 30) -> i
     for note_id, user_id, rev in missing:
         await engine.receive(build_note_uploaded_trigger(
             "http_api", user_id=user_id, note_id=note_id, rev=rev))
+    return len(missing)
+
+
+async def run_pending_work(limit: int = 100, retry_delay_seconds: int = 30) -> int:
+    engine = get_engine()
+    await repair(limit=limit)
     processed = 0
     for item in await engine.pending(limit):
         result = await OrganizeNoteWorker(engine).run(item, retry_delay_seconds=retry_delay_seconds)
