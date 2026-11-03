@@ -114,9 +114,11 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
             return@withLock
         }
         AppRepositories.consumeIfCurrent(generation, alarmGeneration) {
-            if (repo.signedIn) alarms.consume(sync)
+            if (repo.signedIn) {
+                alarms.consume(sync)
+                reminders = sync.reminders.sortedWith(compareBy(nullsLast()) { it.fire_at })
+            }
         }
-        reminders = sync.reminders.sortedWith(compareBy(nullsLast()) { it.fire_at })
         val fresh = repo.notes()
         if (repo.signedIn && AppRepositories.sessionGeneration() == generation) notes = fresh
     }
@@ -157,7 +159,7 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
             }
             editing = null; editText = ""
             done()
-            if (updated.status == "uploaded") {
+            if (shouldPollOrganizeAfterEdit(updated.status)) {
                 organizeJobs[updated.id]?.cancelAndJoin()
                 waitForOrganize(Created(updated.id, updated.status, updated.rev))
             }
@@ -176,7 +178,9 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
         refreshMutex.withLock {
             repo.delete(note.id)
             AppRepositories.invalidateAlarms {
-                reminders.filter { it.note_id == note.id }.forEach { alarms.cancelReminder(it.id) }
+                alarms.consume(SyncResponse(0, deleted = SyncDeleted(
+                    notes = listOf(note.id),
+                    reminders = reminders.filter { it.note_id == note.id }.map { it.id })))
             }
             reminders = reminders.filterNot { it.note_id == note.id }
             organizeJobs.remove(note.id)?.cancel()
@@ -323,7 +327,7 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                             OutlinedTextField(model.editText, model::updateEdit, label = { Text("记事内容（最多 5000 字）") },
                                 modifier = Modifier.fillMaxWidth().weight(1f), enabled = !model.busy)
                             Button({ model.saveEdit {
-                                if (nav.currentBackStackEntry?.destination?.route == "edit") nav.popBackStack()
+                                if (shouldPopEditRoute(nav.currentBackStackEntry?.destination?.route)) nav.popBackStack()
                             } },
                                 enabled = !model.busy && model.editing != null && model.editText.isNotBlank()) { Text("保存") }
                             TextButton({ nav.popBackStack() }, enabled = !model.busy) { Text("取消") }

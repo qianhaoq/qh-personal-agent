@@ -63,6 +63,17 @@ class RepositoryTest {
         try { repo.patch("n1", 1, null); fail("Expected session error") } catch (_: SessionExpired) { }
         try { repo.delete("n1"); fail("Expected session error") } catch (_: SessionExpired) { }
     }
+    @Test fun mockDeleteUnknownNoteIsANoOp() = runBlocking {
+        val repo = MockRepository(seedOnLogin = false)
+        repo.login("demo")
+        repo.create(noteDraft("保留这条", "keep"))
+        val before = repo.sync()
+        repo.delete("missing")
+        repo.delete("missing")
+        assertEquals(before, repo.sync())
+        assertEquals(listOf("keep"), repo.notes().map { it.id })
+    }
+
     @Test fun retrofitPatchDeleteAndConflictContract() = runBlocking {
         MockWebServer().use { server ->
             server.start()
