@@ -74,6 +74,9 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
     var answer by mutableStateOf<Answer?>(null); private set
     var invite by mutableStateOf("")
     var draft by mutableStateOf(""); private set
+    var searchQuery by mutableStateOf("")
+    var searchHits by mutableStateOf(emptyList<SearchHit>()); private set
+    var searchCompleted by mutableStateOf(false); private set
     var question by mutableStateOf("")
     var organizingNoteIds by mutableStateOf(emptySet<String>()); private set
     private val organizeJobs = mutableMapOf<String, Job>()
@@ -84,6 +87,7 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
         organizeJobs.values.toList().forEach { it.cancel() }; organizeJobs.clear()
         organizingNoteIds = emptySet()
         editing = null; editText = ""
+        searchQuery = ""; searchHits = emptyList(); searchCompleted = false
         notes = emptyList(); reminders = emptyList(); answer = null; draft = ""; question = ""; pending = null; draftSource = "app"
     }
     private fun clearSession() {
@@ -229,6 +233,10 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
         question = result.question
         if (result.shouldAutoAsk) ask()
     }
+    fun search() = run {
+        searchCompleted = false; searchHits = emptyList()
+        searchHits = repo.search(searchQuery); searchCompleted = true
+    }
     fun ask() = run { answer = null; answer = repo.ask(question) }
     fun logout() = run {
         // Bump generation + clear alarms before network logout so in-flight boot cannot re-arm.
@@ -244,7 +252,7 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
 fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> VoiceAsr, requestMicrophone: () -> Unit, cancelVoice: () -> Unit) {
     Surface(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().imePadding().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("随记 · S6" + if (BuildConfig.USE_MOCK_API) " / 本地演示" else " / 服务器", style = MaterialTheme.typography.headlineSmall)
+            Text("随记 · S7" + if (BuildConfig.USE_MOCK_API) " / 本地演示" else " / 服务器", style = MaterialTheme.typography.headlineSmall)
             if (model.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
             model.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             if (!model.signedIn) {
@@ -275,8 +283,9 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 Button({ nav.navigate("capture") }, enabled = !model.busy) { Text("记一条") }
                                 Button({ nav.navigate("ask") }, enabled = !model.busy) { Text("问一问") }
-                                TextButton(model::reload, enabled = !model.busy) { Text("同步") }
+                                Button({ nav.navigate("search") }, enabled = !model.busy) { Text("搜记忆") }
                             }
+                            TextButton(model::reload, enabled = !model.busy) { Text("同步") }
                             LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                                 item { Text("提醒", style = MaterialTheme.typography.titleMedium) }
                                 if (model.reminders.isEmpty() && !model.busy) item { Text("暂无提醒。") }
@@ -316,6 +325,26 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                                             note.category?.let { Text("分类：$it") }
                                             Text("${note.recorded_at.orEmpty()} · ${noteStatus(note.status)}", style = MaterialTheme.typography.bodySmall)
                                         }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    composable("search") {
+                        LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                            item {
+                                OutlinedTextField(model.searchQuery, { model.searchQuery = it },
+                                    label = { Text("搜索记忆（最多 500 字）") },
+                                    modifier = Modifier.fillMaxWidth(), enabled = !model.busy)
+                                Button(model::search, enabled = !model.busy && model.searchQuery.isNotBlank()) { Text("搜索") }
+                            }
+                            if (model.searchCompleted && model.searchHits.isEmpty() && !model.busy) item { Text("没有找到相关记忆。") }
+                            items(model.searchHits) { hit ->
+                                Card(Modifier.fillMaxWidth()) {
+                                    Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                        Text(hit.text)
+                                        hit.note_id?.let { Text("记事：$it", style = MaterialTheme.typography.bodySmall) }
+                                        hit.score?.let { Text("相关度：$it", style = MaterialTheme.typography.bodySmall) }
                                     }
                                 }
                             }

@@ -1,4 +1,4 @@
-# Android S6 · 记事编辑/删除
+# Android S7 · 记忆搜索
 
 紧凑的 Kotlin / Compose 客户端：登录、时间线、记事创建/编辑/删除、问答、提醒同步与确认；
 确认后的 `schedule_reminder` Channel action 会落到 AlarmManager，响铃时显示系统通知。
@@ -50,6 +50,15 @@ api.useMock=false
 默认地址为生产占位 `https://agent.pinhaoyun.com/`；debug 默认 mock 不访问该地址。
 切回 mock：删除 `api.useMock=false` 或改为 `api.useMock=true`。
 `local.properties` 在构建时读取，改动后需重新构建安装。
+
+## S7 记忆搜索
+
+时间线「问一问」旁新增「搜记忆」，输入文字后调用 `GET /v1/search?q=&top_k=`。
+查询 trim 后为 1–500 字，默认 top_k=10（允许 1–50）；展示记忆正文、可选 note_id
+与相关度 score，无命中时提示；请求期间禁用输入与搜索。沿用 Bearer 和 401 refresh，
+退出清空查询和结果。不提供语音搜索，不改 ASR、闹钟、confirm 或 boot 核心行为。
+Mock 登录预置绿植/周报记忆，创建、整理和编辑更新记忆，删除记事移除关联记忆；
+大小写不敏感子串匹配，仅返回命中项并截断 topK，退出清空。
 
 ## S6 记事编辑/删除
 
@@ -123,7 +132,7 @@ pause/stop 保留 Permission 状态，允许权限结果继续启动识别。
 ## 模块与契约
 
 - `:app`：Compose Navigation、提醒列表与确认、AlarmManager、通知、开机重放、
-  S6 记事编辑/删除、创建后短轮询与整理字段展示、系统 SpeechRecognizer 语音记事与语音提问、ViewModel 保留旋转期间状态、手动 DI。
+  S7 记忆搜索、S6 记事编辑/删除、创建后短轮询与整理字段展示、系统 SpeechRecognizer 语音记事与语音提问、ViewModel 保留旋转期间状态、手动 DI。
 - `:data`：纯 JVM DTO、Retrofit、仓库、mock、S5 轮询纯函数和测试。接口核对自当前服务端
   `app/schemas.py` 与 `app/api/{auth,notes,ask,sync,reminders}.py`，未知响应字段由 Gson 忽略。
 - `:core-security`：Android Keystore MasterKey + EncryptedSharedPreferences。
@@ -133,7 +142,7 @@ pause/stop 保留 Permission 状态，允许权限结果继续启动识别。
 真实路由：`POST /v1/auth/login`、`POST /v1/auth/refresh`、
 `POST /v1/auth/logout`、`POST /v1/notes`、`GET /v1/notes`、`POST /v1/ask`、
 `PATCH /v1/notes/{id}`、`DELETE /v1/notes/{id}`、
-`GET /v1/sync`、`POST /v1/reminders/{id}/confirm`。
+`GET /v1/search`、`GET /v1/sync`、`POST /v1/reminders/{id}/confirm`。
 创建记事使用 `client_note_id/text/recorded_at/timezone/source`，返回 `note_id/status/rev`。
 记事列表遍历 `next_cursor` 分页；问答使用 `text/client_time/timezone` 并显示 citations。
 受保护请求发送 Bearer；401 后串行轮换 refresh 并重试一次。刷新失败即清本地会话，
@@ -182,11 +191,11 @@ JAR SHA-256：`cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8`
 
 使用 `/home/box/.local/jdk/jdk-17.0.16+8` 与 `/home/box/.local/android-sdk`。
 `./gradlew --no-daemon :data:test :app:testDebugUnitTest :app:assembleDebug`：`BUILD SUCCESSFUL`。
-`:data` RepositoryTest：**16** + OrganizePollTest：**9**（共 25），0 failures / 0 errors / 0 skipped；
-`:app` AsrStateTest：**6** + VoiceQuestionTest：**2**（共 8），0 failures / 0 errors / 0 skipped；
+`:data` RepositoryTest：**21** + OrganizePollTest：**9**（共 30），0 failures / 0 errors / 0 skipped；
+`:app` AsrStateTest：**6** + VoiceQuestionTest：**2** + EditBehaviorTest：**2** + AppRepositoriesTest：**2**（共 12），0 failures / 0 errors / 0 skipped；
 `:core-security` unit tests：`NO-SOURCE`。
 `python3 scripts/check-invariants.py`：`0 error(s), 0 warning(s)`。
-应用标签更新为 S6；时间线可编辑/删除记事，PATCH 变更后复用短轮询。
+应用标签更新为 S7；时间线可进入「搜记忆」，对接 `GET /v1/search`。
 未运行模拟器/真机、Keystore instrumentation 或连接实际服务的端到端测试。
 会话与同步安全：前台与开机共用 `AppRepositories.real`（进程级单例仓库，同一 Mutex），
 并以 session generation 栅栏防止 logout 后在途 boot sync / 整理轮询再设闹钟或写回。
