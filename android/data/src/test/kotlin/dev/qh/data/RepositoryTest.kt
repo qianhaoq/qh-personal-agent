@@ -8,6 +8,72 @@ import org.junit.Test
 import com.google.gson.JsonParser
 
 class RepositoryTest {
+    @Test fun mockSearchTracksMemoriesAndSession() = runBlocking {
+        val repo = MockRepository(organizeAfterReads = 0); repo.login("demo")
+        assertTrue(repo.search("  绿植 ").isNotEmpty())
+        repo.create(noteDraft("Kotlin 搜索记录", "search-note"))
+        assertEquals("search-note", repo.search("kotlin").single().note_id)
+        repo.organizeNote("search-note", "整理标题", emptyList(), emptyList())
+        assertEquals("search-note", repo.search("整理标题").single().note_id)
+        repo.create(noteDraft("KOTLIN 第二条", "second"))
+        assertEquals(1, repo.search("kotlin", 1).size)
+        repo.patch("search-note", 2, "修改后的记忆")
+        assertTrue(repo.search("整理标题").isEmpty())
+        assertEquals("search-note", repo.search("修改后").single().note_id)
+        repo.delete("search-note")
+        assertTrue(repo.search("修改后").isEmpty())
+        repo.logout(); repo.login("demo")
+        assertTrue(repo.search("kotlin").isEmpty())
+        repo.logout()
+        try { repo.search("绿植"); fail("Expected session error") } catch (_: SessionExpired) { }
+    }
+    @Test fun searchValidatesBeforeSendingRequests() = runBlocking {
+        MockWebServer().use { server ->
+            server.start()
+            val mock = MockRepository(); mock.login("demo")
+            val real = RealRepository(realApi(server.url("/").toString()), Store())
+            for (repo in listOf(mock, real)) {
+                for (query in listOf("", "   ", "字".repeat(501), "a\u0000")) {
+                    try { repo.search(query); fail("Expected invalid query") }
+                    catch (e: IllegalArgumentException) { assertTrue(readableError(e).contains("有效内容")) }
+                }
+                for (limit in listOf(0, 51)) {
+                    try { repo.search("记忆", limit); fail("Expected invalid limit") }
+                    catch (_: IllegalArgumentException) { }
+                }
+            }
+            assertEquals(0, server.requestCount)
+        }
+    }
+    @Test fun retrofitSearchContractAndRefresh() = runBlocking {
+        MockWebServer().use { server ->
+            server.start()
+            val store = Store().apply { tokens = Tokens("old", "rotation-1", 900, "u1") }
+            val repo = RealRepository(realApi(server.url("/").toString()), store)
+            server.json("{}", 401)
+            server.json(tokens)
+            server.json("""{"items":[{"memory_id":"m1","note_id":"n1","text":"记忆正文","score":0.85},
+                {"memory_id":"m2","note_id":null,"text":"另一条","score":null}]}""")
+            val hits = repo.search("  绿植 & Kotlin  ", 7)
+            assertEquals(SearchHit("m1", "n1", "记忆正文", 0.85), hits.first())
+            assertNull(hits[1].score); assertNull(hits[1].note_id)
+            val first = server.takeRequest()
+            assertEquals("GET", first.method)
+            assertEquals("/v1/search", first.requestUrl!!.encodedPath)
+            assertEquals("绿植 & Kotlin", first.requestUrl!!.queryParameter("q"))
+            assertEquals("7", first.requestUrl!!.queryParameter("top_k"))
+            assertEquals("Bearer old", first.getHeader("Authorization"))
+            val refresh = server.takeRequest()
+            assertEquals("/v1/auth/refresh", refresh.path)
+            assertEquals("rotation-1", JsonParser.parseString(refresh.body.readUtf8()).asJsonObject["refresh_token"].asString)
+            val retry = server.takeRequest()
+            assertEquals(first.path, retry.path)
+            assertEquals("Bearer access-1", retry.getHeader("Authorization"))
+            server.json("""{"items":[]}""")
+            assertTrue(repo.search("无结果").isEmpty())
+            assertEquals("10", server.takeRequest().requestUrl!!.queryParameter("top_k"))
+        }
+    }
     @Test fun mockPatchChecksRevAndInvalidatesDerivedFields() = runBlocking {
         val repo = MockRepository(false, 0); repo.login("demo")
         repo.create(noteDraft("原文", "n1"))

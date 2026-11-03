@@ -21,6 +21,8 @@ data class NotePatchResponse(val note: Note, val rev: Int)
 data class NotePage(val items: List<Note>, val next_cursor: Long?)
 data class AskRequest(val text: String, val client_time: String, val timezone: String)
 data class Citation(val memory_id: String, val note_id: String, val text: String)
+data class SearchHit(val memory_id: String, val note_id: String?, val text: String, val score: Double?)
+data class SearchResponse(val items: List<SearchHit>)
 data class Answer(val answer: String, val citations: List<Citation>)
 data class ReminderDto(val id: String, val note_id: String?, val title: String,
     val fire_at: String?, val rrule: String? = null, val status: String, val rev: Int,
@@ -51,6 +53,8 @@ interface AgentApi {
     @GET("v1/notes") suspend fun notes(@Header("Authorization") bearer: String,
         @Query("cursor") cursor: Long = 0, @Query("limit") limit: Int = 100): NotePage
     @POST("v1/ask") suspend fun ask(@Header("Authorization") bearer: String, @Body body: AskRequest): Answer
+    @GET("v1/search") suspend fun search(@Header("Authorization") bearer: String,
+        @Query("q") q: String, @Query("top_k") topK: Int = 10): SearchResponse
     @GET("v1/sync") suspend fun sync(@Header("Authorization") bearer: String,
         @Query("since") since: Long = 0, @Query("limit") limit: Int = 100): SyncResponse
     @POST("v1/reminders/{id}/confirm") suspend fun confirmReminder(@Header("Authorization") bearer: String,

@@ -28,6 +28,7 @@ interface Repository {
     suspend fun create(body: NoteCreate): Created
     suspend fun patch(noteId: String, rev: Int, text: String?): Note
     suspend fun delete(noteId: String)
+    suspend fun search(query: String, topK: Int = 10): List<SearchHit>
     suspend fun ask(text: String): Answer
     suspend fun sync(since: Long = 0, limit: Int = 100): SyncResponse
     suspend fun confirmReminder(id: String, rev: Int, fireAt: String? = null,
@@ -118,6 +119,11 @@ class RealRepository(private val api: AgentApi, private val store: TokenStore,
         try { authorized { api.deleteNote(it, noteId) } }
         catch (error: HttpException) { if (error.code() != 404) throw error }
     }
+    override suspend fun search(query: String, topK: Int): List<SearchHit> {
+        val q = query.trim(); validText(q, 500)
+        require(topK in 1..50) { "搜索条数须为 1–50" }
+        return authorized { api.search(it, q, topK).items }
+    }
     override suspend fun ask(text: String): Answer {
         validText(text, 2000)
         return authorized { api.ask(it, askBody(text)) }
@@ -159,6 +165,11 @@ class MockRepository(private val seedOnLogin: Boolean = true, private val organi
     private val organizeReads = mutableMapOf<String, Int>()
     private var active = false
     private var cursor = 0L
+    private val memories = linkedMapOf<String, SearchHit>()
+    private fun remember(note: Note) {
+        memories[note.id] = SearchHit("memory-${note.id}", note.id,
+            listOfNotNull(note.title, note.text).distinct().joinToString("\n"), 1.0)
+    }
     private val entries = linkedMapOf<String, Note>()
     private val deletedNotes = mutableMapOf<String, Long>()
     private val noteChanges = mutableMapOf<String, Long>()
@@ -173,13 +184,15 @@ class MockRepository(private val seedOnLogin: Boolean = true, private val organi
         require(invite.isNotBlank()) { "请输入邀请码" }
         active = true
         if (seedOnLogin && reminders.isEmpty()) {
+            memories["demo-plants"] = SearchHit("memory-demo-plants", null, "每周给绿植浇水", 1.0)
+            memories["demo-report"] = SearchHit("memory-demo-report", null, "周五整理周报，回顾本周工作", 1.0)
             seedReminder("给绿植浇水", Instant.now().plusSeconds(3600).toString())
             seedReminder("整理周报", Instant.now().plusSeconds(7200).toString())
         }
     }
     override suspend fun logout() {
         active = false; cursor = 0
-        organizeReads.clear()
+        memories.clear(); organizeReads.clear()
         entries.clear(); noteChanges.clear(); deletedNotes.clear(); reminders.clear(); reminderChanges.clear()
         deletedReminders.clear(); actions.clear(); actionChanges.clear(); deletedActions.clear()
     }
@@ -203,6 +216,7 @@ class MockRepository(private val seedOnLogin: Boolean = true, private val organi
         val current = entries.getValue(id)
         entries[id] = current.copy(status = "organized", rev = current.rev + 1,
             title = title, tags = tags, todos = todos)
+        remember(entries.getValue(id))
         organizeReads.remove(id)
         noteChanges[id] = nextSeq()
     }
@@ -210,6 +224,7 @@ class MockRepository(private val seedOnLogin: Boolean = true, private val organi
         requireSession(); validText(body.text, 5000)
         val note = Note(body.client_note_id, body.text, "uploaded", 1, recorded_at = body.recorded_at)
         if (entries.putIfAbsent(body.client_note_id, note) == null) {
+            remember(note)
             noteChanges[note.id] = nextSeq()
             organizeReads[note.id] = 0
         }
@@ -225,6 +240,7 @@ class MockRepository(private val seedOnLogin: Boolean = true, private val organi
         val updated = current.copy(text = text, rev = current.rev + 1, status = "uploaded",
             title = null, tags = null, todos = null, category = null)
         entries[noteId] = updated
+        remember(updated)
         organizeReads[noteId] = 0
         reminders.values.filter { it.note_id == noteId && it.status == "suggested" }
             .map { it.id }.forEach(::deleteReminder)
@@ -234,12 +250,19 @@ class MockRepository(private val seedOnLogin: Boolean = true, private val organi
     override suspend fun delete(noteId: String) {
         requireSession()
         if (entries.remove(noteId) == null) return
+        memories.remove(noteId)
         organizeReads.remove(noteId); noteChanges.remove(noteId)
         val related = reminders.values.filter { it.note_id == noteId }.map { it.id }.toSet()
         actions.values.filter { it.reminder_id in related || it.payload["note_id"] == noteId }
             .map { it.id }.forEach(::deleteAction)
         related.forEach(::deleteReminder)
         deletedNotes[noteId] = nextSeq()
+    }
+    override suspend fun search(query: String, topK: Int): List<SearchHit> {
+        requireSession()
+        val q = query.trim(); validText(q, 500)
+        require(topK in 1..50) { "搜索条数须为 1–50" }
+        return memories.values.filter { it.text.contains(q, ignoreCase = true) }.take(topK)
     }
     override suspend fun ask(text: String): Answer {
         requireSession(); validText(text, 2000)
