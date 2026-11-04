@@ -38,6 +38,9 @@ data class SyncResponse(val cursor: Long, val notes: List<Note> = emptyList(),
 data class ReminderConfirmRequest(val rev: Int, val fire_at: String? = null, val title: String? = null)
 data class ReminderConfirmResponse(val reminder: ReminderDto, val action: SyncAction? = null,
     val work_item_id: String? = null, val duplicate: Boolean = false)
+data class ReminderCancelRequest(val rev: Int)
+data class ReminderCancelResponse(val reminder: ReminderDto, val action: SyncAction? = null,
+    val work_item_id: String? = null, val duplicate: Boolean = false)
 data class ApiError(val code: String, val message: String)
 data class ErrorEnvelope(val error: ApiError?)
 
@@ -60,4 +63,6 @@ interface AgentApi {
         @Query("since") since: Long = 0, @Query("limit") limit: Int = 100): SyncResponse
     @POST("v1/reminders/{id}/confirm") suspend fun confirmReminder(@Header("Authorization") bearer: String,
         @Path("id") id: String, @Body body: ReminderConfirmRequest): ReminderConfirmResponse
+    @POST("v1/reminders/{id}/cancel") suspend fun cancelReminder(@Header("Authorization") bearer: String,
+        @Path("id") id: String, @Body body: ReminderCancelRequest): ReminderCancelResponse
 }

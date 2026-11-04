@@ -44,6 +44,9 @@ class ReminderAlarmScheduler(context: Context) {
 
     fun consume(response: SyncResponse) {
         response.actions.filter { it.type == "schedule_reminder" }.forEach(::schedule)
+        response.actions.filter { it.type == "cancel_reminder" }.forEach { action ->
+            (action.reminder_id ?: action.payload["reminder_id"] as? String)?.let(::cancelReminder)
+        }
         response.deleted.notes.forEach(::cancelForNote)
         response.deleted.actions.forEach(::cancelAction)
         response.deleted.reminders.forEach(::cancelReminder)
