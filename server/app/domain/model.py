@@ -19,6 +19,7 @@ TRIGGER_NOTE_UPLOADED = "note_uploaded"
 TRIGGER_ASK_REQUESTED = "ask_requested"
 TRIGGER_USER_CONFIRMED_REMINDER = "user_confirmed_reminder"
 TRIGGER_USER_CANCELLED_REMINDER = "user_cancelled_reminder"
+TRIGGER_USER_COMPLETED_REMINDER = "user_completed_reminder"
 
 # WorkItem kind（授权工作单元类型）
 WORK_ITEM_ORGANIZE_NOTE = "organize_note"
@@ -32,6 +33,7 @@ SUBSCRIPTION_STOPPED = "stopped"
 # Channel action types（端侧可消费；服务端从不执行 OS 闹钟）
 CHANNEL_ACTION_SCHEDULE_REMINDER = "schedule_reminder"
 CHANNEL_ACTION_CANCEL_REMINDER = "cancel_reminder"
+CHANNEL_ACTION_COMPLETE_REMINDER = "complete_reminder"
 
 # WorkItem 状态机：pending → running → done | failed
 WORK_ITEM_PENDING = "pending"

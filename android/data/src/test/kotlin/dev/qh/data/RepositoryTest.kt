@@ -79,6 +79,77 @@ class RepositoryTest {
             }
         }
     }
+    @Test fun mockCompleteScheduledTombstonesActionAndIsIdempotent() = runBlocking {
+        val repo = MockRepository(seedOnLogin = false); repo.login("demo")
+        val seeded = repo.seedReminder("吃药", "2099-01-01T00:00:00Z")
+        val confirmed = repo.confirmReminder(seeded.id, seeded.rev)
+        val before = repo.sync()
+        val done = repo.completeReminder(seeded.id, confirmed.reminder.rev)
+        assertEquals("done", done.reminder.status)
+        assertEquals(3, done.reminder.rev)
+        assertFalse(done.duplicate)
+        assertEquals("complete_reminder", done.action?.type)
+        assertEquals(3, done.action?.payload?.get("rev"))
+        val delta = repo.sync(before.cursor)
+        assertEquals(listOf(confirmed.action!!.id), delta.deleted.actions)
+        assertEquals(done.action, delta.actions.single())
+        assertEquals(done.reminder, delta.reminders.single())
+        val retry = repo.completeReminder(seeded.id, done.reminder.rev)
+        assertTrue(retry.duplicate)
+        assertEquals(done.action, retry.action)
+        assertEquals(done.reminder, retry.reminder)
+        assertEquals(delta.cursor, repo.sync(delta.cursor).cursor)
+    }
+    @Test fun mockCompleteSuggestedAndRejectStaleRev() = runBlocking {
+        val repo = MockRepository(seedOnLogin = false); repo.login("demo")
+        val seeded = repo.seedReminder("吃药", "2099-01-01T00:00:00Z")
+        try { repo.completeReminder(seeded.id, 2); fail("Expected conflict") }
+        catch (e: IllegalArgumentException) { assertTrue(readableError(e).contains("版本冲突")) }
+        val done = repo.completeReminder(seeded.id, 1)
+        assertEquals("done", done.reminder.status)
+        assertEquals(2, done.reminder.rev)
+        assertTrue(repo.sync().deleted.actions.isEmpty())
+        try { repo.completeReminder(seeded.id, 1); fail("Expected conflict") }
+        catch (e: IllegalArgumentException) { assertTrue(readableError(e).contains("版本冲突")) }
+        try { repo.confirmReminder(seeded.id, 2); fail("Expected unavailable") }
+        catch (e: IllegalArgumentException) { assertTrue(readableError(e).contains("不可确认")) }
+        repo.deleteReminder(seeded.id)
+        try { repo.completeReminder(seeded.id, 2); fail("Expected missing") }
+        catch (e: IllegalArgumentException) { assertTrue(readableError(e).contains("不存在")) }
+    }
+    @Test fun mockCompleteCancelledIsRejectedWithoutChanges() = runBlocking {
+        val repo = MockRepository(seedOnLogin = false); repo.login("demo")
+        val done = repo.seedReminder("吃药", "2099-01-01T00:00:00Z", status = "cancelled")
+        val before = repo.sync()
+        try { repo.completeReminder(done.id, done.rev); fail("Expected unavailable") }
+        catch (e: IllegalArgumentException) { assertTrue(readableError(e).contains("不可完成")) }
+        val after = repo.sync()
+        assertEquals(before, after)
+    }
+    @Test fun completeUsesPostRevBearerAndReadableStateConflict() = runBlocking {
+        MockWebServer().use { server ->
+            server.start()
+            val store = Store().apply { tokens = Tokens("access", "refresh", 900, "u1") }
+            val repo = RealRepository(realApi(server.url("/").toString()), store)
+            server.json("""{"reminder":{"id":"r1","title":"吃药","status":"done","rev":4},"action":{"id":"a2","type":"complete_reminder","reminder_id":"r1"},"work_item_id":"w1","duplicate":false}""")
+            val result = repo.completeReminder("r1", 3)
+            assertEquals("done", result.reminder.status)
+            assertEquals("complete_reminder", result.action?.type)
+            assertEquals("w1", result.work_item_id)
+            assertFalse(result.duplicate)
+            val request = server.takeRequest()
+            assertEquals("POST", request.method)
+            assertEquals("/v1/reminders/r1/complete", request.path)
+            assertEquals("Bearer access", request.getHeader("Authorization"))
+            assertEquals("{\"rev\":3}", request.body.readUtf8())
+            server.json("""{"error":{"code":"conflict","message":"提醒当前不可完成"}}""", 409)
+            try { repo.completeReminder("r1", 4); fail("Expected conflict") }
+            catch (e: retrofit2.HttpException) {
+                // 409 统一走 readableError 固定文案（与 patch/confirm 契约一致），不回显服务端 message。
+                assertEquals(409, e.code()); assertEquals("版本冲突，请同步后重试", readableError(e))
+            }
+        }
+    }
     @Test fun mockLoginSyncReminderLinksLoadDemoNoteDetails() = runBlocking {
         val repo = MockRepository()
         repo.login("demo")

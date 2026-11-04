@@ -16,6 +16,7 @@ from app.domain.model import (
     SUBSCRIPTION_ACTIVE,
     SUBSCRIPTION_REMINDER_CONFIRM,
     TRIGGER_USER_CANCELLED_REMINDER,
+    TRIGGER_USER_COMPLETED_REMINDER,
     TRIGGER_USER_CONFIRMED_REMINDER,
     Decision,
     Receipt,
@@ -59,14 +60,14 @@ class Engine:
                     SaTrigger.dedupe_key == trigger.dedupe_key))).one()
                 item = (await session.scalars(select(SaWorkItem).where(
                     SaWorkItem.trigger_id == original.id))).one_or_none()
-                if item is None and original.kind in (TRIGGER_USER_CONFIRMED_REMINDER, TRIGGER_USER_CANCELLED_REMINDER):
+                if item is None and original.kind in (TRIGGER_USER_CONFIRMED_REMINDER, TRIGGER_USER_CANCELLED_REMINDER, TRIGGER_USER_COMPLETED_REMINDER):
                     item = await _subscribed_work_item(session, original.thread_key)
                 return Receipt(original.id, True, Decision(**original.decision),
                                snapshot(item) if item else None)
 
             # Subscription fast path: confirm/modify goes to the original Ticket
             # without Policy Eval or a new WorkItem.
-            if trigger.kind in (TRIGGER_USER_CONFIRMED_REMINDER, TRIGGER_USER_CANCELLED_REMINDER):
+            if trigger.kind in (TRIGGER_USER_CONFIRMED_REMINDER, TRIGGER_USER_CANCELLED_REMINDER, TRIGGER_USER_COMPLETED_REMINDER):
                 return await self._receive_subscription_reminder(session, trigger)
 
             decision = self.policy.evaluate(trigger)
@@ -183,8 +184,9 @@ class Engine:
 
 
     async def _receive_subscription_reminder(self, session, trigger: Trigger) -> Receipt:
-        """Fan out explicit confirm/cancel via active Subscription → Channel."""
-        operation = "cancel" if trigger.kind == TRIGGER_USER_CANCELLED_REMINDER else "confirm"
+        """Fan out explicit confirm/cancel/complete via active Subscription → Channel."""
+        operation = {TRIGGER_USER_CANCELLED_REMINDER: "cancel",
+                     TRIGGER_USER_COMPLETED_REMINDER: "complete"}.get(trigger.kind, "confirm")
         sub_row = await _active_subscription(session, trigger.thread_key)
         if sub_row is None:
             decision = Decision(
@@ -207,7 +209,9 @@ class Engine:
             await session.execute(update(SaTrigger).where(SaTrigger.id == trigger.id)
                                   .values(decision=asdict(decision)))
             return Receipt(trigger.id, False, decision, None)
-        handler = self.channel.cancel_reminder if operation == "cancel" else self.channel.confirm_reminder
+        handler = {"cancel": self.channel.cancel_reminder,
+                   "complete": self.channel.complete_reminder,
+                   "confirm": self.channel.confirm_reminder}[operation]
         action = await handler(
             session,
             work_item_id=work_row.id,

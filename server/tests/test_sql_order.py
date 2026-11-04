@@ -257,3 +257,26 @@ async def test_cancel_sql_order_reminder_actions_before_seq(client, user):
     assert len([i for i in reminder_updates if i > seq]) == 1
     assert len([i for i in action_updates if i > seq]) >= 1  # both change_seq writes
     assert not [i for i in action_inserts if i > seq]
+
+
+async def test_complete_sql_order_reminder_actions_before_seq(client, user):
+    from tests.test_subscription_channel import _suggested
+
+    _, reminder_id, rev = await _suggested(client, user)
+    confirmed = await client.post(f"/v1/reminders/{reminder_id}/confirm",
+                                  headers=auth_headers(user), json={"rev": rev})
+    assert confirmed.status_code == 200
+    with _SqlTrace(("reminders", "sa_channel_actions", "sequences")) as trace:
+        done = await client.post(f"/v1/reminders/{reminder_id}/complete",
+                                      headers=auth_headers(user),
+                                      json={"rev": confirmed.json()["reminder"]["rev"]})
+    assert done.status_code == 200, done.text
+    seq = _first_seq_write(trace)
+    reminder_updates = trace.indices("reminders", "UPDATE")
+    action_updates = trace.indices("sa_channel_actions", "UPDATE")
+    action_inserts = trace.indices("sa_channel_actions", "INSERT")
+    assert reminder_updates[0] < action_updates[0] < seq  # schedule tombstone
+    assert reminder_updates[0] < action_inserts[0] < seq  # complete action
+    assert len([i for i in reminder_updates if i > seq]) == 1
+    assert len([i for i in action_updates if i > seq]) >= 1  # both change_seq writes
+    assert not [i for i in action_inserts if i > seq]
