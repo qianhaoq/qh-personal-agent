@@ -7,6 +7,13 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class ReminderNotificationActionTest {
+    @Test fun notificationOrderAndLabelsMatchInAppActions() {
+        val actions = reminderNotificationActionOrder()
+        assertEquals(listOf(ReminderNotificationAction.CANCEL, ReminderNotificationAction.COMPLETE,
+            ReminderNotificationAction.SNOOZE), actions)
+        assertEquals(listOf("取消提醒", "完成提醒", "贪睡10分钟"), actions.map { it.label })
+    }
+
     private val reminder = ReminderDto("target", null, "提醒", null, status = "scheduled", rev = 7)
     private class Fake(private val response: SyncResponse) : Repository by MockRepository() {
         var syncs = 0

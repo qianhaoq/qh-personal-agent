@@ -13,6 +13,10 @@ internal enum class ReminderNotificationAction(val intentAction: String, val lab
     }
 }
 
+/** Same left-to-right order as in-app cancel → complete → snooze. */
+internal fun reminderNotificationActionOrder(): List<ReminderNotificationAction> =
+    listOf(ReminderNotificationAction.CANCEL, ReminderNotificationAction.COMPLETE, ReminderNotificationAction.SNOOZE)
+
 /** Resolve rev from a fresh full sync; never clear alarms/notification on a failed mutation. */
 internal suspend fun performReminderNotificationAction(
     action: ReminderNotificationAction, id: String, repository: Repository,

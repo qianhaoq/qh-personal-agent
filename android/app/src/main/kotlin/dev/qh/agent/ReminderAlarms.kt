@@ -162,9 +162,11 @@ class ReminderAlarmReceiver : BroadcastReceiver() {
             .setSmallIcon(android.R.drawable.ic_dialog_alert).setContentTitle("随记提醒")
             .setContentText(title).setStyle(Notification.BigTextStyle().bigText(title))
             .setContentIntent(contentIntent).setAutoCancel(true)
-            .addAction(notificationAction(context, reminderId, title, ReminderNotificationAction.COMPLETE))
-            .addAction(notificationAction(context, reminderId, title, ReminderNotificationAction.CANCEL))
-            .addAction(notificationAction(context, reminderId, title, ReminderNotificationAction.SNOOZE)).build()
+            .apply {
+                reminderNotificationActionOrder().forEach { action ->
+                    addAction(notificationAction(context, reminderId, title, action))
+                }
+            }.build()
         notifications.notify(reminderId.hashCode(), notification)
     }
 }

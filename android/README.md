@@ -1,4 +1,4 @@
-# S35 · 二次确认对话框展示提醒标题
+# S36 · 通知栏提醒操作顺序对齐
 
 紧凑的 Kotlin / Compose 客户端：登录、时间线、记事创建/编辑/删除、问答、提醒同步、确认/取消/完成；
 确认后的 `schedule_reminder` Channel action 会落到 AlarmManager，响铃时显示系统通知。
@@ -510,3 +510,12 @@ JAR SHA-256：`cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8`
 - 通知三个 action 均携带共享 `EXTRA_TITLE`；对话框标题「完成提醒？／取消提醒？」与按钮「确认」「取消」保持不变。
 - 应用标签「随记 S35」，顶栏「随记 · S35」。单测覆盖两种动作的具体标题、空白回落及缺省通知标题，保留 busy 与会话确认回归。
 - S35 不做：rrule、根路径 `GET /`、FCM/Room/Hilt/Pipecat、server/data/Mock/API、贪睡分钟调整、S31 竞态逻辑、大重构、部署、合入、squash routine；不改通知栏 action/intentAction/分钟/PendingIntent 类型，仅补确认文案与 EXTRA_TITLE。
+
+
+## S36 通知栏提醒操作顺序对齐
+
+- 选刀理由（已确认）：扫描 #57–#62，无开放 P0/P1；已知竞态、确认页、空态、确认标题 P2 均已由 S31–S35 闭环。标签已在 S26–S29 对齐，本刀只补顺序一致性。
+- 抽出可测纯函数 `reminderNotificationActionOrder()`，通知栏按 CANCEL→COMPLETE→SNOOZE 添加 action，与主列表及详情的「取消提醒」→「完成提醒」→「贪睡10分钟」一致。
+- 保留 enum 声明顺序与 ordinal，intentAction、label、PendingIntent 类型、确认文案、EXTRA_TITLE、贪睡 10 分钟及 S31 栅栏不变。单测断言完整顺序与对应标签，保留既有确认与贪睡行为用例。
+- 应用标签「随记 S36」，顶栏「随记 · S36」；保留 S35 及更早历史。
+- S36 不做：rrule、根路径 `GET /`、FCM/Room/Hilt/Pipecat、server/data/Mock/API、贪睡分钟调整、S31 竞态逻辑、大重构、部署、合入、squash；不改应用内按钮顺序、确认文案、EXTRA_TITLE、筛选空态。
