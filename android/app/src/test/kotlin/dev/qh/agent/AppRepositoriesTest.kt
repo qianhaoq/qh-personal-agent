@@ -7,6 +7,54 @@ import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 
 class AppRepositoriesTest {
+    @Test fun mutationSignalCarriesCurrentGenerationAndUnsubscribes() {
+        val received = mutableListOf<Long>()
+        val unsubscribe = AppRepositories.subscribeRemindersMutated { received += it }
+        try {
+            AppRepositories.notifyRemindersMutated()
+            assertEquals(listOf(AppRepositories.sessionGeneration()), received)
+            unsubscribe()
+            AppRepositories.notifyRemindersMutated()
+            assertEquals(1, received.size)
+        } finally { unsubscribe() }
+    }
+
+    @Test fun oldSessionHandlerCannotRefreshAfterSessionBump() {
+        val subscribedSession = AppRepositories.sessionGeneration()
+        var refreshes = 0
+        val unsubscribe = AppRepositories.subscribeRemindersMutated { eventSession ->
+            if (eventSession == subscribedSession) {
+                AppRepositories.ifCurrent(eventSession) { refreshes++ }
+            }
+        }
+        try {
+            AppRepositories.notifyRemindersMutated()
+            assertEquals(1, refreshes)
+            AppRepositories.bumpSession()
+            AppRepositories.notifyRemindersMutated()
+            assertEquals(1, refreshes)
+        } finally { unsubscribe() }
+    }
+
+    @Test fun queuedMutationCannotRefreshAfterSessionBump() {
+        val queued = mutableListOf<() -> Unit>()
+        var refreshes = 0
+        val unsubscribe = AppRepositories.subscribeRemindersMutated { eventSession ->
+            queued += { AppRepositories.ifCurrent(eventSession) { refreshes++ } }
+        }
+        try {
+            AppRepositories.notifyRemindersMutated()
+            assertEquals(1, queued.size)
+            AppRepositories.bumpSession()
+            queued.single().invoke()
+            assertEquals(0, refreshes)
+        } finally { unsubscribe() }
+    }
+
+    @Test fun mutationWithoutSubscribersIsSafe() {
+        AppRepositories.notifyRemindersMutated()
+    }
+
     @Test fun deleteInvalidatesOldSyncWithoutInvalidatingOrganizeSession() {
         val session = AppRepositories.sessionGeneration()
         val alarms = AppRepositories.alarmGeneration()

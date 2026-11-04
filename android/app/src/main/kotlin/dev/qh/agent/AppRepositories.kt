@@ -4,6 +4,7 @@ import android.content.Context
 import dev.qh.data.RealRepository
 import dev.qh.data.realApi
 import dev.qh.security.SecureTokens
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicLong
 
 /** Process-wide real repository and session generation fence for boot vs foreground. */
@@ -12,6 +13,19 @@ object AppRepositories {
     private val generation = AtomicLong(0)
     private val alarmGeneration = AtomicLong(0)
     @Volatile private var real: RealRepository? = null
+
+    private val remindersMutatedListeners = CopyOnWriteArrayList<(Long) -> Unit>()
+
+    /** Listeners run synchronously under the session fence; enqueue work without blocking. */
+    fun subscribeRemindersMutated(listener: (Long) -> Unit): () -> Unit {
+        remindersMutatedListeners.add(listener)
+        return { remindersMutatedListeners.remove(listener) }
+    }
+
+    fun notifyRemindersMutated() = synchronized(lock) {
+        val session = generation.get()
+        remindersMutatedListeners.forEach { it(session) }
+    }
 
     fun sessionGeneration(): Long = generation.get()
 

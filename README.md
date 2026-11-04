@@ -2,9 +2,9 @@
 
 个人语音记事与语音助手。说一句话，自动整理成笔记 / 待办 / 提醒，并能用语音问答自己的记忆。
 
-当前 Android 里程碑：**S20**，提醒主列表与记事详情的 suggested/scheduled 提醒支持「10分钟后」，与「完成 / 取消」并列；成功后重设本地闹钟并刷新，失败保留闹钟并显示可读错误。复用 S19 data / Mock / API，保留通知快捷操作。详见 [Android README](android/README.md)。
+当前 Android 里程碑：**S21**，通知栏完成 / 取消 /「10分钟后」成功后，通过进程内会话信号自动刷新前台列表与详情时间线，无需手动同步或等待 Activity ON_RESUME。复用既有 refresh 与会话栅栏。详见 [Android README](android/README.md)。
 
-S20 不做：rrule 执行、二次确认、FCM/Room/Hilt/Pipecat、ASR/TTS 核心改动、根路径 `GET /`；不部署、不改通知栏。
+S21 不做：FCM/Room/Hilt/Pipecat、rrule、根路径 `GET /`、二次确认、data / Mock / API / server 改动、ASR/TTS 改动、routine；不改通知按钮集合或 API 语义，不部署、不合入。
 
 ## 仓库结构（monorepo）
 

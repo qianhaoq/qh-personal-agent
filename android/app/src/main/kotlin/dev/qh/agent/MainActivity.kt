@@ -85,6 +85,26 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
     var organizingNoteIds by mutableStateOf(emptySet<String>()); private set
     private val organizeJobs = mutableMapOf<String, Job>()
     private val refreshMutex = Mutex()
+    private val unsubscribeRemindersMutated = AppRepositories.subscribeRemindersMutated { generation ->
+        viewModelScope.launch {
+            try {
+                refresh(expectedGeneration = generation)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                AppRepositories.ifCurrent(generation) {
+                    if (!repo.signedIn) { clearSession(); signedIn = false }
+                    error = readableError(e)
+                }
+            }
+        }
+    }
+
+    override fun onCleared() {
+        unsubscribeRemindersMutated()
+        super.onCleared()
+    }
+
     private var pending: NoteCreate? = null
     private var draftSource = "app"
     var onAnswer: ((String) -> Unit)? = null
@@ -118,8 +138,11 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
             finally { signedIn = repo.signedIn; busy = false }
         }
     }
-    private suspend fun refresh() = refreshMutex.withLock {
-        val generation = AppRepositories.sessionGeneration()
+    private suspend fun refresh(expectedGeneration: Long? = null) = refreshMutex.withLock {
+        // Recheck after waiting for another refresh, before any repository/network work.
+        val generation = expectedGeneration ?: AppRepositories.sessionGeneration()
+        if (expectedGeneration != null &&
+            (!repo.signedIn || AppRepositories.sessionGeneration() != generation)) return@withLock
         val alarmGeneration = AppRepositories.alarmGeneration()
         val sync = repo.sync()
         if (!repo.signedIn || AppRepositories.sessionGeneration() != generation) {
@@ -308,7 +331,7 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
 fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> VoiceAsr, requestMicrophone: () -> Unit, cancelVoice: () -> Unit) {
     Surface(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().imePadding().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("随记 · S20" + if (BuildConfig.USE_MOCK_API) " / 本地演示" else " / 服务器", style = MaterialTheme.typography.headlineSmall)
+            Text("随记 · S21" + if (BuildConfig.USE_MOCK_API) " / 本地演示" else " / 服务器", style = MaterialTheme.typography.headlineSmall)
             if (model.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
             model.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             if (!model.signedIn) {
