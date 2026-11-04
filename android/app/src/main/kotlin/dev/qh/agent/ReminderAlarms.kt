@@ -32,7 +32,7 @@ import org.json.JSONObject
 
 private const val ALARM_PREFS = "pending_reminder_alarms"
 private const val ALARM_ACTION = "dev.qh.agent.action.REMINDER_ALARM"
-private const val EXTRA_REMINDER_ID = "reminder_id"
+internal const val EXTRA_REMINDER_ID = "reminder_id"
 private const val EXTRA_TITLE = "title"
 private const val NOTIFICATION_CHANNEL = "reminders"
 // Soft budget for optional post-boot network sync (does not hold the broadcast).
@@ -199,14 +199,17 @@ class ReminderBootReceiver : BroadcastReceiver() {
 }
 
 private fun notificationAction(context: Context, id: String, action: ReminderNotificationAction): Notification.Action {
-    val intent = Intent(context, ReminderNotificationActionReceiver::class.java).setAction(action.intentAction)
+    val target = if (action.confirmAction == null) ReminderNotificationActionReceiver::class.java
+        else ReminderNotificationConfirmActivity::class.java
+    val intent = Intent(context, target).setAction(action.intentAction)
         .setData(Uri.Builder().scheme("qh-agent").authority("reminder-action")
             .appendPath(id).appendPath(action.name).build())
         .putExtra(EXTRA_REMINDER_ID, id)
     // Distinct request codes so complete/cancel PendingIntents never collide.
     val requestCode = 31 * id.hashCode() + action.ordinal
-    val pending = PendingIntent.getBroadcast(context, requestCode, intent,
-        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+    val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+    val pending = if (action.confirmAction == null) PendingIntent.getBroadcast(context, requestCode, intent, flags)
+        else PendingIntent.getActivity(context, requestCode, intent, flags)
     return Notification.Action.Builder(null, action.label, pending).build()
 }
 
@@ -214,50 +217,61 @@ class ReminderNotificationActionReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         val action = ReminderNotificationAction.fromIntentAction(intent.action) ?: return
         val id = intent.getStringExtra(EXTRA_REMINDER_ID)?.takeIf { it.isNotBlank() } ?: return
-        val appContext = context.applicationContext
-        if (SecureTokens(appContext).read() == null) return
-        val generation = AppRepositories.sessionGeneration()
-        val alarmGeneration = AppRepositories.alarmGeneration(id)
-        val repository = AppRepositories.real(appContext)
-        if (!repository.signedIn) return
+        // Terminal actions must enter through the confirmation Activity, including old notifications.
+        if (action.confirmAction != null) return
         val pending = goAsync()
-        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
-            try {
-                val completed = withTimeoutOrNull(8_000L) {
-                    performReminderNotificationAction(action, id, repository,
-                        sessionCurrent = {
-                            repository.signedIn && generation == AppRepositories.sessionGeneration()
-                        }, onSuccess = { snoozed ->
-                            val scheduler = ReminderAlarmScheduler(appContext)
-                            AppRepositories.applyNotificationActionLocalEffects(
-                                generation, id, alarmGeneration,
-                                signedIn = { repository.signedIn },
-                                cancelAlarm = { scheduler.cancelReminder(id) },
-                                reinstallAlarm = snoozed?.let { response ->
-                                    { scheduler.snoozed(response) }
-                                },
-                                dismissNotification = {
-                                    appContext.getSystemService(NotificationManager::class.java)
-                                        .cancel(id.hashCode())
-                                }
-                            )
-                        })
-                    true
-                }
-                if (completed == null) showFailure(appContext, "操作超时，请重试")
-            } catch (error: CancellationException) {
-                throw error
-            } catch (error: Exception) {
-                // Never log exception messages: they may contain server/user data.
-                Log.w("ReminderAction", "Notification action failed: ${error.javaClass.simpleName}")
-                showFailure(appContext, "操作失败，请重试或打开应用同步")
-            } finally {
-                pending.finish()
+        executeReminderNotificationAction(context, action, id, confirmed = false) { pending.finish() }
+    }
+}
+
+/** Application-scoped work survives the short-lived confirmation Activity. */
+internal fun executeReminderNotificationAction(
+    context: Context, action: ReminderNotificationAction, id: String, confirmed: Boolean,
+    onFinished: () -> Unit = {}
+) {
+    val appContext = context.applicationContext
+    if (SecureTokens(appContext).read() == null) { onFinished(); return }
+    val generation = AppRepositories.sessionGeneration()
+    val alarmGeneration = AppRepositories.alarmGeneration(id)
+    val repository = AppRepositories.real(appContext)
+    if (!repository.signedIn) { onFinished(); return }
+    CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+        try {
+            val completed = withTimeoutOrNull(8_000L) {
+                performConfirmedReminderNotificationAction(action, confirmed, id, repository,
+                    sessionCurrent = {
+                        repository.signedIn && generation == AppRepositories.sessionGeneration()
+                    }, onSuccess = { snoozed ->
+                        val scheduler = ReminderAlarmScheduler(appContext)
+                        AppRepositories.applyNotificationActionLocalEffects(
+                            generation, id, alarmGeneration,
+                            signedIn = { repository.signedIn },
+                            cancelAlarm = { scheduler.cancelReminder(id) },
+                            reinstallAlarm = snoozed?.let { response ->
+                                { scheduler.snoozed(response) }
+                            },
+                            dismissNotification = {
+                                appContext.getSystemService(NotificationManager::class.java)
+                                    .cancel(id.hashCode())
+                            }
+                        )
+                    })
+                true
             }
+            if (completed == null) showFailure(appContext, "操作超时，请重试")
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            // Never log exception messages: they may contain server/user data.
+            Log.w("ReminderAction", "Notification action failed: ${error.javaClass.simpleName}")
+            showFailure(appContext, "操作失败，请重试或打开应用同步")
+        } finally {
+            onFinished()
         }
     }
-    private suspend fun showFailure(context: Context, message: String) {
-        Log.w("ReminderAction", message)
-        withContext(Dispatchers.Main) { Toast.makeText(context, message, Toast.LENGTH_LONG).show() }
-    }
+}
+
+private suspend fun showFailure(context: Context, message: String) {
+    Log.w("ReminderAction", message)
+    withContext(Dispatchers.Main) { Toast.makeText(context, message, Toast.LENGTH_LONG).show() }
 }

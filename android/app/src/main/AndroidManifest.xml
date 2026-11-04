@@ -9,7 +9,7 @@
         <intent><action android:name="android.speech.RecognitionService" /></intent>
         <intent><action android:name="android.intent.action.TTS_SERVICE" /></intent>
     </queries>
-    <application android:label="随记 S31" android:theme="@android:style/Theme.Material.Light.NoActionBar"
+    <application android:label="随记 S32" android:theme="@android:style/Theme.Material.Light.NoActionBar"
         android:allowBackup="false" android:usesCleartextTraffic="false" android:supportsRtl="true">
         <activity android:name=".MainActivity" android:exported="true">
             <intent-filter>
@@ -17,6 +17,8 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <activity android:name=".ReminderNotificationConfirmActivity" android:exported="false"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" android:excludeFromRecents="true" />
         <receiver android:name=".ReminderNotificationActionReceiver" android:exported="false" />
         <receiver android:name=".ReminderAlarmReceiver" android:exported="false" />
         <receiver android:name=".ReminderBootReceiver" android:enabled="true" android:exported="true">
