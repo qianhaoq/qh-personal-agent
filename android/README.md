@@ -1,4 +1,4 @@
-# S19 · 通知贪睡（稍后提醒）
+# S20 · 主列表/详情「10分钟后」贪睡
 
 紧凑的 Kotlin / Compose 客户端：登录、时间线、记事创建/编辑/删除、问答、提醒同步、确认/取消/完成；
 确认后的 `schedule_reminder` Channel action 会落到 AlarmManager，响铃时显示系统通知。
@@ -280,7 +280,7 @@ scheduled rev 保持幂等；取消会将 suggested/scheduled 改为 cancelled�
 - 不引入 FCM、Room、离线写队列、Hilt；不做 Backfill confirmation subscriptions。
 - S16 同步新增服务端 cancel API；不部署服务端，服务端只负责产生 sync action，不执行系统闹钟。
 - 创建后自动短轮询；无常驻后台同步，另保留进入/刷新时间线、confirm/cancel 后刷新和 boot 同步。
-- `rrule` 目前只解析不执行，闹钟均为一次性；仅确认前可改标题/时间，没有已确认提醒编辑、贪睡或重复提醒 UI。
+- `rrule` 目前只解析不执行，闹钟均为一次性；仅确认前可改标题/时间，没有已确认提醒任意编辑或重复提醒 UI；主列表、详情与通知支持「10分钟后」贪睡。
 - 尚无推送或发布签名；自动短轮询结束后仍可手动同步。
 - 同一份未修改草稿在失败重试时保留 `client_note_id`，但编辑草稿会生成新 ID；
   网络结果不确定时请先刷新时间线，避免编辑后重复记录。
@@ -340,3 +340,15 @@ JAR SHA-256：`cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8`
 本刀不做：主列表/详情贪睡按钮、rrule 执行、二次确认、FCM/Room/Hilt/Pipecat、改 ASR/TTS 核心、根路径 `GET /`；不部署。
 
 里程碑 / changelog：S19 通知贪睡闭环；保留 S18 及更早历史。
+
+
+## S20 主列表/详情贪睡
+
+- 提醒主列表与记事详情「关联提醒」对 suggested/scheduled 显示「10分钟后」，与「完成」「取消」并列；busy 时禁用。
+- 点击复用 S19 的 `Repository.snoozeReminder(id, rev, minutes = 10)`，不改 data / Mock / API 实现。
+- 成功后经 `AppRepositories.invalidateAlarms` 取消旧闹钟并调用 `alarms.snoozed(response)` 重设，再刷新列表；API 失败由既有 `run` 显示可读错误，不清闹钟。
+- `reminderCanSnooze` 纯函数供两处 UI 共用；JVM 单测覆盖 suggested/scheduled 可操作，其它状态不可操作。应用标签与标题更新为 S20。
+
+本刀不做：rrule 执行、二次确认、FCM/Room/Hilt/Pipecat、改 ASR/TTS、改 server、根路径 `GET /`；不部署、不改 S19 通知栏操作。
+
+里程碑 / changelog：S20 补齐主列表与详情贪睡入口；保留 S19 及更早历史。

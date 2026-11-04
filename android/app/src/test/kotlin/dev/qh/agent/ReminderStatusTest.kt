@@ -4,6 +4,16 @@ import org.junit.Assert.assertEquals
 import org.junit.Test
 
 class ReminderStatusTest {
+    @Test fun snoozeRequiresAnActionableStatus() {
+        listOf("suggested", "scheduled").forEach {
+            assertEquals(true, reminderCanSnooze(it))
+        }
+        listOf(null, "", " ", "done", "cancelled", "snoozed", "unknown",
+            "SCHEDULED", " scheduled ").forEach {
+            assertEquals(false, reminderCanSnooze(it))
+        }
+    }
+
     @Test fun knownStatusesUseChineseLabels() {
         mapOf(
             "suggested" to "待确认", "scheduled" to "已排程",
