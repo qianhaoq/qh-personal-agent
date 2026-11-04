@@ -137,3 +137,9 @@ Subscription → 原 WorkItem → Channel，将 suggested/scheduled 改为 cance
 已 cancelled 且 rev 为当前值返回 200 / duplicate=true，不改 rev 或 sync 序列；
 旧 rev 返回 409「版本冲突，请拉取最新版本后重试」，done 等不可取消状态 409，
 不存在、非本人或已软删返回 404。服务端不执行系统闹钟，不做贪睡或 rrule 执行。
+
+## S17 提醒完成
+
+`POST /v1/reminders/{id}/complete` 接受 `{ "rev": <int> }`（1..2147483647）。通过现有 Subscription → 原 WorkItem → Channel，不新建 Ticket；suggested/scheduled → done、rev+1，发 `complete_reminder`，墓碑活跃 `schedule_reminder`，经 sync `deleted.actions` 可见。
+
+与 S16 cancel 同形：done + 当前 rev 幂等 200（`duplicate=true`、返回原 action、不推进 rev/seq）；旧 rev 409「版本冲突，请拉取最新版本后重试」；cancelled/unknown 等状态 409「提醒当前不可完成」；不存在、非本人、软删 404。Trigger 为 `user_completed_reminder`，dedupe 为 `reminder_complete:{id}:r{rev}`，action dedupe 为 `complete_reminder:{id}`。提醒行锁 → schedule 墓碑 + complete upsert → flush → allocate_seq 最后 → change_seq 写回。

@@ -1,6 +1,6 @@
-# Android S16 · 提醒取消（cancel API + Android）
+# S17 · 提醒完成
 
-紧凑的 Kotlin / Compose 客户端：登录、时间线、记事创建/编辑/删除、问答、提醒同步、确认与取消；
+紧凑的 Kotlin / Compose 客户端：登录、时间线、记事创建/编辑/删除、问答、提醒同步、确认/取消/完成；
 确认后的 `schedule_reminder` Channel action 会落到 AlarmManager，响铃时显示系统通知。
 系统 SpeechRecognizer 中文语音记事与语音问答，系统 TextToSpeech 中文答案播报。minSdk 26，compile/targetSdk 34，JDK 17，Gradle 8.7，AGP 8.5.2。
 
@@ -307,3 +307,12 @@ JAR SHA-256：`cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8`
 服务端 `tests/test_subscription_channel.py` 等取消相关用例通过；`python3 scripts/check-invariants.py`：`0 error(s), 0 warning(s)`。
 应用标签与标题更新为 S16；新增 cancel API / Mock / UI；历史 S15 及更早章节保留。
 未运行模拟器/真机或连接实际服务的端到端测试；本刀不部署。
+
+## S17 提醒完成
+
+- API：`POST /v1/reminders/{id}/complete`，body 为当前 `rev`；suggested/scheduled → done，rev+1。当前 done rev 幂等，旧 rev 返回 409。
+- Mock 与 RealRepository 提供 `completeReminder`；Mock 墓碑 schedule action，并经 sync 返回 `complete_reminder`。
+- 主列表与详情的关联提醒在 suggested/scheduled 时显示「完成」，与「取消」并列，busy 时禁用。
+- 完成后经 `AppRepositories.invalidateAlarms { alarms.cancelReminder(id) }` 栅栏取消本地闹钟，再刷新；sync 消费 `complete_reminder` 同样取消闹钟。
+
+里程碑 / changelog：S17 补齐提醒完成闭环；保留 S16 取消及更早历史。

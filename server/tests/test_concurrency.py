@@ -831,3 +831,53 @@ async def test_concurrent_confirm_cancel_same_rev_exactly_one_success(client, us
         reminder = await session.get(Reminder, reminder_id)
         assert reminder.rev == rev + 1
         assert reminder.status == winner["reminder"]["status"]
+
+
+@requires_postgres
+async def test_concurrent_complete_same_rev_exactly_one_success(client, user):
+    from sqlalchemy import func, select
+
+    from app.db import get_sessionmaker
+    from app.models import Reminder, SaChannelAction
+    from tests.test_subscription_channel import _suggested
+
+    _, reminder_id, rev = await _suggested(client, user)
+    confirmed = await client.post(f"/v1/reminders/{reminder_id}/confirm",
+                                  headers=auth_headers(user), json={"rev": rev})
+    assert confirmed.status_code == 200
+    rev = confirmed.json()["reminder"]["rev"]
+    async def complete():
+        return await client.post(f"/v1/reminders/{reminder_id}/complete",
+                                 headers=auth_headers(user), json={"rev": rev})
+    results = await asyncio.wait_for(asyncio.gather(complete(), complete()), timeout=10)
+    assert sorted(r.status_code for r in results) == [200, 409], [r.text for r in results]
+    async with get_sessionmaker()() as session:
+        reminder = await session.get(Reminder, reminder_id)
+        assert reminder.status == "done" and reminder.rev == rev + 1
+        assert await session.scalar(select(func.count()).select_from(SaChannelAction).where(
+            SaChannelAction.reminder_id == reminder_id, SaChannelAction.deleted_at.is_(None),
+            SaChannelAction.type == "complete_reminder",
+        )) == 1
+        schedule = (await session.scalars(select(SaChannelAction).where(
+            SaChannelAction.reminder_id == reminder_id, SaChannelAction.type == "schedule_reminder",
+        ))).one()
+        assert schedule.deleted_at is not None
+
+
+@requires_postgres
+async def test_concurrent_confirm_complete_same_rev_exactly_one_success(client, user):
+    from app.db import get_sessionmaker
+    from app.models import Reminder
+    from tests.test_subscription_channel import _suggested
+
+    _, reminder_id, rev = await _suggested(client, user)
+    async def send(operation):
+        return await client.post(f"/v1/reminders/{reminder_id}/{operation}",
+                                 headers=auth_headers(user), json={"rev": rev})
+    results = await asyncio.wait_for(asyncio.gather(send("confirm"), send("complete")), timeout=10)
+    assert sorted(r.status_code for r in results) == [200, 409], [r.text for r in results]
+    winner = next(r.json() for r in results if r.status_code == 200)
+    async with get_sessionmaker()() as session:
+        reminder = await session.get(Reminder, reminder_id)
+        assert reminder.rev == rev + 1
+        assert reminder.status == winner["reminder"]["status"]

@@ -153,6 +153,13 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
         }
         refresh()
     }
+    fun completeReminder(reminder: ReminderDto) = run {
+        repo.completeReminder(reminder.id, reminder.rev)
+        AppRepositories.invalidateAlarms {
+            alarms.cancelReminder(reminder.id)
+        }
+        refresh()
+    }
     fun updateDraft(value: String) { draft = value; draftSource = "app"; pending = null }
     fun createFromVoice(text: String, done: () -> Unit) {
         if (busy) return
@@ -354,6 +361,8 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                                             if (reminder.status in listOf("suggested", "scheduled")) {
                                                 TextButton({ model.cancelReminder(reminder) },
                                                     enabled = !model.busy) { Text("取消") }
+                                                TextButton({ model.completeReminder(reminder) },
+                                                    enabled = !model.busy) { Text("完成") }
                                             }
                                             if (reminder.status == "suggested") {
                                                 Button({ model.beginConfirm(reminder) },
@@ -466,6 +475,8 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                                                 if (reminder.status in listOf("suggested", "scheduled")) {
                                                     TextButton({ model.cancelReminder(reminder) },
                                                         enabled = !model.busy) { Text("取消") }
+                                                    TextButton({ model.completeReminder(reminder) },
+                                                        enabled = !model.busy) { Text("完成") }
                                                 }
                                             }
                                         }

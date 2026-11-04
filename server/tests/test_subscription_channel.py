@@ -386,3 +386,88 @@ async def test_cancel_requires_bounded_rev(client, user, body):
     response = await client.post(f"/v1/reminders/{reminder_id}/cancel",
                                  headers=auth_headers(user), json=body)
     assert response.status_code == 422
+
+
+@pytest.mark.parametrize("scheduled", [False, True])
+async def test_complete_emits_action_and_tombstones_schedule(client, user, scheduled):
+    _, reminder_id, rev = await _suggested(client, user)
+    headers = auth_headers(user)
+    schedule_id = None
+    if scheduled:
+        confirmed = await client.post(f"/v1/reminders/{reminder_id}/confirm",
+                                      headers=headers, json={"rev": rev})
+        assert confirmed.status_code == 200
+        rev = confirmed.json()["reminder"]["rev"]
+        schedule_id = confirmed.json()["action"]["id"]
+    before = (await client.get("/v1/sync", headers=headers)).json()
+    url = f"/v1/reminders/{reminder_id}/complete"
+    done = await client.post(url, headers=headers, json={"rev": rev})
+    assert done.status_code == 200, done.text
+    result = done.json()
+    assert result["reminder"]["status"] == "done"
+    assert result["reminder"]["rev"] == rev + 1
+    assert result["duplicate"] is False
+    assert result["action"]["type"] == "complete_reminder"
+    assert result["action"]["payload"]["rev"] == rev + 1
+    assert result["action"]["payload"]["reminder_id"] == reminder_id
+    assert result["action"]["work_item_id"] == result["work_item_id"]
+    after = (await client.get("/v1/sync", headers=headers,
+                              params={"since": before["cursor"]})).json()
+    assert result["action"]["id"] in [a["id"] for a in after["actions"]]
+    assert not any(a["type"] == "schedule_reminder" for a in after["actions"])
+    assert after["deleted"]["actions"] == ([schedule_id] if scheduled else [])
+    stale = await client.post(url, headers=headers, json={"rev": rev})
+    assert stale.status_code == 409
+    assert stale.json()["error"]["message"] == "版本冲突，请拉取最新版本后重试"
+    for _ in range(2):  # new current-rev Trigger, then duplicate Trigger intake
+        retry = await client.post(url, headers=headers, json={"rev": rev + 1})
+        assert retry.status_code == 200, retry.text
+        assert retry.json()["duplicate"] is True
+        assert retry.json()["action"] == result["action"]
+        assert retry.json()["reminder"] == result["reminder"]
+    unchanged = (await client.get("/v1/sync", headers=headers,
+                                  params={"since": after["cursor"]})).json()
+    assert unchanged["reminders"] == unchanged["actions"] == []
+
+
+@pytest.mark.parametrize("status", ["cancelled", "unknown"])
+async def test_complete_unavailable_status_and_stale_rev(client, user, status):
+    _, reminder_id, rev = await _suggested(client, user)
+    async with get_sessionmaker()() as session, session.begin():
+        reminder = await session.get(Reminder, reminder_id)
+        reminder.status = status
+    url = f"/v1/reminders/{reminder_id}/complete"
+    stale = await client.post(url, headers=auth_headers(user), json={"rev": rev + 1})
+    assert stale.status_code == 409
+    assert stale.json()["error"]["message"] == "版本冲突，请拉取最新版本后重试"
+    response = await client.post(url, headers=auth_headers(user), json={"rev": rev})
+    assert response.status_code == 409
+    async with get_sessionmaker()() as session:
+        reminder = await session.get(Reminder, reminder_id)
+        assert reminder.rev == rev and reminder.status == status
+        assert await session.scalar(select(func.count()).select_from(SaChannelAction)) == 0
+
+
+@pytest.mark.parametrize("kind", ["missing", "deleted", "other_user"])
+async def test_complete_not_found_or_not_owned(client, user, kind):
+    note_id, reminder_id, rev = await _suggested(client, user)
+    if kind == "missing":
+        reminder_id = new_id("rmd")
+    elif kind == "deleted":
+        assert (await client.delete(f"/v1/notes/{note_id}", headers=auth_headers(user))).status_code == 204
+    else:
+        from tests.conftest import make_invite
+        invite = await make_invite(get_sessionmaker())
+        other = await client.post("/v1/auth/login", json={"invite_code": invite, "device_id": "other"})
+        user = other.json()
+    response = await client.post(f"/v1/reminders/{reminder_id}/complete",
+                                 headers=auth_headers(user), json={"rev": rev})
+    assert response.status_code == 404
+
+
+@pytest.mark.parametrize("body", [{}, {"rev": 0}, {"rev": 2_147_483_648}])
+async def test_complete_requires_bounded_rev(client, user, body):
+    _, reminder_id, _ = await _suggested(client, user)
+    response = await client.post(f"/v1/reminders/{reminder_id}/complete",
+                                 headers=auth_headers(user), json=body)
+    assert response.status_code == 422

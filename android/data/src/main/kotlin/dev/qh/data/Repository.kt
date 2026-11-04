@@ -22,6 +22,7 @@ interface TokenStore {
 class SessionExpired : IOException("会话已失效，请重新登录")
 interface Repository {
     suspend fun cancelReminder(id: String, rev: Int): ReminderCancelResponse
+    suspend fun completeReminder(id: String, rev: Int): ReminderCompleteResponse
     val signedIn: Boolean
     suspend fun login(invite: String)
     suspend fun logout()
@@ -168,6 +169,8 @@ class RealRepository(private val api: AgentApi, private val store: TokenStore,
         authorized { api.confirmReminder(it, id, ReminderConfirmRequest(rev, fireAt, title)) }
     override suspend fun cancelReminder(id: String, rev: Int) =
         authorized { api.cancelReminder(it, id, ReminderCancelRequest(rev)) }
+    override suspend fun completeReminder(id: String, rev: Int) =
+        authorized { api.completeReminder(it, id, ReminderCompleteRequest(rev)) }
 }
 class MockRepository(private val seedOnLogin: Boolean = true, private val organizeAfterReads: Int = 3) : Repository {
     private data class Change(val seq: Long, val kind: String, val id: String)
@@ -366,6 +369,30 @@ class MockRepository(private val seedOnLogin: Boolean = true, private val organi
         actions[action.id] = action
         actionChanges[action.id] = nextSeq()
         return ReminderCancelResponse(updated, action, workItemId)
+    }
+    override suspend fun completeReminder(id: String, rev: Int): ReminderCompleteResponse {
+        requireSession()
+        val current = reminders[id] ?: throw IllegalArgumentException("提醒不存在")
+        require(current.rev == rev) { "版本冲突，请刷新后重试" }
+        val existing = actions.values.firstOrNull { it.reminder_id == id && it.type == "complete_reminder" }
+        if (current.status == "done") {
+            return ReminderCompleteResponse(current, existing, existing?.work_item_id, duplicate = true)
+        }
+        require(current.status == "suggested" || current.status == "scheduled") { "提醒当前不可完成" }
+        val now = Instant.now().toString()
+        val updated = current.copy(status = "done", rev = current.rev + 1, updated_at = now)
+        reminders[id] = updated
+        reminderChanges[id] = nextSeq()
+        actions.values.filter { it.reminder_id == id && it.type == "schedule_reminder" }
+            .map { it.id }.forEach(::deleteAction)
+        val workItemId = "work-${updated.note_id}"
+        val payload = mapOf<String, Any?>("reminder_id" to id, "note_id" to updated.note_id,
+            "title" to updated.title, "fire_at" to updated.fire_at,
+            "work_item_id" to workItemId, "rev" to updated.rev)
+        val action = SyncAction("action-${UUID.randomUUID()}", "complete_reminder", payload, workItemId, id, now)
+        actions[action.id] = action
+        actionChanges[action.id] = nextSeq()
+        return ReminderCompleteResponse(updated, action, workItemId)
     }
     override suspend fun confirmReminder(id: String, rev: Int, fireAt: String?, title: String?): ReminderConfirmResponse {
         requireSession()
