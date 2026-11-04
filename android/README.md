@@ -1,4 +1,4 @@
-# Android S12 · 确认前编辑标题与时间
+# Android S13 · confirm 对话框草稿进 ViewModel
 
 紧凑的 Kotlin / Compose 客户端：登录、时间线、记事创建/编辑/删除、问答、提醒同步与确认；
 确认后的 `schedule_reminder` Channel action 会落到 AlarmManager，响铃时显示系统通知。
@@ -50,6 +50,14 @@ api.useMock=false
 默认地址为生产占位 `https://agent.pinhaoyun.com/`；debug 默认 mock 不访问该地址。
 切回 mock：删除 `api.useMock=false` 或改为 `api.useMock=true`。
 `local.properties` 在构建时读取，改动后需重新构建安装。
+
+## S13 confirm 对话框草稿进 ViewModel
+
+确认对话框的标题与 fire_at 草稿从 Composable `remember` 迁入 `AgentModel`：
+`confirming` / `confirmTitle` / `confirmFireAt`，经 `beginConfirm` / `updateConfirm*` /
+`cancelConfirm` 同步。旋转与配置变更后对话框仍打开且草稿不丢，与现有编辑草稿旋转契约一致。
+取消、确认成功提交、`clearUi` / 登出均清空草稿。校验错误文案仍可留在对话框本地。
+不改 ASR、AlarmManager/boot、server、网络协议；不新增依赖或权限；不引入 FCM/Room/Hilt。
 
 ## S12 确认前编辑标题与时间
 
@@ -202,7 +210,7 @@ pause/stop 保留 Permission 状态，允许权限结果继续启动识别。
 ## 模块与契约
 
 - `:app`：Compose Navigation、提醒列表与确认、AlarmManager、通知、开机重放、
-  S12 确认前编辑标题/时间、S11 本地可读时间、S10 系统 TTS 答案播报、S9 提醒↔记事跳转与只读关联提醒、S8 记事详情与搜索/问答引用跳转、S7 记忆搜索、S6 记事编辑/删除、创建后短轮询与整理字段展示、系统 SpeechRecognizer 语音记事与语音提问、ViewModel 保留旋转期间状态、手动 DI。
+  S13 confirm 草稿 ViewModel 保留、S12 确认前编辑标题/时间、S11 本地可读时间、S10 系统 TTS 答案播报、S9 提醒↔记事跳转与只读关联提醒、S8 记事详情与搜索/问答引用跳转、S7 记忆搜索、S6 记事编辑/删除、创建后短轮询与整理字段展示、系统 SpeechRecognizer 语音记事与语音提问、ViewModel 保留旋转期间状态、手动 DI。
 - `:data`：纯 JVM DTO、Retrofit、仓库、mock、S5 轮询纯函数和测试。接口核对自当前服务端
   `app/schemas.py` 与 `app/api/{auth,notes,ask,sync,reminders}.py`，未知响应字段由 Gson 忽略。
 - `:core-security`：Android Keystore MasterKey + EncryptedSharedPreferences。
@@ -260,12 +268,12 @@ JAR SHA-256：`cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8`
 ## 本次环境验证
 
 使用 `/home/box/.local/jdk/jdk-17.0.16+8` 与 `/home/box/.local/android-sdk`
-（`GRADLE_USER_HOME=/tmp/s12-gradle`）。
+（`GRADLE_USER_HOME=/tmp/s13-gradle`）。
 `./gradlew --no-daemon :data:test :app:testDebugUnitTest :app:assembleDebug`：`BUILD SUCCESSFUL`。
 `:data` RepositoryTest：**26** + OrganizePollTest：**9**（共 35），0 failures / 0 errors / 0 skipped；
 `:app` ConfirmOverrideTest：**8** + DisplayTimeTest：**6** + AnswerTtsTest：**7** + AsrStateTest：**6** + VoiceQuestionTest：**2** + EditBehaviorTest：**5** + ReminderNoteLinkTest：**4** + AppRepositoriesTest：**2**（共 40），0 failures / 0 errors / 0 skipped；
 `:core-security` unit tests：`NO-SOURCE`。
 `python3 scripts/check-invariants.py`：`0 error(s), 0 warning(s)`。
-应用标签与标题更新为 S12；确认前可编辑标题与 ISO 时间。
+应用标签与标题更新为 S13；confirm 草稿迁入 `AgentModel`，旋转后对话框与草稿可保留。
 未运行模拟器/真机或连接实际服务的端到端测试；
-确认对话框交互与闹钟触发仍需真机验收。
+确认对话框旋转保留与闹钟触发仍需真机验收。
