@@ -159,8 +159,9 @@ class ReminderAlarmReceiver : BroadcastReceiver() {
         val contentIntent = PendingIntent.getActivity(context, reminderId.hashCode(), open,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val notification = Notification.Builder(context, NOTIFICATION_CHANNEL)
-            .setSmallIcon(android.R.drawable.ic_dialog_alert).setContentTitle("随记提醒")
-            .setContentText(title).setStyle(Notification.BigTextStyle().bigText(title))
+            .setSmallIcon(android.R.drawable.ic_dialog_alert).setContentTitle(reminderNotificationContentTitle(title))
+            .setContentText(reminderNotificationContentText())
+            .setStyle(Notification.BigTextStyle().bigText(reminderNotificationContentTitle(title)))
             .setContentIntent(contentIntent).setAutoCancel(true)
             .apply {
                 reminderNotificationActionOrder().forEach { action ->
