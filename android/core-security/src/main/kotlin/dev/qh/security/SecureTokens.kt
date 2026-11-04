@@ -24,6 +24,13 @@ class SecureTokens(context: Context) : TokenStore {
             .putLong("ttl", tokens.expires_in).putString("user", tokens.user_id)
         check(edit.commit()) { "无法保存安全会话" }
     }
+    /** Separate from tokens: refresh must not change the login-session fence. */
+    @Synchronized fun sessionEpoch(): String = prefs.getString("epoch", null)
+        ?: bumpSessionEpoch()
+
+    @Synchronized fun bumpSessionEpoch(): String = UUID.randomUUID().toString().also {
+        check(prefs.edit().putString("epoch", it).commit()) { "无法保存会话标识" }
+    }
     // Kept across logout; never changes unless app data is explicitly cleared/uninstalled.
     @Synchronized override fun deviceId(): String = prefs.getString("device", null) ?: UUID.randomUUID().toString().also {
         check(prefs.edit().putString("device", it).commit()) { "无法保存设备标识" }
