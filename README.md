@@ -2,9 +2,9 @@
 
 个人语音记事与语音助手。说一句话，自动整理成笔记 / 待办 / 提醒，并能用语音问答自己的记忆。
 
-当前里程碑：**S30**，修复 snooze 的 ignore 请求重放误报成功（仍返回 409，已接受的重放仍返回 200），并为 Android 通知贪睡成功回调增加 alarm-generation 栅栏，防止取消/完成/删除后迟到响应重设闹钟。应用标签「随记 S30」、顶部标题「随记 · S30」。详见 [Android README](android/README.md)。
+当前里程碑：**S31**，修复同提醒贪睡成功使代际失效后，已成功完成/取消的通知回调未清理本地闹钟和通知的问题；保留迟到贪睡的代际栅栏与跨提醒隔离。应用标签「随记 S31」、顶部标题「随记 · S31」。详见 [Android README](android/README.md)。
 
-S30 不做：不改通知栏/应用内按钮文案；不做通知栏二次确认、rrule、根路径 `GET /`；不改 FCM/Room/Hilt/Pipecat；不部署、不合入。
+S31 不做：不改 server/data/Mock/API、通知栏/应用内按钮文案；不做通知栏二次确认、rrule、根路径 `GET /`；不改 FCM/Room/Hilt/Pipecat；不部署、不合入。
 
 ## 仓库结构（monorepo）
 
