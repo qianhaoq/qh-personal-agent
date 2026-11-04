@@ -148,7 +148,9 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
     }
     fun cancelReminder(reminder: ReminderDto) = run {
         repo.cancelReminder(reminder.id, reminder.rev)
-        alarms.cancelReminder(reminder.id)
+        AppRepositories.invalidateAlarms {
+            alarms.cancelReminder(reminder.id)
+        }
         refresh()
     }
     fun updateDraft(value: String) { draft = value; draftSource = "app"; pending = null }
