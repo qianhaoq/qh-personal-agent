@@ -34,6 +34,35 @@ class ReminderNotificationActionTest {
         }
     }
 
+    @Test fun terminalActionsWaitForConfirmationAndDismissalDoesNotRequest() = runBlocking {
+        listOf(ReminderNotificationAction.COMPLETE, ReminderNotificationAction.CANCEL).forEach { action ->
+            val repo = Fake(SyncResponse(1, reminders = listOf(reminder)))
+            assertEquals(ReminderAction.valueOf(action.name), action.confirmAction)
+            // Opening the confirmation, cancelling it, or pressing Back grants no confirmation.
+            repeat(3) {
+                performConfirmedReminderNotificationAction(action, false, "target", repo, { true }) { fail() }
+            }
+            assertEquals(0, repo.syncs)
+            assertNull(repo.mutation)
+            var successes = 0
+            performConfirmedReminderNotificationAction(action, true, "target", repo, { true }) { successes++ }
+            assertEquals(1, repo.syncs)
+            assertEquals("target" to 7, repo.mutation)
+            assertEquals(1, successes)
+        }
+    }
+
+    @Test fun snoozeStillExecutesWithoutConfirmation() = runBlocking {
+        val repo = Fake(SyncResponse(1, reminders = listOf(reminder)))
+        assertNull(ReminderNotificationAction.SNOOZE.confirmAction)
+        var successes = 0
+        performConfirmedReminderNotificationAction(ReminderNotificationAction.SNOOZE, false,
+            "target", repo, { true }) { successes++ }
+        assertEquals(1, repo.syncs)
+        assertEquals(10, repo.snoozeMinutes)
+        assertEquals(1, successes)
+    }
+
     @Test fun actionsResolveCurrentRevAndOnlyThenRunSuccess() = runBlocking {
         ReminderNotificationAction.entries.forEach { action ->
             val repo = Fake(SyncResponse(1, reminders = listOf(reminder.copy(id = "other", rev = 99), reminder)))

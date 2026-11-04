@@ -30,3 +30,19 @@ internal suspend fun performReminderNotificationAction(
     }
     if (sessionCurrent()) onSuccess(snoozed)
 }
+
+/** Null means the one-tap snooze path. */
+internal val ReminderNotificationAction.confirmAction: ReminderAction?
+    get() = when (this) {
+        ReminderNotificationAction.COMPLETE -> ReminderAction.COMPLETE
+        ReminderNotificationAction.CANCEL -> ReminderAction.CANCEL
+        ReminderNotificationAction.SNOOZE -> null
+    }
+
+internal suspend fun performConfirmedReminderNotificationAction(
+    action: ReminderNotificationAction, confirmed: Boolean, id: String, repository: Repository,
+    sessionCurrent: () -> Boolean, onSuccess: (ReminderSnoozeResponse?) -> Unit
+) {
+    if (action.confirmAction != null && !confirmed) return
+    performReminderNotificationAction(action, id, repository, sessionCurrent, onSuccess)
+}
