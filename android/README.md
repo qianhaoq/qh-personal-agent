@@ -1,4 +1,4 @@
-# S36 · 通知栏提醒操作顺序对齐
+# S37 · 通知栏主标题对齐提醒标题
 
 紧凑的 Kotlin / Compose 客户端：登录、时间线、记事创建/编辑/删除、问答、提醒同步、确认/取消/完成；
 确认后的 `schedule_reminder` Channel action 会落到 AlarmManager，响铃时显示系统通知。
@@ -519,3 +519,12 @@ JAR SHA-256：`cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8`
 - 保留 enum 声明顺序与 ordinal，intentAction、label、PendingIntent 类型、确认文案、EXTRA_TITLE、贪睡 10 分钟及 S31 栅栏不变。单测断言完整顺序与对应标签，保留既有确认与贪睡行为用例。
 - 应用标签「随记 S36」，顶栏「随记 · S36」；保留 S35 及更早历史。
 - S36 不做：rrule、根路径 `GET /`、FCM/Room/Hilt/Pipecat、server/data/Mock/API、贪睡分钟调整、S31 竞态逻辑、大重构、部署、合入、squash；不改应用内按钮顺序、确认文案、EXTRA_TITLE、筛选空态。
+
+
+## S37 通知栏主标题对齐提醒标题
+
+- 通知栏主标题展示具体提醒标题，副文为「随记提醒」；BigTextStyle 展开内容与主标题一致。无通知权限时 Toast 继续展示提醒标题。
+- `reminderNotificationContentTitle` 复用 `reminderConfirmDisplayTitle`，null、空串或仅空白均回落「随记提醒」；非空白标题原样保留。`reminderNotificationContentText` 固定返回「随记提醒」。
+- `ReminderActionConfirmTest` 覆盖标题、副文和缺省/空白回落，保留既有确认与通知操作顺序回归。
+- 应用标签「随记 S37」，顶栏「随记 · S37」；保留 S36 及更早历史。
+- S37 不做：rrule、根路径 `GET /`、FCM/Room/Hilt/Pipecat、server/data/Mock/API、贪睡分钟调整、S31 竞态逻辑、大重构、部署、合入、squash；不改 action 顺序、intentAction、label、PendingIntent、确认正文模板、EXTRA_TITLE 语义、筛选空态。

@@ -28,6 +28,19 @@ class ReminderActionConfirmTest {
         assertEquals(" 买牛奶 ", reminderConfirmDisplayTitle(" 买牛奶 "))
     }
 
+    @Test fun notificationUsesReminderTitleAndGenericSecondaryText() {
+        for (title in listOf("买牛奶", " 买牛奶 ")) {
+            assertEquals(title, reminderNotificationContentTitle(title))
+        }
+        assertEquals("随记提醒", reminderNotificationContentText())
+    }
+
+    @Test fun notificationMissingOrBlankTitleFallsBack() {
+        for (title in listOf(null, "", " ", "\t\n　")) {
+            assertEquals("随记提醒", reminderNotificationContentTitle(title))
+        }
+    }
+
     @Test fun busyBlocksConfirmationAndDismissal() {
         assertEquals(false, shouldAcceptReminderActionConfirm(busy = true))
         assertEquals(true, shouldAcceptReminderActionConfirm(busy = false))

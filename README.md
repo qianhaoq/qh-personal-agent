@@ -2,11 +2,11 @@
 
 个人语音记事与语音助手。说一句话，自动整理成笔记 / 待办 / 提醒，并能用语音问答自己的记忆。
 
-当前里程碑：**S36**，仅将通知栏提醒操作顺序对齐应用内主列表与详情的「取消提醒」→「完成提醒」→「贪睡10分钟」。应用标签「随记 S36」、顶部标题「随记 · S36」。详见 [Android README](android/README.md)。
+当前里程碑：**S37**，通知栏主标题展示提醒标题，副文为「随记提醒」，展开后仍展示提醒标题；空白或缺省标题回落「随记提醒」。应用标签「随记 S37」、顶部标题「随记 · S37」。详见 [Android README](android/README.md)。
 
-选刀理由（已确认）：扫描 #57–#62，无开放 P0/P1；已知竞态、确认页、空态、确认标题 P2 均已由 S31–S35 闭环。标签已在 S26–S29 对齐，但通知栏仍为 COMPLETE→CANCEL→SNOOZE，本刀只对齐顺序。
+选刀理由（已确认）：扫描 #57–#63，无开放 P0/P1；竞态、确认页、空态、确认标题及通知按钮顺序已由 S31–S36 闭环。本刀将通知主标题层级对齐应用内提醒卡片。
 
-S36 不做：rrule、根路径 `GET /`、FCM/Room/Hilt/Pipecat、server/data/Mock/API、贪睡分钟调整、S31 竞态逻辑、大重构、部署、合入、squash；不改应用内按钮顺序、intentAction、label、PendingIntent 类型、确认文案、EXTRA_TITLE、筛选空态。
+S37 不做：rrule、根路径 `GET /`、FCM/Room/Hilt/Pipecat、server/data/Mock/API、贪睡分钟调整、S31 竞态逻辑、大重构、部署、合入、squash；不改 action 顺序、intentAction、label、PendingIntent、确认正文模板、EXTRA_TITLE 语义、筛选空态。
 
 ## 仓库结构（monorepo）
 
