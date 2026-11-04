@@ -337,8 +337,9 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                                     Card(Modifier.fillMaxWidth()) {
                                         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                                             Text(reminder.title, style = MaterialTheme.typography.titleMedium)
+                                            ReminderStatusBadge(reminder.status)
                                             Text("时间：${formatDisplayTimeOrUnset(reminder.fire_at)}")
-                                            Text("状态：${reminderStatus(reminder.status)} · rev ${reminder.rev}",
+                                            Text("rev ${reminder.rev}",
                                                 style = MaterialTheme.typography.bodySmall)
                                             reminderNoteIdForOpen(reminder.note_id)?.let { id ->
                                                 TextButton({ openDetail(id) }, enabled = !model.busy) { Text("打开记事") }
@@ -449,8 +450,8 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                                         Card(Modifier.fillMaxWidth()) {
                                             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                                                 Text(reminder.title, style = MaterialTheme.typography.titleMedium)
+                                                ReminderStatusBadge(reminder.status)
                                                 Text("时间：${formatDisplayTimeOrUnset(reminder.fire_at)}")
-                                                Text("状态：${reminderStatus(reminder.status)}", style = MaterialTheme.typography.bodySmall)
                                             }
                                         }
                                     }
@@ -568,12 +569,22 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
         }
     }
 }
-private fun reminderStatus(status: String) = when (status) {
-    "suggested" -> "待确认"
-    "scheduled" -> "已确认"
-    "done" -> "已完成"
-    "cancelled" -> "已取消"
-    else -> status
+@Composable
+private fun ReminderStatusBadge(status: String?) {
+    val colors = MaterialTheme.colorScheme
+    val (container, content) = when (status?.trim()) {
+        "suggested" -> colors.tertiaryContainer to colors.onTertiaryContainer
+        "scheduled" -> colors.primaryContainer to colors.onPrimaryContainer
+        "cancelled" -> colors.errorContainer to colors.onErrorContainer
+        else -> colors.surfaceVariant to colors.onSurfaceVariant
+    }
+    Surface(color = container, contentColor = content, shape = MaterialTheme.shapes.small) {
+        Text(
+            reminderStatus(status),
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+            style = MaterialTheme.typography.labelMedium
+        )
+    }
 }
 
 private fun noteStatus(status: String) = when (status) {
