@@ -1,5 +1,14 @@
 package dev.qh.agent
 
+import dev.qh.data.ReminderDto
+
+/** Only exact active statuses belong in the default main list. */
+fun reminderIsActive(status: String?): Boolean = status == "suggested" || status == "scheduled"
+
+/** Presentation only: retain sync order and keep the source list available to note detail. */
+fun filterRemindersForList(reminders: List<ReminderDto>, showEnded: Boolean): List<ReminderDto> =
+    if (showEnded) reminders else reminders.filter { reminderIsActive(it.status) }
+
 /** Display only: preserve the source status for requests and reminder actions. */
 fun reminderStatus(status: String?): String = when (val value = status?.trim().orEmpty()) {
     "suggested" -> "待确认"

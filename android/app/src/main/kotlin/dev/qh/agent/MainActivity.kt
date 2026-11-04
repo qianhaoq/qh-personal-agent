@@ -13,6 +13,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
@@ -75,6 +76,9 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
     fun clearDetail() { detailNote = null }
     fun openNote(noteId: String) = run { clearDetail(); detailNote = repo.note(noteId) }
     var reminders by mutableStateOf(emptyList<ReminderDto>()); private set
+    private var showEndedState by mutableStateOf(false)
+    val showEnded: Boolean get() = showEndedState
+    fun setShowEnded(value: Boolean) { showEndedState = value }
     var answer by mutableStateOf<Answer?>(null); private set
     var invite by mutableStateOf("")
     var draft by mutableStateOf(""); private set
@@ -331,7 +335,7 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
 fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> VoiceAsr, requestMicrophone: () -> Unit, cancelVoice: () -> Unit) {
     Surface(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().imePadding().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("随记 · S21" + if (BuildConfig.USE_MOCK_API) " / 本地演示" else " / 服务器", style = MaterialTheme.typography.headlineSmall)
+            Text("随记 · S22" + if (BuildConfig.USE_MOCK_API) " / 本地演示" else " / 服务器", style = MaterialTheme.typography.headlineSmall)
             if (model.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
             model.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             if (!model.signedIn) {
@@ -348,6 +352,7 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                 }
                 NavHost(nav, startDestination = "timeline", modifier = Modifier.weight(1f)) {
                     composable("timeline") {
+                        val visibleReminders = filterRemindersForList(model.reminders, model.showEnded)
                         model.confirming?.let { reminder ->
                             ConfirmReminderDialog(reminder, model.busy,
                                 title = model.confirmTitle, fireAt = model.confirmFireAt,
@@ -376,9 +381,17 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                             }
                             TextButton(model::reload, enabled = !model.busy) { Text("同步") }
                             LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                                item { Text("提醒", style = MaterialTheme.typography.titleMedium) }
-                                if (model.reminders.isEmpty() && !model.busy) item { Text("暂无提醒。") }
-                                items(model.reminders, key = { "reminder:${it.id}" }) { reminder ->
+                                item {
+                                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                        verticalAlignment = Alignment.CenterVertically) {
+                                        Text("提醒", style = MaterialTheme.typography.titleMedium)
+                                        FilterChip(selected = model.showEnded,
+                                            onClick = { model.setShowEnded(!model.showEnded) },
+                                            label = { Text("显示已结束") })
+                                    }
+                                }
+                                if (visibleReminders.isEmpty() && !model.busy) item { Text("暂无提醒。") }
+                                items(visibleReminders, key = { "reminder:${it.id}" }) { reminder ->
                                     Card(Modifier.fillMaxWidth()) {
                                         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                                             Text(reminder.title, style = MaterialTheme.typography.titleMedium)
