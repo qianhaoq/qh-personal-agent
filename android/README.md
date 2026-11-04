@@ -1,4 +1,4 @@
-# S24 · 提醒完成与取消二次确认
+# S25 · 详情页返回文案
 
 紧凑的 Kotlin / Compose 客户端：登录、时间线、记事创建/编辑/删除、问答、提醒同步、确认/取消/完成；
 确认后的 `schedule_reminder` Channel action 会落到 AlarmManager，响铃时显示系统通知。
@@ -398,3 +398,13 @@ JAR SHA-256：`cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8`
 本刀不做：通知栏操作、snooze 分钟、筛选/空状态、确认并设闹钟流程、data / Mock / API / status 规则 / server、FCM/Room/Hilt/Pipecat、rrule、根路径 `GET /`、ASR/TTS；不部署、不合入。
 
 里程碑 / changelog：S24 为列表与详情页的完成/取消增加二次确认，降低误触；保留 S23 及更早历史。
+
+
+## S25 详情页返回文案
+
+- 详情页顶部导航钮从「取消」改回「返回」：S24 #51 误改后与「取消提醒」同名易误导。仅改文案，点击仍执行 `clearDetail()` + `popBackStack()`，busy 门禁保持原样。
+- 应用标签与顶部标题更新为 S25；删除确认、提醒二次确认、编辑页、语音与 ConfirmDialog 等其它「取消」文案保持原样。
+
+本刀不做：通知栏、完成/取消二次确认逻辑、筛选/空状态、API / server / data、FCM/Room/Hilt/Pipecat、根路径 `GET /`；不部署、不合入。
+
+里程碑 / changelog：S25 恢复详情页顶部导航「返回」文案；保留 S24 及更早历史。
