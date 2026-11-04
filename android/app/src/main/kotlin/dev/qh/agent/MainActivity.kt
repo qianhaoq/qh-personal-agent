@@ -335,7 +335,7 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
 fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> VoiceAsr, requestMicrophone: () -> Unit, cancelVoice: () -> Unit) {
     Surface(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().imePadding().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("随记 · S34" + if (BuildConfig.USE_MOCK_API) " / 本地演示" else " / 服务器", style = MaterialTheme.typography.headlineSmall)
+            Text("随记 · S35" + if (BuildConfig.USE_MOCK_API) " / 本地演示" else " / 服务器", style = MaterialTheme.typography.headlineSmall)
             if (model.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
             model.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             if (!model.signedIn) {
@@ -354,7 +354,7 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                     composable("timeline") {
                         var pendingReminderAction by remember { mutableStateOf<Pair<ReminderAction, ReminderDto>?>(null) }
                         pendingReminderAction?.let { (action, reminder) ->
-                            ReminderActionConfirmDialog(action, model.busy,
+                            ReminderActionConfirmDialog(action, reminder.title, model.busy,
                                 onDismiss = { pendingReminderAction = null },
                                 onConfirm = {
                                     pendingReminderAction = null
@@ -487,7 +487,7 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                     composable("detail") {
                         var pendingReminderAction by remember { mutableStateOf<Pair<ReminderAction, ReminderDto>?>(null) }
                         pendingReminderAction?.let { (action, reminder) ->
-                            ReminderActionConfirmDialog(action, model.busy,
+                            ReminderActionConfirmDialog(action, reminder.title, model.busy,
                                 onDismiss = { pendingReminderAction = null },
                                 onConfirm = {
                                     pendingReminderAction = null
@@ -732,11 +732,11 @@ private fun ConfirmReminderDialog(
 }
 
 @Composable
-internal fun ReminderActionConfirmDialog(action: ReminderAction, busy: Boolean, onDismiss: () -> Unit, onConfirm: () -> Unit) {
+internal fun ReminderActionConfirmDialog(action: ReminderAction, reminderTitle: String, busy: Boolean, onDismiss: () -> Unit, onConfirm: () -> Unit) {
     val enabled = shouldAcceptReminderActionConfirm(busy)
     AlertDialog(onDismissRequest = { if (enabled) onDismiss() },
         title = { Text(reminderActionConfirmTitle(action)) },
-        text = { Text(reminderActionConfirmMessage(action)) },
+        text = { Text(reminderActionConfirmMessage(action, reminderTitle)) },
         confirmButton = {
             TextButton({ if (enabled) onConfirm() }, enabled = enabled) { Text("确认") }
         }, dismissButton = {
