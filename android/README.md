@@ -1,4 +1,4 @@
-# S21 · 通知栏操作后前台自动刷新
+# S22 · 提醒主列表默认只显示进行中提醒
 
 紧凑的 Kotlin / Compose 客户端：登录、时间线、记事创建/编辑/删除、问答、提醒同步、确认/取消/完成；
 确认后的 `schedule_reminder` Channel action 会落到 AlarmManager，响铃时显示系统通知。
@@ -364,3 +364,15 @@ JAR SHA-256：`cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8`
 本刀不做：FCM/Room/Hilt/Pipecat、rrule、根路径 `GET /`、二次确认、data / Mock / API / server 改动、ASR/TTS 改动、routine；不改通知按钮集合或 API 语义，不部署、不合入。
 
 里程碑 / changelog：S21 补齐通知遮罩未触发 ON_RESUME 时的前台自动刷新；保留 S20 及更早历史。
+
+
+## S22 提醒主列表筛选
+
+- 主提醒列表默认只显示 suggested / scheduled，精确匹配，不去空白、不忽略大小写；done / cancelled / 空值 / 未知状态均隐藏。
+- 提醒标题旁提供 Material3「显示已结束」开关，开启后展示全部状态；showEnded 保存在 AgentModel，默认 false，配置变更 / 旋转后保留。
+- 筛选仅用于主列表展示；ViewModel 仍按 fire_at 排序并保存完整同步列表，记事详情「关联提醒」保留完整历史。筛选后为空且非 busy 时继续显示「暂无提醒。」。
+- reminderIsActive / filterRemindersForList 纯函数的 JVM 测试覆盖严格状态匹配、全部展示与顺序保持；应用标签与标题更新为 S22。
+
+本刀不做：FCM/Room/Hilt/Pipecat、rrule、根路径 `GET /`、二次确认、data / Mock / API / server 改动；不改通知栏操作或贪睡分钟，不部署、不合入。
+
+里程碑 / changelog：S22 增加主列表进行中筛选与「显示已结束」开关；保留 S21 及更早历史。
