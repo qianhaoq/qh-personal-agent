@@ -20,13 +20,16 @@ class ReminderListFilterTest {
             reminder("scheduled", "scheduled"), reminder("cancelled", "cancelled"),
             reminder("blank", ""), reminder("space", " \t"), reminder("unknown", "unknown"),
             reminder("uppercase", "SCHEDULED"), reminder("padded", " scheduled "),
+            reminder("ended-uppercase", "DONE"), reminder("ended-padded", " cancelled "),
             nullStatusReminder())
         assertEquals(listOf("suggested", "scheduled"),
-            filterRemindersForList(all, showEnded = false).map { it.id })
-        assertEquals(all, filterRemindersForList(all, showEnded = true))
-        assertEquals(10, all.size)
-        assertEquals(emptyList<ReminderDto>(), filterRemindersForList(emptyList(), false))
-        assertEquals(emptyList<ReminderDto>(), filterRemindersForList(emptyList(), true))
+            filterRemindersForList(all, ReminderListFilter.ACTIVE).map { it.id })
+        assertEquals(all, filterRemindersForList(all, ReminderListFilter.ALL))
+        assertEquals(listOf("done", "cancelled"),
+            filterRemindersForList(all, ReminderListFilter.ENDED).map { it.id })
+        assertEquals(12, all.size)
+        assertEquals(emptyList<ReminderDto>(), filterRemindersForList(emptyList(), ReminderListFilter.ACTIVE))
+        assertEquals(emptyList<ReminderDto>(), filterRemindersForList(emptyList(), ReminderListFilter.ALL))
     }
 
     @Test fun filteringPreservesActiveOrderInFullTimeSortedList() {
@@ -39,44 +42,47 @@ class ReminderListFilterTest {
             reminder("cancelled", "cancelled")
         ).sortedWith(compareBy(nullsLast()) { it.fire_at })
         assertEquals(listOf("done", "early", "same-time", "late", "no-time", "cancelled"),
-            filterRemindersForList(all, true).map { it.id })
+            filterRemindersForList(all, ReminderListFilter.ALL).map { it.id })
         assertEquals(listOf("early", "same-time", "late", "no-time"),
-            filterRemindersForList(all, false).map { it.id })
-        assertEquals(all, filterRemindersForList(all, true))
+            filterRemindersForList(all, ReminderListFilter.ACTIVE).map { it.id })
+        assertEquals(listOf("done", "cancelled"),
+            filterRemindersForList(all, ReminderListFilter.ENDED).map { it.id })
+        assertEquals(all, filterRemindersForList(all, ReminderListFilter.ALL))
     }
 
     @Test fun emptyMessageForNoReminders() {
-        listOf(false, true).forEach { showEnded ->
-            assertEquals("暂无提醒。", reminderListEmptyMessage(emptyList(), showEnded))
+        ReminderListFilter.entries.forEach { filter ->
+            assertEquals(emptyList<ReminderDto>(), filterRemindersForList(emptyList(), filter))
+            assertEquals("暂无提醒。", reminderListEmptyMessage(emptyList(), filter))
         }
     }
 
-    @Test fun emptyMessageFallsBackForActiveReminders() {
-        val all = listOf(reminder("suggested", "suggested"), reminder("scheduled", "scheduled"))
-        listOf(false, true).forEach { showEnded ->
-            assertEquals("暂无提醒。", reminderListEmptyMessage(all, showEnded))
+    @Test fun emptyActiveMessageExplainsHiddenEndedReminders() {
+        listOf("done", "cancelled").forEach { status ->
+            val all = listOf(reminder(status, status), reminder("unknown", "unknown"))
+            assertEquals("暂无待办提醒。可切换到「已结束」或「全部」查看。",
+                reminderListEmptyMessage(all, ReminderListFilter.ACTIVE))
         }
     }
 
-    @Test fun emptyMessageExplainsHiddenEndedReminders() {
-        listOf(
-            listOf(reminder("done", "done")),
-            listOf(reminder("cancelled", "cancelled")),
-            listOf(reminder("done", "done"), reminder("cancelled", "cancelled"))
-        ).forEach { all ->
-            assertEquals("暂无进行中提醒。可开启「显示已结束」查看。",
-                reminderListEmptyMessage(all, showEnded = false))
+    @Test fun emptyEndedMessageExplainsHiddenActiveReminders() {
+        listOf("suggested", "scheduled").forEach { status ->
+            val all = listOf(reminder(status, status), reminder("unknown", "unknown"))
+            assertEquals("暂无已结束提醒。可切换到「待办」或「全部」查看。",
+                reminderListEmptyMessage(all, ReminderListFilter.ENDED))
         }
     }
 
-    @Test fun emptyMessageFallsBackWhenShowingEndedReminders() {
-        assertEquals("暂无提醒。",
-            reminderListEmptyMessage(listOf(reminder("done", "done")), showEnded = true))
-    }
-
-    @Test fun emptyMessageFallsBackWhenActiveReminderRemainsVisible() {
-        val all = listOf(reminder("done", "done"), reminder("scheduled", "scheduled"))
-        assertEquals("暂无提醒。", reminderListEmptyMessage(all, showEnded = false))
+    @Test fun emptyMessageFallsBackForUnknownStatusesAndVisibleBuckets() {
+        val unknown = listOf(reminder("unknown", "unknown"), reminder("padded", " done "),
+            reminder("uppercase", "SCHEDULED"), nullStatusReminder())
+        val mixed = unknown + reminder("active", "scheduled") + reminder("ended", "done")
+        ReminderListFilter.entries.forEach { filter ->
+            assertEquals("暂无提醒。", reminderListEmptyMessage(unknown, filter))
+            assertEquals("暂无提醒。", reminderListEmptyMessage(mixed, filter))
+            assertEquals("暂无提醒。",
+                reminderListEmptyMessage(filterRemindersForList(mixed, filter), filter))
+        }
     }
 
     // JSON/Gson can materialize a null status despite the DTO's Kotlin type.

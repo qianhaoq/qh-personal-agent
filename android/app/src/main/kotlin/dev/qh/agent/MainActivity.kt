@@ -76,9 +76,9 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
     fun clearDetail() { detailNote = null }
     fun openNote(noteId: String) = run { clearDetail(); detailNote = repo.note(noteId) }
     var reminders by mutableStateOf(emptyList<ReminderDto>()); private set
-    private var showEndedState by mutableStateOf(false)
-    val showEnded: Boolean get() = showEndedState
-    fun setShowEnded(value: Boolean) { showEndedState = value }
+    private var listFilterState by mutableStateOf(ReminderListFilter.ACTIVE)
+    val listFilter: ReminderListFilter get() = listFilterState
+    fun setListFilter(value: ReminderListFilter) { listFilterState = value }
     var answer by mutableStateOf<Answer?>(null); private set
     var invite by mutableStateOf("")
     var draft by mutableStateOf(""); private set
@@ -335,7 +335,7 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
 fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> VoiceAsr, requestMicrophone: () -> Unit, cancelVoice: () -> Unit) {
     Surface(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().imePadding().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("随记 · S32" + if (BuildConfig.USE_MOCK_API) " / 本地演示" else " / 服务器", style = MaterialTheme.typography.headlineSmall)
+            Text("随记 · S33" + if (BuildConfig.USE_MOCK_API) " / 本地演示" else " / 服务器", style = MaterialTheme.typography.headlineSmall)
             if (model.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
             model.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             if (!model.signedIn) {
@@ -364,7 +364,7 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                                     }
                                 })
                         }
-                        val visibleReminders = filterRemindersForList(model.reminders, model.showEnded)
+                        val visibleReminders = filterRemindersForList(model.reminders, model.listFilter)
                         model.confirming?.let { reminder ->
                             ConfirmReminderDialog(reminder, model.busy,
                                 title = model.confirmTitle, fireAt = model.confirmFireAt,
@@ -397,12 +397,14 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                                     Row(horizontalArrangement = Arrangement.spacedBy(12.dp),
                                         verticalAlignment = Alignment.CenterVertically) {
                                         Text("提醒", style = MaterialTheme.typography.titleMedium)
-                                        FilterChip(selected = model.showEnded,
-                                            onClick = { model.setShowEnded(!model.showEnded) },
-                                            label = { Text("显示已结束") })
+                                        ReminderListFilter.entries.forEach { filter ->
+                                            FilterChip(selected = model.listFilter == filter,
+                                                onClick = { model.setListFilter(filter) },
+                                                label = { Text(filter.label) })
+                                        }
                                     }
                                 }
-                                if (visibleReminders.isEmpty() && !model.busy) item { Text(reminderListEmptyMessage(model.reminders, model.showEnded)) }
+                                if (visibleReminders.isEmpty() && !model.busy) item { Text(reminderListEmptyMessage(model.reminders, model.listFilter)) }
                                 items(visibleReminders, key = { "reminder:${it.id}" }) { reminder ->
                                     Card(Modifier.fillMaxWidth()) {
                                         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {

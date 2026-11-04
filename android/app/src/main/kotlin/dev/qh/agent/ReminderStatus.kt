@@ -5,17 +5,28 @@ import dev.qh.data.ReminderDto
 /** Only exact active statuses belong in the default main list. */
 fun reminderIsActive(status: String?): Boolean = status == "suggested" || status == "scheduled"
 
-/** Presentation only: retain sync order and keep the source list available to note detail. */
-fun filterRemindersForList(reminders: List<ReminderDto>, showEnded: Boolean): List<ReminderDto> =
-    if (showEnded) reminders else reminders.filter { reminderIsActive(it.status) }
+enum class ReminderListFilter(val label: String) {
+    ACTIVE("待办"), ENDED("已结束"), ALL("全部")
+}
 
-/** Explain when the default list is empty because non-active reminders are hidden. */
-fun reminderListEmptyMessage(allReminders: List<ReminderDto>, showEnded: Boolean): String =
+private fun reminderIsEnded(status: String?): Boolean = status == "done" || status == "cancelled"
+
+/** Presentation only: retain sync order and keep the source list available to note detail. */
+fun filterRemindersForList(reminders: List<ReminderDto>, listFilter: ReminderListFilter): List<ReminderDto> =
+    when (listFilter) {
+        ReminderListFilter.ACTIVE -> reminders.filter { reminderIsActive(it.status) }
+        ReminderListFilter.ENDED -> reminders.filter { reminderIsEnded(it.status) }
+        ReminderListFilter.ALL -> reminders
+    }
+
+/** Explain an empty bucket only when the opposite known bucket has reminders. */
+fun reminderListEmptyMessage(allReminders: List<ReminderDto>, listFilter: ReminderListFilter): String =
     when {
-        allReminders.isEmpty() -> "暂无提醒。"
-        !showEnded && allReminders.any { !reminderIsActive(it.status) } &&
-            filterRemindersForList(allReminders, showEnded).isEmpty() ->
-            "暂无进行中提醒。可开启「显示已结束」查看。"
+        filterRemindersForList(allReminders, listFilter).isNotEmpty() -> "暂无提醒。"
+        listFilter == ReminderListFilter.ACTIVE && allReminders.any { reminderIsEnded(it.status) } ->
+            "暂无待办提醒。可切换到「已结束」或「全部」查看。"
+        listFilter == ReminderListFilter.ENDED && allReminders.any { reminderIsActive(it.status) } ->
+            "暂无已结束提醒。可切换到「待办」或「全部」查看。"
         else -> "暂无提醒。"
     }
 
