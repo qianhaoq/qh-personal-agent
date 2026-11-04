@@ -350,6 +350,15 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                     TextButton({ cancelVoice(); nav.navigate("timeline") { popUpTo("timeline") { inclusive = true } } }, enabled = !model.busy) { Text("时间线") }
                     TextButton({ cancelVoice(); model.logout() }, enabled = !model.busy) { Text("退出") }
                 }
+                model.confirming?.let { reminder ->
+                    ConfirmReminderDialog(reminder, model.busy,
+                        title = model.confirmTitle, fireAt = model.confirmFireAt,
+                        submitError = model.error,
+                        onTitleChange = model::updateConfirmTitle,
+                        onFireAtChange = model::updateConfirmFireAt,
+                        onDismiss = model::cancelConfirm,
+                        onConfirm = { overrides -> model.confirmReminder(reminder, overrides) })
+                }
                 NavHost(nav, startDestination = "timeline", modifier = Modifier.weight(1f)) {
                     composable("timeline") {
                         var pendingReminderAction by remember { mutableStateOf<Pair<ReminderAction, ReminderDto>?>(null) }
@@ -365,15 +374,6 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                                 })
                         }
                         val visibleReminders = filterRemindersForList(model.reminders, model.listFilter)
-                        model.confirming?.let { reminder ->
-                            ConfirmReminderDialog(reminder, model.busy,
-                                title = model.confirmTitle, fireAt = model.confirmFireAt,
-                                submitError = model.error,
-                                onTitleChange = model::updateConfirmTitle,
-                                onFireAtChange = model::updateConfirmFireAt,
-                                onDismiss = model::cancelConfirm,
-                                onConfirm = { overrides -> model.confirmReminder(reminder, overrides) })
-                        }
                         var deleting by remember { mutableStateOf<Note?>(null) }
                         deleting?.let { note ->
                             AlertDialog(onDismissRequest = { if (!model.busy) deleting = null },

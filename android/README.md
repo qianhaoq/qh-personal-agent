@@ -533,6 +533,7 @@ JAR SHA-256：`cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8`
 ## S38 详情关联提醒补确认并设闹钟
 
 - 记事详情「关联提醒」在贪睡按钮之后，对 suggested 提醒显示「确认并设闹钟」，调用既有 `model.beginConfirm(reminder)`；busy 时禁用，与主列表一致。
+- 确认对话框挂在 `NavHost` 外，详情与时间线共用。
 - 主列表与详情共用 `reminderCanConfirmAlarm`，仅严格相等于 `suggested` 时可确认，不去空白、不忽略大小写；其它按钮顺序与筛选保持原样。
 - `ReminderStatusTest` 覆盖 suggested 可确认，以及 scheduled/done/cancelled/null/空白/大小写变体和带空白状态不可确认。
 - 应用标签「随记 S38」，顶栏「随记 · S38」；保留 S37 及更早历史。
