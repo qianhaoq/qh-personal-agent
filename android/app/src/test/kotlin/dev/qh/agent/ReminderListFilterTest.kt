@@ -73,12 +73,16 @@ class ReminderListFilterTest {
         }
     }
 
-    @Test fun emptyMessageFallsBackForUnknownStatusesAndVisibleBuckets() {
+    @Test fun emptyMessageGuidesUnknownStatusesAndFallsBackForVisibleBuckets() {
         val unknown = listOf(reminder("unknown", "unknown"), reminder("padded", " done "),
             reminder("uppercase", "SCHEDULED"), nullStatusReminder())
+        assertEquals("暂无待办提醒。可切换到「全部」查看。",
+            reminderListEmptyMessage(unknown, ReminderListFilter.ACTIVE))
+        assertEquals("暂无已结束提醒。可切换到「全部」查看。",
+            reminderListEmptyMessage(unknown, ReminderListFilter.ENDED))
+        assertEquals("暂无提醒。", reminderListEmptyMessage(unknown, ReminderListFilter.ALL))
         val mixed = unknown + reminder("active", "scheduled") + reminder("ended", "done")
         ReminderListFilter.entries.forEach { filter ->
-            assertEquals("暂无提醒。", reminderListEmptyMessage(unknown, filter))
             assertEquals("暂无提醒。", reminderListEmptyMessage(mixed, filter))
             assertEquals("暂无提醒。",
                 reminderListEmptyMessage(filterRemindersForList(mixed, filter), filter))

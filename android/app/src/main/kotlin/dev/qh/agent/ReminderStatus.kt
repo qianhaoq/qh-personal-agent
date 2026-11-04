@@ -19,7 +19,7 @@ fun filterRemindersForList(reminders: List<ReminderDto>, listFilter: ReminderLis
         ReminderListFilter.ALL -> reminders
     }
 
-/** Explain an empty bucket only when the opposite known bucket has reminders. */
+/** Explain where hidden reminders can be viewed when the selected bucket is empty. */
 fun reminderListEmptyMessage(allReminders: List<ReminderDto>, listFilter: ReminderListFilter): String =
     when {
         filterRemindersForList(allReminders, listFilter).isNotEmpty() -> "暂无提醒。"
@@ -27,6 +27,10 @@ fun reminderListEmptyMessage(allReminders: List<ReminderDto>, listFilter: Remind
             "暂无待办提醒。可切换到「已结束」或「全部」查看。"
         listFilter == ReminderListFilter.ENDED && allReminders.any { reminderIsActive(it.status) } ->
             "暂无已结束提醒。可切换到「待办」或「全部」查看。"
+        listFilter == ReminderListFilter.ACTIVE && allReminders.isNotEmpty() ->
+            "暂无待办提醒。可切换到「全部」查看。"
+        listFilter == ReminderListFilter.ENDED && allReminders.isNotEmpty() ->
+            "暂无已结束提醒。可切换到「全部」查看。"
         else -> "暂无提醒。"
     }
 
