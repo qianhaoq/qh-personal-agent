@@ -45,6 +45,40 @@ class ReminderListFilterTest {
         assertEquals(all, filterRemindersForList(all, true))
     }
 
+    @Test fun emptyMessageForNoReminders() {
+        listOf(false, true).forEach { showEnded ->
+            assertEquals("暂无提醒。", reminderListEmptyMessage(emptyList(), showEnded))
+        }
+    }
+
+    @Test fun emptyMessageFallsBackForActiveReminders() {
+        val all = listOf(reminder("suggested", "suggested"), reminder("scheduled", "scheduled"))
+        listOf(false, true).forEach { showEnded ->
+            assertEquals("暂无提醒。", reminderListEmptyMessage(all, showEnded))
+        }
+    }
+
+    @Test fun emptyMessageExplainsHiddenEndedReminders() {
+        listOf(
+            listOf(reminder("done", "done")),
+            listOf(reminder("cancelled", "cancelled")),
+            listOf(reminder("done", "done"), reminder("cancelled", "cancelled"))
+        ).forEach { all ->
+            assertEquals("暂无进行中提醒。可开启「显示已结束」查看。",
+                reminderListEmptyMessage(all, showEnded = false))
+        }
+    }
+
+    @Test fun emptyMessageFallsBackWhenShowingEndedReminders() {
+        assertEquals("暂无提醒。",
+            reminderListEmptyMessage(listOf(reminder("done", "done")), showEnded = true))
+    }
+
+    @Test fun emptyMessageFallsBackWhenActiveReminderRemainsVisible() {
+        val all = listOf(reminder("done", "done"), reminder("scheduled", "scheduled"))
+        assertEquals("暂无提醒。", reminderListEmptyMessage(all, showEnded = false))
+    }
+
     // JSON/Gson can materialize a null status despite the DTO's Kotlin type.
     private fun nullStatusReminder(): ReminderDto {
         val reminder = ReminderDto("null", "note", "提醒", null, status = "done", rev = 1)

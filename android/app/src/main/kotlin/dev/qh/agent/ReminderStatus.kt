@@ -9,6 +9,16 @@ fun reminderIsActive(status: String?): Boolean = status == "suggested" || status
 fun filterRemindersForList(reminders: List<ReminderDto>, showEnded: Boolean): List<ReminderDto> =
     if (showEnded) reminders else reminders.filter { reminderIsActive(it.status) }
 
+/** Explain when the default list is empty because non-active reminders are hidden. */
+fun reminderListEmptyMessage(allReminders: List<ReminderDto>, showEnded: Boolean): String =
+    when {
+        allReminders.isEmpty() -> "暂无提醒。"
+        !showEnded && allReminders.any { !reminderIsActive(it.status) } &&
+            filterRemindersForList(allReminders, showEnded).isEmpty() ->
+            "暂无进行中提醒。可开启「显示已结束」查看。"
+        else -> "暂无提醒。"
+    }
+
 /** Display only: preserve the source status for requests and reminder actions. */
 fun reminderStatus(status: String?): String = when (val value = status?.trim().orEmpty()) {
     "suggested" -> "待确认"
