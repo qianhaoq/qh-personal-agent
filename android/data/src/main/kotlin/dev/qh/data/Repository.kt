@@ -21,6 +21,7 @@ interface TokenStore {
 }
 class SessionExpired : IOException("会话已失效，请重新登录")
 interface Repository {
+    suspend fun cancelReminder(id: String, rev: Int): ReminderCancelResponse
     val signedIn: Boolean
     suspend fun login(invite: String)
     suspend fun logout()
@@ -165,6 +166,8 @@ class RealRepository(private val api: AgentApi, private val store: TokenStore,
     }
     override suspend fun confirmReminder(id: String, rev: Int, fireAt: String?, title: String?) =
         authorized { api.confirmReminder(it, id, ReminderConfirmRequest(rev, fireAt, title)) }
+    override suspend fun cancelReminder(id: String, rev: Int) =
+        authorized { api.cancelReminder(it, id, ReminderCancelRequest(rev)) }
 }
 class MockRepository(private val seedOnLogin: Boolean = true, private val organizeAfterReads: Int = 3) : Repository {
     private data class Change(val seq: Long, val kind: String, val id: String)
@@ -286,12 +289,12 @@ class MockRepository(private val seedOnLogin: Boolean = true, private val organi
         return Answer("这是本地演示回答：你的记事已保存在本次会话中。接入服务器后可根据相关记录回答。", emptyList())
     }
     fun seedReminder(title: String, fireAt: String,
-        noteId: String = "note-demo-${reminders.size + 1}"): ReminderDto {
+        noteId: String = "note-demo-${reminders.size + 1}", status: String = "suggested"): ReminderDto {
         requireSession(); validText(title, 256)
         val normalizedFireAt = Instant.parse(fireAt).toString()
         val now = Instant.now().toString()
         val reminder = ReminderDto("reminder-${UUID.randomUUID()}", noteId, title,
-            normalizedFireAt, status = "suggested", rev = 1, created_at = now, updated_at = now)
+            normalizedFireAt, status = status, rev = 1, created_at = now, updated_at = now)
         reminders[reminder.id] = reminder
         reminderChanges[reminder.id] = nextSeq()
         return reminder
@@ -340,6 +343,30 @@ class MockRepository(private val seedOnLogin: Boolean = true, private val organi
         return SyncResponse(page.lastOrNull()?.seq ?: since, notes, liveReminders, liveActions,
             SyncDeleted(notes = removedNotes, reminders = removedReminders, actions = removedActions), changes.size > limit)
     }
+    override suspend fun cancelReminder(id: String, rev: Int): ReminderCancelResponse {
+        requireSession()
+        val current = reminders[id] ?: throw IllegalArgumentException("提醒不存在")
+        require(current.rev == rev) { "版本冲突，请刷新后重试" }
+        val existing = actions.values.firstOrNull { it.reminder_id == id && it.type == "cancel_reminder" }
+        if (current.status == "cancelled") {
+            return ReminderCancelResponse(current, existing, existing?.work_item_id, duplicate = true)
+        }
+        require(current.status == "suggested" || current.status == "scheduled") { "提醒当前不可取消" }
+        val now = Instant.now().toString()
+        val updated = current.copy(status = "cancelled", rev = current.rev + 1, updated_at = now)
+        reminders[id] = updated
+        reminderChanges[id] = nextSeq()
+        actions.values.filter { it.reminder_id == id && it.type == "schedule_reminder" }
+            .map { it.id }.forEach(::deleteAction)
+        val workItemId = "work-${updated.note_id}"
+        val payload = mapOf<String, Any?>("reminder_id" to id, "note_id" to updated.note_id,
+            "title" to updated.title, "fire_at" to updated.fire_at,
+            "work_item_id" to workItemId, "rev" to updated.rev)
+        val action = SyncAction("action-${UUID.randomUUID()}", "cancel_reminder", payload, workItemId, id, now)
+        actions[action.id] = action
+        actionChanges[action.id] = nextSeq()
+        return ReminderCancelResponse(updated, action, workItemId)
+    }
     override suspend fun confirmReminder(id: String, rev: Int, fireAt: String?, title: String?): ReminderConfirmResponse {
         requireSession()
         val current = reminders[id] ?: throw IllegalArgumentException("提醒不存在")
@@ -361,7 +388,7 @@ class MockRepository(private val seedOnLogin: Boolean = true, private val organi
         val payload = mapOf<String, Any?>("reminder_id" to id, "note_id" to updated.note_id,
             "title" to updated.title, "fire_at" to updated.fire_at,
             "work_item_id" to workItemId, "rev" to updated.rev)
-        val existing = actions.values.firstOrNull { it.reminder_id == id }
+        val existing = actions.values.firstOrNull { it.reminder_id == id && it.type == "schedule_reminder" }
         val action = existing?.copy(payload = payload, work_item_id = workItemId)
             ?: SyncAction("action-${UUID.randomUUID()}", "schedule_reminder", payload,
                 workItemId, id, now)

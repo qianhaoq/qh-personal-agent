@@ -1,4 +1,4 @@
-"""提醒确认：POST /v1/reminders/{id}/confirm — Subscription 直通原 WorkItem。"""
+"""提醒确认与取消：POST /v1/reminders/{id}/{confirm,cancel} — Subscription 直通原 WorkItem。"""
 import hashlib
 import json
 from typing import Annotated
@@ -11,7 +11,11 @@ from app.common import new_id
 from app.db import get_sessionmaker
 from app.deps import get_current_user_id
 from app.domain.engine import get_engine
-from app.domain.model import TRIGGER_USER_CONFIRMED_REMINDER, Trigger
+from app.domain.model import (
+    TRIGGER_USER_CANCELLED_REMINDER,
+    TRIGGER_USER_CONFIRMED_REMINDER,
+    Trigger,
+)
 from app.errors import ApiError
 from app.models import Reminder, SaChannelAction
 from app.schemas import NoNulStr, SafeDatetime, action_to_dict, reminder_to_dict
@@ -104,6 +108,52 @@ async def confirm_reminder(
     return {
         "reminder": reminder_to_dict(fresh),
         "action": action_to_dict(action_row) if action_row else None,
+        "work_item_id": receipt.work_item.id if receipt.work_item else None,
+        "duplicate": fresh.rev == body.rev,
+    }
+
+
+class ReminderCancelRequest(BaseModel):
+    rev: int = Field(ge=1, le=2_147_483_647)
+
+
+@router.post("/{reminder_id}/cancel")
+async def cancel_reminder(
+    reminder_id: Annotated[NoNulStr, Path()],
+    body: ReminderCancelRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Cancel suggested/scheduled reminders via the original Subscription Ticket."""
+    maker = get_sessionmaker()
+    async with maker() as session:
+        reminder = await session.get(Reminder, reminder_id)
+        if reminder is None or reminder.deleted_at is not None or reminder.user_id != user_id:
+            raise ApiError(404, "not_found", "reminder not found")
+        if reminder.note_id is None:
+            raise ApiError(409, "conflict", "reminder has no note thread")
+        note_id = reminder.note_id
+    receipt = await get_engine().receive(Trigger(
+        id=new_id("trg"), kind=TRIGGER_USER_CANCELLED_REMINDER, source="http_api",
+        dedupe_key=f"reminder_cancel:{reminder_id}:r{body.rev}", user_id=user_id,
+        payload={"reminder_id": reminder_id, "note_id": note_id, "rev": body.rev},
+        occurred_at=utcnow(), thread_key=f"note:{note_id}",
+    ))
+    if receipt.decision is None or receipt.decision.outcome != "accept":
+        raise ApiError(409, "conflict", "提醒当前不可取消")
+    async with maker() as read:
+        fresh = await read.get(Reminder, reminder_id)
+        action = (await read.scalars(select(SaChannelAction).where(
+            SaChannelAction.dedupe_key == f"cancel_reminder:{reminder_id}",
+            SaChannelAction.deleted_at.is_(None),
+        ))).one_or_none()
+    if fresh is None or fresh.deleted_at is not None or fresh.user_id != user_id:
+        raise ApiError(404, "not_found", "reminder not found")
+    # Duplicate intake bypasses Channel; current revision must still match.
+    if receipt.duplicate and fresh.rev != body.rev:
+        raise ApiError(409, "conflict", "版本冲突，请拉取最新版本后重试")
+    return {
+        "reminder": reminder_to_dict(fresh),
+        "action": action_to_dict(action) if action else None,
         "work_item_id": receipt.work_item.id if receipt.work_item else None,
         "duplicate": fresh.rev == body.rev,
     }

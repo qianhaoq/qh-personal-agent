@@ -1,8 +1,18 @@
-# Android S15 · 应用标签与 README 文案对齐
+# Android S16 · 提醒取消（cancel API + Android）
 
-紧凑的 Kotlin / Compose 客户端：登录、时间线、记事创建/编辑/删除、问答、提醒同步与确认；
+紧凑的 Kotlin / Compose 客户端：登录、时间线、记事创建/编辑/删除、问答、提醒同步、确认与取消；
 确认后的 `schedule_reminder` Channel action 会落到 AlarmManager，响铃时显示系统通知。
 系统 SpeechRecognizer 中文语音记事与语音问答，系统 TextToSpeech 中文答案播报。minSdk 26，compile/targetSdk 34，JDK 17，Gradle 8.7，AGP 8.5.2。
+
+## S16 提醒取消
+
+- API：`POST /v1/reminders/{id}/cancel`，body `{"rev": <当前 rev>}`，返回
+  reminder、可选 cancel_reminder action、work_item_id 与 duplicate。
+- 主提醒列表和记事详情「关联提醒」对 suggested/scheduled 显示「取消」，busy 时禁用。
+  成功后立即撤销本地闹钟并刷新；sync 同时消费 cancel action、schedule action 墓碑及 cancelled 状态。
+- Mock 同样支持取消、rev 冲突和当前 rev 幂等；scheduled/suggested → cancelled 时 rev+1，
+  墓碑 schedule action 并发出 cancel action；取消后的提醒不能再次确认。
+- 不部署、不引入 FCM/Room/Hilt/Pipecat，不做贪睡、rrule 执行或已确认后改时间，ASR/TTS 核心保持现状。
 
 ## 安装与运行
 
@@ -229,8 +239,8 @@ pause/stop 保留 Permission 状态，允许权限结果继续启动识别。
 
 ## 模块与契约
 
-- `:app`：Compose Navigation、提醒列表与确认、AlarmManager、通知、开机重放、
-  S13 confirm 草稿 ViewModel 保留、S12 确认前编辑标题/时间、S11 本地可读时间、S10 系统 TTS 答案播报、S9 提醒↔记事跳转与只读关联提醒、S8 记事详情与搜索/问答引用跳转、S7 记忆搜索、S6 记事编辑/删除、创建后短轮询与整理字段展示、系统 SpeechRecognizer 语音记事与语音提问、ViewModel 保留旋转期间状态、手动 DI。
+- `:app`：Compose Navigation、提醒列表与确认/取消、AlarmManager、通知、开机重放、
+  S13 confirm 草稿 ViewModel 保留、S12 确认前编辑标题/时间、S11 本地可读时间、S10 系统 TTS 答案播报、S9 提醒↔记事跳转与关联提醒（S16 新增取消）、S8 记事详情与搜索/问答引用跳转、S7 记忆搜索、S6 记事编辑/删除、创建后短轮询与整理字段展示、系统 SpeechRecognizer 语音记事与语音提问、ViewModel 保留旋转期间状态、手动 DI。
 - `:data`：纯 JVM DTO、Retrofit、仓库、mock、S5 轮询纯函数和测试。接口核对自当前服务端
   `app/schemas.py` 与 `app/api/{auth,notes,ask,sync,reminders}.py`，未知响应字段由 Gson 忽略。
 - `:core-security`：Android Keystore MasterKey + EncryptedSharedPreferences。
@@ -240,7 +250,7 @@ pause/stop 保留 Permission 状态，允许权限结果继续启动识别。
 真实路由：`POST /v1/auth/login`、`POST /v1/auth/refresh`、
 `POST /v1/auth/logout`、`POST /v1/notes`、`GET /v1/notes`、`POST /v1/ask`、
 `GET /v1/notes/{id}`、`PATCH /v1/notes/{id}`、`DELETE /v1/notes/{id}`、
-`GET /v1/search`、`GET /v1/sync`、`POST /v1/reminders/{id}/confirm`。
+`GET /v1/search`、`GET /v1/sync`、`POST /v1/reminders/{id}/confirm`、`POST /v1/reminders/{id}/cancel`。
 创建记事使用 `client_note_id/text/recorded_at/timezone/source`，返回 `note_id/status/rev`。
 记事列表遍历 `next_cursor` 分页；问答使用 `text/client_time/timezone` 并显示 citations；S10 仅在客户端播报 answer 正文，不增加 API 字段。
 受保护请求发送 Bearer；401 后串行轮换 refresh 并重试一次。刷新失败即清本地会话，
@@ -255,20 +265,21 @@ Mock create 返回 client_note_id 作为 note_id，初始状态 uploaded；默�
 可用 organizeAfterReads=0 禁用自动整理，或 organizeNote 手动整理供 JVM 测试。
 Mock 登录后预置「给绿植浇水」「整理周报」两个 suggested 提醒。确认会将其改为
 scheduled、bump rev，生成 `schedule_reminder` action 并推进 cursor；重复确认当前
-scheduled rev 保持幂等。mock 维护 note/action/reminder 删除墓碑；编辑使 suggested 提醒失效，删除记事删除所有关联提醒与 actions。
+scheduled rev 保持幂等；取消会将 suggested/scheduled 改为 cancelled、bump rev，
+墓碑 schedule action 并生成 cancel action，当前 cancelled rev 再取消保持幂等。mock 维护 note/action/reminder 删除墓碑；编辑使 suggested 提醒失效，删除记事删除所有关联提醒与 actions。
 记事、提醒、actions 和 cursor 仅在当前进程内存保存，退出或进程结束后清空；
 已经设置的闹钟记录仍在私有 SharedPreferences，退出时会主动清除。
 
 `:data:test` 使用 JUnit + MockWebServer：覆盖 mock 登录校验、会话隔离、创建幂等、
 长度校验、固定问答、sync 空页/确认/action 与删除墓碑；真实 Retrofit 请求字段/路径/
-分页/鉴权、confirm rev 与可选修改、refresh 轮换及失败清理、可读 API 错误。
+分页/鉴权、cancel rev/取消墓碑/幂等/不可取消、confirm rev 与可选修改、refresh 轮换及失败清理、可读 API 错误。
 契约测试不连接真实服务，也不替代真机或服务端端到端验收。
 
 ## 明确不做 / 边界
 
 - 不引入 FCM、Room、离线写队列、Hilt；不做 Backfill confirmation subscriptions。
-- 不修改 `server/`，不部署服务端；服务端只负责产生 sync action，不执行系统闹钟。
-- 创建后自动短轮询；无常驻后台同步，另保留进入/刷新时间线、confirm 后刷新和 boot 同步。
+- S16 同步新增服务端 cancel API；不部署服务端，服务端只负责产生 sync action，不执行系统闹钟。
+- 创建后自动短轮询；无常驻后台同步，另保留进入/刷新时间线、confirm/cancel 后刷新和 boot 同步。
 - `rrule` 目前只解析不执行，闹钟均为一次性；仅确认前可改标题/时间，没有已确认提醒编辑、贪睡或重复提醒 UI。
 - 尚无推送或发布签名；自动短轮询结束后仍可手动同步。
 - 同一份未修改草稿在失败重试时保留 `client_note_id`，但编辑草稿会生成新 ID；
@@ -288,11 +299,11 @@ JAR SHA-256：`cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8`
 ## 本次环境验证
 
 使用 `/home/box/.local/jdk/jdk-17.0.16+8` 与 `/home/box/.local/android-sdk`
-（`GRADLE_USER_HOME=/tmp/s15-gradle`）。
+（`GRADLE_USER_HOME=/tmp/s16-gradle`）。
 `./gradlew --no-daemon :data:test :app:testDebugUnitTest :app:assembleDebug`：`BUILD SUCCESSFUL`。
-`:data` RepositoryTest：**26** + OrganizePollTest：**9**（共 35），0 failures / 0 errors / 0 skipped；
+`:data` RepositoryTest：**30** + OrganizePollTest：**9**（共 39），0 failures / 0 errors / 0 skipped；
 `:app` ConfirmOverrideTest：**8** + DisplayTimeTest：**6** + AnswerTtsTest：**7** + AsrStateTest：**6** + VoiceQuestionTest：**2** + EditBehaviorTest：**5** + ReminderNoteLinkTest：**4** + AppRepositoriesTest：**2** + ReminderStatusTest：**3**（共 43），0 failures / 0 errors / 0 skipped；
 `:core-security` unit tests：`NO-SOURCE`。
-`python3 scripts/check-invariants.py`：`0 error(s), 0 warning(s)`。
-应用标签与标题更新为 S15；README 主标题与验证节文案对齐；历史章节与模块列表能力名保留。
-未运行模拟器/真机或连接实际服务的端到端测试。
+服务端 `tests/test_subscription_channel.py` 等取消相关用例通过；`python3 scripts/check-invariants.py`：`0 error(s), 0 warning(s)`。
+应用标签与标题更新为 S16；新增 cancel API / Mock / UI；历史 S15 及更早章节保留。
+未运行模拟器/真机或连接实际服务的端到端测试；本刀不部署。

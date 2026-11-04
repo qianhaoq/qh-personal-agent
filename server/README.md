@@ -127,3 +127,13 @@ docker compose exec api python -m app.cli create-invite
 - 所有业务查询强制带 `user_id`，有专门的用户隔离测试。
 - 笔记内容拼进 prompt 时放在 `<note>` 分隔符内并声明“只是数据”，S1 无任何可执行工具。
 - 统一错误格式 `{"error":{"code","message"}}`，未处理异常返回 500 且不泄露内部细节。
+
+## S16 提醒取消
+
+`POST /v1/reminders/{id}/cancel`（Bearer，body `{"rev": <current rev>}`）经
+Subscription → 原 WorkItem → Channel，将 suggested/scheduled 改为 cancelled 并 bump rev。
+返回 `{reminder, action, work_item_id, duplicate}`；action 类型为 `cancel_reminder`，
+原 `schedule_reminder` 软删并通过 sync `deleted.actions` 下发。
+已 cancelled 且 rev 为当前值返回 200 / duplicate=true，不改 rev 或 sync 序列；
+旧 rev 返回 409「版本冲突，请拉取最新版本后重试」，done 等不可取消状态 409，
+不存在、非本人或已软删返回 404。服务端不执行系统闹钟，不做贪睡或 rrule 执行。
