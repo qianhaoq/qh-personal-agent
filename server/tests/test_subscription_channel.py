@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timedelta
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
 from app.common import new_id
 from app.db import get_sessionmaker
@@ -483,12 +483,54 @@ async def test_snooze_unavailable_status_and_stale_rev(client, user, status):
     stale = await client.post(url, headers=auth_headers(user), json={"rev": rev + 1})
     assert stale.status_code == 409
     assert stale.json()["error"]["message"] == "版本冲突，请拉取最新版本后重试"
-    response = await client.post(url, headers=auth_headers(user), json={"rev": rev})
-    assert response.status_code == 409
+    async with get_sessionmaker()() as session:
+        before = await session.get(Reminder, reminder_id)
+        before_fire_at = before.fire_at
+        before_change_seq = before.change_seq
+    body = {"rev": rev}
+    for _ in range(2):
+        response = await client.post(url, headers=auth_headers(user), json=body)
+        assert response.status_code == 409
+        assert response.json()["error"]["message"] == "提醒当前不可贪睡"
     async with get_sessionmaker()() as session:
         reminder = await session.get(Reminder, reminder_id)
         assert reminder.rev == rev and reminder.status == status
+        assert reminder.fire_at == before_fire_at
+        assert reminder.change_seq == before_change_seq
         assert await session.scalar(select(func.count()).select_from(SaChannelAction)) == 0
+
+
+async def test_snooze_persisted_ignore_replay_without_active_subscription(client, user):
+    note_id, reminder_id, rev = await _suggested(client, user)
+    async with get_sessionmaker()() as session, session.begin():
+        await session.execute(delete(SaSubscription).where(
+            SaSubscription.thread_key == f"note:{note_id}",
+        ))
+        reminder = await session.get(Reminder, reminder_id)
+        before = (reminder.rev, reminder.status, reminder.fire_at, reminder.change_seq)
+    trigger_id = None
+    for _ in range(2):
+        response = await client.post(
+            f"/v1/reminders/{reminder_id}/snooze",
+            headers=auth_headers(user), json={"rev": rev},
+        )
+        assert response.status_code == 409
+        assert response.json()["error"]["message"] == "提醒当前不可贪睡"
+        # A separate session verifies the first 409 committed the ignore Trigger;
+        # the retry must reuse that same persisted record.
+        async with get_sessionmaker()() as session:
+            trigger = (await session.scalars(select(SaTrigger).where(
+                SaTrigger.kind == "user_snoozed_reminder",
+                SaTrigger.thread_key == f"note:{note_id}",
+            ))).one()
+            assert trigger.decision["outcome"] == "ignore"
+            assert trigger.decision["reason"] == "no active reminder_confirm subscription"
+            if trigger_id is not None:
+                assert trigger.id == trigger_id
+            trigger_id = trigger.id
+            reminder = await session.get(Reminder, reminder_id)
+            assert (reminder.rev, reminder.status, reminder.fire_at, reminder.change_seq) == before
+            assert await session.scalar(select(func.count()).select_from(SaChannelAction)) == 0
 
 
 @pytest.mark.parametrize("kind", ["missing", "deleted", "other_user"])

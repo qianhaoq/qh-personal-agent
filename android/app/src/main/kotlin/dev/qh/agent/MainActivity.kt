@@ -175,21 +175,21 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
     }
     fun cancelReminder(reminder: ReminderDto) = run {
         repo.cancelReminder(reminder.id, reminder.rev)
-        AppRepositories.invalidateAlarms {
+        AppRepositories.invalidateAlarms(reminder.id) {
             alarms.cancelReminder(reminder.id)
         }
         refresh()
     }
     fun completeReminder(reminder: ReminderDto) = run {
         repo.completeReminder(reminder.id, reminder.rev)
-        AppRepositories.invalidateAlarms {
+        AppRepositories.invalidateAlarms(reminder.id) {
             alarms.cancelReminder(reminder.id)
         }
         refresh()
     }
     fun snoozeReminder(reminder: ReminderDto) = run {
         val response = repo.snoozeReminder(reminder.id, reminder.rev, minutes = 10)
-        AppRepositories.invalidateAlarms {
+        AppRepositories.invalidateAlarms(reminder.id) {
             alarms.cancelReminder(reminder.id)
             alarms.snoozed(response)
         }
@@ -335,7 +335,7 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
 fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> VoiceAsr, requestMicrophone: () -> Unit, cancelVoice: () -> Unit) {
     Surface(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().imePadding().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("随记 · S29" + if (BuildConfig.USE_MOCK_API) " / 本地演示" else " / 服务器", style = MaterialTheme.typography.headlineSmall)
+            Text("随记 · S30" + if (BuildConfig.USE_MOCK_API) " / 本地演示" else " / 服务器", style = MaterialTheme.typography.headlineSmall)
             if (model.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
             model.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             if (!model.signedIn) {

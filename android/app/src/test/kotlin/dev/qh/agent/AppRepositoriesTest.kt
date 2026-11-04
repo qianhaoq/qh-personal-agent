@@ -66,6 +66,63 @@ class AppRepositoriesTest {
         assertEquals(session, AppRepositories.sessionGeneration())
     }
 
+    @Test fun notificationSnoozeSuccessRejectsCapturedAlarmGenerationAfterCancellation() {
+        for (action in listOf("cancel", "complete")) {
+            val session = AppRepositories.sessionGeneration()
+            val id = "same-reminder-$action"
+            val alarms = AppRepositories.alarmGeneration(id)
+            val effects = mutableListOf<String>()
+            val delayedSnoozeSuccess = {
+                AppRepositories.consumeIfCurrent(session, id, alarms) {
+                    AppRepositories.invalidateAlarms(id) { effects += "reinstall alarm" }
+                    effects += "dismiss notification"
+                    AppRepositories.notifyRemindersMutated()
+                }
+            }
+            AppRepositories.invalidateAlarms(id) { effects += action }
+            delayedSnoozeSuccess()
+            assertEquals(listOf(action), effects)
+            assertEquals(session, AppRepositories.sessionGeneration())
+        }
+    }
+
+    @Test fun differentReminderSuccessesBothApplyLocalEffects() {
+        val session = AppRepositories.sessionGeneration()
+        val ids = listOf("interleaved-A", "interleaved-B")
+        val captured = ids.associateWith { AppRepositories.alarmGeneration(it) }
+        val global = AppRepositories.alarmGeneration()
+        val effects = mutableListOf<String>()
+        var refreshes = 0
+        val unsubscribe = AppRepositories.subscribeRemindersMutated { refreshes++ }
+        try {
+            for (id in ids) {
+                AppRepositories.consumeIfCurrent(session, id, captured.getValue(id)) {
+                    AppRepositories.invalidateAlarms(id) {
+                        effects += "$id cancel"
+                        effects += "$id reschedule"
+                    }
+                    effects += "$id dismiss"
+                    AppRepositories.notifyRemindersMutated()
+                }
+            }
+            assertEquals(ids.flatMap { listOf("$it cancel", "$it reschedule", "$it dismiss") }, effects)
+            assertEquals(2, refreshes)
+            var staleSyncApplied = false
+            AppRepositories.consumeIfCurrent(session, global) { staleSyncApplied = true }
+            assertFalse(staleSyncApplied)
+        } finally { unsubscribe() }
+    }
+
+    @Test fun bulkInvalidationRejectsCapturedReminderCallback() {
+        val session = AppRepositories.sessionGeneration()
+        val id = "bulk-deleted-reminder"
+        val alarms = AppRepositories.alarmGeneration(id)
+        AppRepositories.invalidateAlarms {}
+        var applied = false
+        AppRepositories.consumeIfCurrent(session, id, alarms) { applied = true }
+        assertFalse(applied)
+    }
+
     @Test fun delayedBootResponseCannotConsumeDuringOrAfterDeleteCancellation() {
         val session = AppRepositories.sessionGeneration()
         val alarms = AppRepositories.alarmGeneration()

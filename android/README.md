@@ -1,4 +1,4 @@
-# S29 · 通知栏完成/取消文案
+# S30 · 通知路径 P2（snooze ignore 重放与闹钟栅栏）
 
 紧凑的 Kotlin / Compose 客户端：登录、时间线、记事创建/编辑/删除、问答、提醒同步、确认/取消/完成；
 确认后的 `schedule_reminder` Channel action 会落到 AlarmManager，响铃时显示系统通知。
@@ -453,3 +453,12 @@ JAR SHA-256：`cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8`
 本刀不做：不改 intentAction / PendingIntent / 动作分发 / minutes / snooze 文案；不改应用内按钮、二次确认逻辑、对话框 dismiss「取消」；不改 API / server / data、FCM/Room/Hilt/Pipecat、筛选/空状态、根路径 `GET /`、rrule；不部署、不合入。
 
 里程碑 / changelog：S29 通知栏完成/取消文案对齐应用内「完成提醒」「取消提醒」，应用标签与顶部标题升至 S29；保留 S28 及更早历史。
+
+
+## S30 通知路径 P2
+
+- Server：snooze 存档 decision 为 ignore 时，首次请求和同 body 重放均返回 409；已接受 snooze 的幂等重放仍返回 200。
+- Android：通知动作发起网络请求前捕获会话与 alarmGeneration，成功本地副作用经 `consumeIfCurrent` 双栅栏校验；取消/完成/删除已使闹钟代际失效后，迟到贪睡响应不得重装闹钟或取消通知。
+- 应用标签更新为「随记 S30」，顶部标题更新为「随记 · S30」；保留 S29 及更早历史。
+
+本刀不做：不改通知栏/应用内按钮文案；不做通知栏二次确认、rrule、根路径 `GET /`；不改 FCM/Room/Hilt/Pipecat；不部署、不合入。
