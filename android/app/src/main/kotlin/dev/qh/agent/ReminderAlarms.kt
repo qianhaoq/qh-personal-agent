@@ -237,6 +237,7 @@ class ReminderNotificationActionReceiver : BroadcastReceiver() {
                                     }
                                     appContext.getSystemService(NotificationManager::class.java)
                                         .cancel(id.hashCode())
+                                    AppRepositories.notifyRemindersMutated()
                                 }
                             }
                         })

@@ -1,4 +1,4 @@
-# S20 · 主列表/详情「10分钟后」贪睡
+# S21 · 通知栏操作后前台自动刷新
 
 紧凑的 Kotlin / Compose 客户端：登录、时间线、记事创建/编辑/删除、问答、提醒同步、确认/取消/完成；
 确认后的 `schedule_reminder` Channel action 会落到 AlarmManager，响铃时显示系统通知。
@@ -352,3 +352,15 @@ JAR SHA-256：`cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8`
 本刀不做：rrule 执行、二次确认、FCM/Room/Hilt/Pipecat、改 ASR/TTS、改 server、根路径 `GET /`；不部署、不改 S19 通知栏操作。
 
 里程碑 / changelog：S20 补齐主列表与详情贪睡入口；保留 S19 及更早历史。
+
+
+## S21 通知栏操作后前台自动刷新
+
+- `AppRepositories` 提供进程内轻量回调订阅，通知携带当前 sessionGeneration；无订阅时可安全发送。
+- 通知栏完成 / 取消 / 贪睡成功后，在原 `ifCurrent` 栅栏内撤通知并发送提醒变更信号，保留既有闹钟处理。
+- `AgentModel` 订阅后通过 viewModelScope 调用既有 refresh，等待 refreshMutex 后再次校验登录态与事件 generation；不因 busy 丢弃事件，不依赖 ON_RESUME。ViewModel 清理时取消订阅，logout 后旧事件由会话栅栏丢弃。
+- JVM 测试覆盖信号 generation、取消订阅、会话切换与迟到事件；保留既有 AppRepositories 测试。
+
+本刀不做：FCM/Room/Hilt/Pipecat、rrule、根路径 `GET /`、二次确认、data / Mock / API / server 改动、ASR/TTS 改动、routine；不改通知按钮集合或 API 语义，不部署、不合入。
+
+里程碑 / changelog：S21 补齐通知遮罩未触发 ON_RESUME 时的前台自动刷新；保留 S20 及更早历史。
