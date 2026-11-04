@@ -1,4 +1,4 @@
-# S27 · 贪睡按钮文案
+# S28 · 通知栏贪睡文案
 
 紧凑的 Kotlin / Compose 客户端：登录、时间线、记事创建/编辑/删除、问答、提醒同步、确认/取消/完成；
 确认后的 `schedule_reminder` Channel action 会落到 AlarmManager，响铃时显示系统通知。
@@ -280,7 +280,7 @@ scheduled rev 保持幂等；取消会将 suggested/scheduled 改为 cancelled�
 - 不引入 FCM、Room、离线写队列、Hilt；不做 Backfill confirmation subscriptions。
 - S16 同步新增服务端 cancel API；不部署服务端，服务端只负责产生 sync action，不执行系统闹钟。
 - 创建后自动短轮询；无常驻后台同步，另保留进入/刷新时间线、confirm/cancel 后刷新和 boot 同步。
-- `rrule` 目前只解析不执行，闹钟均为一次性；仅确认前可改标题/时间，没有已确认提醒任意编辑或重复提醒 UI；主列表、详情与通知支持「10分钟后」贪睡。
+- `rrule` 目前只解析不执行，闹钟均为一次性；仅确认前可改标题/时间，没有已确认提醒任意编辑或重复提醒 UI；主列表、详情与通知支持「贪睡10分钟」贪睡。
 - 尚无推送或发布签名；自动短轮询结束后仍可手动同步。
 - 同一份未修改草稿在失败重试时保留 `client_note_id`，但编辑草稿会生成新 ID；
   网络结果不确定时请先刷新时间线，避免编辑后重复记录。
@@ -426,8 +426,19 @@ JAR SHA-256：`cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8`
 
 - 提醒主列表与记事详情页关联提醒的贪睡按钮：「10分钟后」→「贪睡10分钟」；仍调用 `model.snoozeReminder`，贪睡分钟数保持 10，仅改文案、行为不变。
 - 应用标签更新为「随记 S27」，顶部标题更新为「随记 · S27」。
-- 通知栏 `ReminderNotificationAction` 仍为「10分钟后」，保持不变。
+- S27 当时未改通知栏，`ReminderNotificationAction` 的贪睡文案仍为「10分钟后」。
 
 本刀不做：不改通知栏 PendingIntent、「取消提醒」/「完成提醒」、对话框 dismiss「取消」、二次确认逻辑、snooze 分钟、API / server / data、FCM/Room/Hilt/Pipecat、筛选/空状态、根路径 `GET /`、rrule；不部署、不合入。
 
 里程碑 / changelog：S27 提醒主列表与详情页贪睡按钮文案明确为「贪睡10分钟」；保留 S26 及更早历史。
+
+
+## S28 通知栏贪睡文案
+
+- 通知栏 `ReminderNotificationAction.SNOOZE`：「10分钟后」→「贪睡10分钟」；`intentAction`、`minutes=10`、COMPLETE / CANCEL 及「完成」「取消」保持不变，仅改文案、行为不变。
+- 应用标签更新为「随记 S28」，顶部标题更新为「随记 · S28」。
+- 应用内主列表与详情页贪睡按钮已是「贪睡10分钟」，保持不变。
+
+本刀不做：不改应用内贪睡按钮、取消/完成逻辑、对话框 dismiss「取消」、二次确认逻辑、通知栏 intentAction / PendingIntent、API / server / data、snooze 分钟、FCM/Room/Hilt/Pipecat、筛选/空状态、根路径 `GET /`、rrule；不部署、不合入。
+
+里程碑 / changelog：S28 通知栏贪睡文案明确为「贪睡10分钟」，应用标签与顶部标题升至 S28；保留 S27 及更早历史。

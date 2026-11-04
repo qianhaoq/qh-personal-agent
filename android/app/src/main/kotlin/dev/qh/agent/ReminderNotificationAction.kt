@@ -6,7 +6,7 @@ import dev.qh.data.ReminderSnoozeResponse
 internal enum class ReminderNotificationAction(val intentAction: String, val label: String) {
     COMPLETE("dev.qh.agent.action.REMINDER_COMPLETE", "完成"),
     CANCEL("dev.qh.agent.action.REMINDER_CANCEL", "取消"),
-    SNOOZE("dev.qh.agent.action.REMINDER_SNOOZE", "10分钟后");
+    SNOOZE("dev.qh.agent.action.REMINDER_SNOOZE", "贪睡10分钟");
 
     companion object {
         fun fromIntentAction(value: String?) = entries.find { it.intentAction == value }
