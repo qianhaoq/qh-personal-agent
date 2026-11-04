@@ -33,7 +33,7 @@ import org.json.JSONObject
 private const val ALARM_PREFS = "pending_reminder_alarms"
 private const val ALARM_ACTION = "dev.qh.agent.action.REMINDER_ALARM"
 internal const val EXTRA_REMINDER_ID = "reminder_id"
-private const val EXTRA_TITLE = "title"
+internal const val EXTRA_TITLE = "title"
 private const val NOTIFICATION_CHANNEL = "reminders"
 // Soft budget for optional post-boot network sync (does not hold the broadcast).
 private const val BOOT_SYNC_BUDGET_MS = 10_000L
@@ -162,9 +162,9 @@ class ReminderAlarmReceiver : BroadcastReceiver() {
             .setSmallIcon(android.R.drawable.ic_dialog_alert).setContentTitle("随记提醒")
             .setContentText(title).setStyle(Notification.BigTextStyle().bigText(title))
             .setContentIntent(contentIntent).setAutoCancel(true)
-            .addAction(notificationAction(context, reminderId, ReminderNotificationAction.COMPLETE))
-            .addAction(notificationAction(context, reminderId, ReminderNotificationAction.CANCEL))
-            .addAction(notificationAction(context, reminderId, ReminderNotificationAction.SNOOZE)).build()
+            .addAction(notificationAction(context, reminderId, title, ReminderNotificationAction.COMPLETE))
+            .addAction(notificationAction(context, reminderId, title, ReminderNotificationAction.CANCEL))
+            .addAction(notificationAction(context, reminderId, title, ReminderNotificationAction.SNOOZE)).build()
         notifications.notify(reminderId.hashCode(), notification)
     }
 }
@@ -198,13 +198,14 @@ class ReminderBootReceiver : BroadcastReceiver() {
     }
 }
 
-private fun notificationAction(context: Context, id: String, action: ReminderNotificationAction): Notification.Action {
+private fun notificationAction(context: Context, id: String, title: String, action: ReminderNotificationAction): Notification.Action {
     val target = if (action.confirmAction == null) ReminderNotificationActionReceiver::class.java
         else ReminderNotificationConfirmActivity::class.java
     val intent = Intent(context, target).setAction(action.intentAction)
         .setData(Uri.Builder().scheme("qh-agent").authority("reminder-action")
             .appendPath(id).appendPath(action.name).build())
         .putExtra(EXTRA_REMINDER_ID, id)
+        .putExtra(EXTRA_TITLE, title)
     // Distinct request codes so complete/cancel PendingIntents never collide.
     val requestCode = 31 * id.hashCode() + action.ordinal
     val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE

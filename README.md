@@ -2,9 +2,9 @@
 
 个人语音记事与语音助手。说一句话，自动整理成笔记 / 待办 / 提醒，并能用语音问答自己的记忆。
 
-当前里程碑：**S34**，提醒主列表在仅有未知/异常状态、待办或已结束桶为空时，提示切换到「全部」查看；保留对面已知桶的切换提示。应用标签「随记 S34」、顶部标题「随记 · S34」。详见 [Android README](android/README.md)。
+当前里程碑：**S35**，应用内主列表/详情与通知栏二次确认正文展示具体提醒标题，缺省或空白回落「随记提醒」。应用标签「随记 S35」、顶部标题「随记 · S35」。详见 [Android README](android/README.md)。
 
-S34 不做：rrule、根路径 `GET /`、FCM/Room/Hilt/Pipecat、server/data/Mock/API、通知栏、二次确认、贪睡分钟调整、S31 竞态逻辑、大重构、部署、合入、squash routine。
+S35 不做：rrule、根路径 `GET /`、FCM/Room/Hilt/Pipecat、server/data/Mock/API、贪睡分钟调整、S31 竞态逻辑、大重构、部署、合入、squash routine；不改通知栏 action/intentAction/分钟/PendingIntent 类型，仅补确认文案与 EXTRA_TITLE。
 
 ## 仓库结构（monorepo）
 

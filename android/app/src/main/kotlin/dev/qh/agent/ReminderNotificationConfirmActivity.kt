@@ -31,6 +31,7 @@ class ReminderNotificationConfirmActivity : ComponentActivity() {
             finish()
             return
         }
+        val reminderTitle = reminderConfirmDisplayTitle(intent.getStringExtra(EXTRA_TITLE))
         // Wire process-wide token store so later bumpSession can rotate the durable epoch.
         AppRepositories.real(applicationContext)
         val tokens = SecureTokens(applicationContext)
@@ -49,7 +50,7 @@ class ReminderNotificationConfirmActivity : ComponentActivity() {
         })
         setContent {
             MaterialTheme {
-                ReminderActionConfirmDialog(confirmAction, busy = busy.value,
+                ReminderActionConfirmDialog(confirmAction, reminderTitle, busy = busy.value,
                     onDismiss = { if (state.canDismiss) finish() },
                     onConfirm = {
                         val current = confirmationSessionCurrent(confirmationSession,
