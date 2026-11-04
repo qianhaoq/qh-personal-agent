@@ -14,6 +14,7 @@ import android.os.Build
 import android.util.Log
 import android.widget.Toast
 import dev.qh.data.ReminderConfirmResponse
+import dev.qh.data.ReminderSnoozeResponse
 import dev.qh.data.ReminderDto
 import dev.qh.data.SyncAction
 import dev.qh.data.SyncResponse
@@ -56,6 +57,11 @@ class ReminderAlarmScheduler(context: Context) {
             .forEach { cancelReminder(it.id) }
     }
     fun confirmed(response: ReminderConfirmResponse) {
+        response.action?.let(::schedule) ?: schedule(response.reminder)
+    }
+    fun snoozed(response: ReminderSnoozeResponse) {
+        // Intake replay can return a reminder completed/cancelled since the original snooze.
+        if (response.reminder.status != "scheduled") return
         response.action?.let(::schedule) ?: schedule(response.reminder)
     }
     fun restore() = pending().forEach(::setAlarm)
@@ -157,7 +163,8 @@ class ReminderAlarmReceiver : BroadcastReceiver() {
             .setContentText(title).setStyle(Notification.BigTextStyle().bigText(title))
             .setContentIntent(contentIntent).setAutoCancel(true)
             .addAction(notificationAction(context, reminderId, ReminderNotificationAction.COMPLETE))
-            .addAction(notificationAction(context, reminderId, ReminderNotificationAction.CANCEL)).build()
+            .addAction(notificationAction(context, reminderId, ReminderNotificationAction.CANCEL))
+            .addAction(notificationAction(context, reminderId, ReminderNotificationAction.SNOOZE)).build()
         notifications.notify(reminderId.hashCode(), notification)
     }
 }
@@ -219,12 +226,14 @@ class ReminderNotificationActionReceiver : BroadcastReceiver() {
                     performReminderNotificationAction(action, id, repository,
                         sessionCurrent = {
                             repository.signedIn && generation == AppRepositories.sessionGeneration()
-                        }, onSuccess = {
+                        }, onSuccess = { snoozed ->
                             // Match MainActivity: only clear local alarm after a successful mutation.
                             AppRepositories.ifCurrent(generation) {
                                 if (repository.signedIn) {
                                     AppRepositories.invalidateAlarms {
-                                        ReminderAlarmScheduler(appContext).cancelReminder(id)
+                                        val scheduler = ReminderAlarmScheduler(appContext)
+                                        scheduler.cancelReminder(id)
+                                        snoozed?.let(scheduler::snoozed)
                                     }
                                     appContext.getSystemService(NotificationManager::class.java)
                                         .cancel(id.hashCode())

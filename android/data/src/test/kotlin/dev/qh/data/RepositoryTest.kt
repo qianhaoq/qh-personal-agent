@@ -1,6 +1,8 @@
 package dev.qh.data
 
 import kotlinx.coroutines.runBlocking
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.ResponseBody.Companion.toResponseBody
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.Assert.*
@@ -8,6 +10,90 @@ import org.junit.Test
 import com.google.gson.JsonParser
 
 class RepositoryTest {
+    @Test fun mockSnoozeCreatesAndUpdatesScheduleWithFreshRev() = runBlocking {
+        val repo = MockRepository(seedOnLogin = false); repo.login("demo")
+        val seeded = repo.seedReminder("吃药", "2099-01-01T00:00:00Z")
+        val started = java.time.Instant.now()
+        val first = repo.snoozeReminder(seeded.id, seeded.rev)
+        val fire = java.time.Instant.parse(first.reminder.fire_at)
+        assertFalse(fire.isBefore(started.plusSeconds(600)))
+        assertFalse(fire.isAfter(java.time.Instant.now().plusSeconds(600)))
+        assertEquals("scheduled", first.reminder.status)
+        assertEquals(seeded.rev + 1, first.reminder.rev)
+        assertEquals("schedule_reminder", first.action!!.type)
+        assertEquals(first.reminder.fire_at, first.action.payload["fire_at"])
+        val before = repo.sync()
+        try { repo.snoozeReminder(seeded.id, seeded.rev); fail("Expected stale revision") }
+        catch (_: IllegalArgumentException) { }
+        assertEquals(before, repo.sync())
+        val again = repo.snoozeReminder(seeded.id, first.reminder.rev, 20)
+        assertEquals(first.action.id, again.action!!.id)
+        assertEquals(first.reminder.rev + 1, again.reminder.rev)
+        assertNotEquals(first.reminder.fire_at, again.reminder.fire_at)
+        val delta = repo.sync(before.cursor)
+        assertEquals(listOf(again.action), delta.actions)
+        assertEquals(listOf(again.reminder), delta.reminders)
+        assertTrue(delta.deleted.actions.isEmpty())
+        assertFalse(again.duplicate)
+    }
+
+    @Test fun mockSnoozeConfirmedUpdatesExistingActionAndRejectsUnavailable() = runBlocking {
+        val repo = MockRepository(seedOnLogin = false); repo.login("demo")
+        val seeded = repo.seedReminder("吃药", "2099-01-01T00:00:00Z")
+        val confirmed = repo.confirmReminder(seeded.id, seeded.rev)
+        val snoozed = repo.snoozeReminder(seeded.id, confirmed.reminder.rev, 1)
+        assertEquals(confirmed.action!!.id, snoozed.action!!.id)
+        for (status in listOf("done", "cancelled")) {
+            val unavailable = repo.seedReminder("吃药", "2099-01-01T00:00:00Z", status = status)
+            val before = repo.sync()
+            try { repo.snoozeReminder(unavailable.id, unavailable.rev); fail("Expected unavailable") }
+            catch (_: IllegalArgumentException) { }
+            assertEquals(before, repo.sync())
+        }
+        for (minutes in listOf(0, 1441)) {
+            try { repo.snoozeReminder(seeded.id, snoozed.reminder.rev, minutes); fail("Expected bounds") }
+            catch (_: IllegalArgumentException) { }
+        }
+    }
+
+    @Test fun snoozeUsesPostRevMinutesBearerAndPropagatesDuplicateAndConflict() = runBlocking {
+        // Exercise Retrofit/Gson and authorization without opening a network socket.
+        val requests = mutableListOf<okhttp3.Request>()
+        val responses = java.util.ArrayDeque<Pair<Int, String>>()
+        val client = okhttp3.OkHttpClient.Builder().addInterceptor { chain ->
+            requests += chain.request()
+            val (code, json) = responses.removeFirst()
+            okhttp3.Response.Builder().request(chain.request()).protocol(okhttp3.Protocol.HTTP_1_1)
+                .code(code).message("test").body(json.toResponseBody("application/json".toMediaType())).build()
+        }.build()
+        val api = retrofit2.Retrofit.Builder().baseUrl("https://example.invalid/").client(client)
+            .addConverterFactory(retrofit2.converter.gson.GsonConverterFactory.create()).build()
+            .create(AgentApi::class.java)
+        val store = Store().apply { write(Tokens("access", "refresh", 60, "u1")) }
+        val repo = RealRepository(api, store)
+        for (duplicate in listOf(false, true)) {
+            responses.add(200 to """{"reminder":{"id":"r1","title":"吃药","status":"scheduled","rev":4,"fire_at":"2099-01-01T00:10:00Z"},"action":{"id":"a1","type":"schedule_reminder","reminder_id":"r1","payload":{"rev":4,"fire_at":"2099-01-01T00:10:00Z"}},"work_item_id":"w1","duplicate":$duplicate}""")
+            val result = repo.snoozeReminder("r1", 3)
+            assertEquals(duplicate, result.duplicate)
+            assertEquals("schedule_reminder", result.action!!.type)
+            assertEquals(result.reminder.fire_at, result.action.payload["fire_at"])
+            assertEquals("w1", result.work_item_id)
+            val request = requests.last()
+            assertEquals("POST", request.method)
+            assertEquals("/v1/reminders/r1/snooze", request.url.encodedPath)
+            assertEquals("Bearer access", request.header("Authorization"))
+            val buffer = okio.Buffer(); request.body!!.writeTo(buffer)
+            val body = JsonParser.parseString(buffer.readUtf8()).asJsonObject
+            assertEquals(3, body["rev"].asInt)
+            assertEquals(10, body["minutes"].asInt)
+        }
+        responses.add(409 to "{}")
+        try { repo.snoozeReminder("r1", 3, 20); fail("Expected conflict") }
+        catch (error: retrofit2.HttpException) { assertEquals(409, error.code()) }
+        val buffer = okio.Buffer(); requests.last().body!!.writeTo(buffer)
+        assertEquals(20, JsonParser.parseString(buffer.readUtf8()).asJsonObject["minutes"].asInt)
+    }
+
     @Test fun mockCancelScheduledTombstonesActionAndIsIdempotent() = runBlocking {
         val repo = MockRepository(seedOnLogin = false); repo.login("demo")
         val seeded = repo.seedReminder("吃药", "2099-01-01T00:00:00Z")

@@ -15,6 +15,8 @@ import asyncio
 import json
 import uuid
 
+import pytest
+
 from tests.conftest import auth_headers, requires_postgres
 from tests.runtime_driver import seed_legacy_extract
 
@@ -881,3 +883,52 @@ async def test_concurrent_confirm_complete_same_rev_exactly_one_success(client, 
         reminder = await session.get(Reminder, reminder_id)
         assert reminder.rev == rev + 1
         assert reminder.status == winner["reminder"]["status"]
+
+
+@requires_postgres
+async def test_concurrent_confirm_snooze_same_rev_exactly_one_success(client, user):
+    from app.db import get_sessionmaker
+    from app.models import Reminder
+    from tests.test_subscription_channel import _suggested
+
+    _, reminder_id, rev = await _suggested(client, user)
+    async def send(operation):
+        return await client.post(f"/v1/reminders/{reminder_id}/{operation}",
+                                 headers=auth_headers(user), json={"rev": rev})
+    results = await asyncio.wait_for(asyncio.gather(send("confirm"), send("snooze")), timeout=10)
+    assert sorted(r.status_code for r in results) == [200, 409], [r.text for r in results]
+    winner = next(r.json() for r in results if r.status_code == 200)
+    async with get_sessionmaker()() as session:
+        reminder = await session.get(Reminder, reminder_id)
+        assert reminder.rev == rev + 1
+        assert reminder.status == winner["reminder"]["status"]
+
+
+@requires_postgres
+@pytest.mark.parametrize("same_minutes", [False, True])
+async def test_concurrent_snooze_same_rev_exactly_one_success(client, user, same_minutes):
+    from sqlalchemy import select
+
+    from app.db import get_sessionmaker
+    from app.models import Reminder, SaChannelAction
+    from tests.test_subscription_channel import _suggested
+
+    _, reminder_id, rev = await _suggested(client, user)
+    async def send(minutes):
+        return await client.post(f"/v1/reminders/{reminder_id}/snooze",
+                                 headers=auth_headers(user), json={"rev": rev, "minutes": minutes})
+    results = await asyncio.wait_for(asyncio.gather(send(10), send(10 if same_minutes else 20)), timeout=10)
+    # Same dedupe is replayed as 200; distinct minutes compete for the revision.
+    assert sorted(r.status_code for r in results) == ([200, 200] if same_minutes else [200, 409])
+    successes = [r.json() for r in results if r.status_code == 200]
+    assert sum(not r["duplicate"] for r in successes) == 1
+    async with get_sessionmaker()() as session:
+        reminder = await session.get(Reminder, reminder_id)
+        assert reminder.rev == rev + 1 and reminder.status == "scheduled"
+        actions = (await session.scalars(select(SaChannelAction).where(
+            SaChannelAction.reminder_id == reminder_id,
+        ))).all()
+        assert len(actions) == 1
+        assert actions[0].type == "schedule_reminder" and actions[0].deleted_at is None
+        assert actions[0].payload["rev"] == rev + 1
+        assert actions[0].payload["fire_at"] == successes[0]["reminder"]["fire_at"]

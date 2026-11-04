@@ -3,7 +3,7 @@
 Workers never push notifications or set system alarms. Client-visible side
 effects are Channel actions (sync-visible payloads) plus note/reminder rows.
 """
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Protocol
 
 from sqlalchemy import select, update
@@ -21,7 +21,7 @@ from app.domain.model import (
 from app.errors import ApiError
 from app.models import Note, Reminder, SaChannelAction, SaSubscription
 from app.schemas import clean_llm_str
-from app.timeutil import as_utc, to_iso, utcnow
+from app.timeutil import as_utc, to_iso, to_iso_z, utcnow
 
 
 class Channel(Protocol):
@@ -34,6 +34,9 @@ class Channel(Protocol):
                               payload: dict) -> dict | None: ...
 
     async def complete_reminder(self, session, *, work_item_id: str, user_id: str,
+                              payload: dict) -> dict | None: ...
+
+    async def snooze_reminder(self, session, *, work_item_id: str, user_id: str,
                               payload: dict) -> dict | None: ...
 
 
@@ -157,7 +160,7 @@ class SyncChannel:
             "reminder_id": reminder.id,
             "note_id": reminder.note_id,
             "title": reminder.title,
-            "fire_at": to_iso(reminder.fire_at),
+            "fire_at": to_iso_z(reminder.fire_at),
             "work_item_id": work_item_id,
             "rev": reminder.rev,
         }
@@ -168,6 +171,81 @@ class SyncChannel:
             same = existing.payload == action_payload and existing.deleted_at is None
             if same:
                 return _action_dict(existing)
+            existing.payload = action_payload
+            existing.work_item_id = work_item_id
+            existing.deleted_at = None
+            await session.flush()
+            total = 2  # reminder row + action row
+            last_seq = await allocate_seq(session, count=total)
+            seqs = iter(range(last_seq - total + 1, last_seq + 1))
+            reminder.change_seq = next(seqs)
+            existing.change_seq = next(seqs)
+            await session.flush()
+            return _action_dict(existing)
+
+        action = SaChannelAction(
+            id=new_id("act"),
+            user_id=user_id,
+            type=CHANNEL_ACTION_SCHEDULE_REMINDER,
+            payload=action_payload,
+            work_item_id=work_item_id,
+            reminder_id=reminder.id,
+            dedupe_key=dedupe_key,
+            change_seq=0,
+            created_at=now,
+        )
+        session.add(action)
+        await session.flush()
+        total = 2
+        last_seq = await allocate_seq(session, count=total)
+        seqs = iter(range(last_seq - total + 1, last_seq + 1))
+        reminder.change_seq = next(seqs)
+        action.change_seq = next(seqs)
+        await session.flush()
+        return _action_dict(action)
+
+    async def snooze_reminder(self, session, *, work_item_id: str, user_id: str,
+                              payload: dict) -> dict | None:
+        """Reschedule under reminder lock; actions precede sequences (INV-1/11/13)."""
+        reminder_id = payload.get("reminder_id")
+        stmt = select(Reminder).where(Reminder.id == reminder_id)
+        if session.bind.dialect.name == "postgresql":
+            stmt = stmt.with_for_update()
+        reminder = (await session.execute(stmt)).scalar_one_or_none()
+        if reminder is None or reminder.deleted_at is not None or reminder.user_id != user_id:
+            raise ApiError(404, "not_found", "reminder not found")
+        if reminder.rev != payload.get("rev"):
+            raise ApiError(409, "conflict", "版本冲突，请拉取最新版本后重试")
+        if reminder.status not in ("suggested", "scheduled"):
+            raise ApiError(409, "conflict", "提醒当前不可贪睡")
+        now = utcnow()
+        changed = await session.execute(update(Reminder).where(
+            Reminder.id == reminder_id, Reminder.user_id == user_id,
+            Reminder.deleted_at.is_(None), Reminder.rev == payload["rev"],
+            Reminder.status.in_(("suggested", "scheduled")),
+        ).values(status="scheduled", fire_at=now + timedelta(minutes=payload["minutes"]),
+                 rev=Reminder.rev + 1, updated_at=now))
+        if changed.rowcount != 1:
+            await session.refresh(reminder)
+            if reminder.deleted_at is not None or reminder.user_id != user_id:
+                raise ApiError(404, "not_found", "reminder not found")
+            raise ApiError(409, "conflict", "版本冲突，请拉取最新版本后重试")
+        await session.refresh(reminder)
+
+        dedupe_key = f"schedule_reminder:{reminder_id}"
+        existing = (await session.scalars(select(SaChannelAction).where(
+            SaChannelAction.dedupe_key == dedupe_key))).one_or_none()
+
+        action_payload = {
+            "reminder_id": reminder.id,
+            "note_id": reminder.note_id,
+            "title": reminder.title,
+            "fire_at": to_iso_z(reminder.fire_at),
+            "work_item_id": work_item_id,
+            "rev": reminder.rev,
+        }
+
+        if existing is not None:
             existing.payload = action_payload
             existing.work_item_id = work_item_id
             existing.deleted_at = None
@@ -248,7 +326,7 @@ class SyncChannel:
         ))).one_or_none()
         action_payload = {
             "reminder_id": reminder.id, "note_id": reminder.note_id,
-            "title": reminder.title, "fire_at": to_iso(reminder.fire_at),
+            "title": reminder.title, "fire_at": to_iso_z(reminder.fire_at),
             "work_item_id": work_item_id, "rev": reminder.rev,
         }
         if action is None:
@@ -317,7 +395,7 @@ class SyncChannel:
         ))).one_or_none()
         action_payload = {
             "reminder_id": reminder.id, "note_id": reminder.note_id,
-            "title": reminder.title, "fire_at": to_iso(reminder.fire_at),
+            "title": reminder.title, "fire_at": to_iso_z(reminder.fire_at),
             "work_item_id": work_item_id, "rev": reminder.rev,
         }
         if action is None:

@@ -21,6 +21,7 @@ interface TokenStore {
 }
 class SessionExpired : IOException("会话已失效，请重新登录")
 interface Repository {
+    suspend fun snoozeReminder(id: String, rev: Int, minutes: Int = 10): ReminderSnoozeResponse
     suspend fun cancelReminder(id: String, rev: Int): ReminderCancelResponse
     suspend fun completeReminder(id: String, rev: Int): ReminderCompleteResponse
     val signedIn: Boolean
@@ -171,6 +172,9 @@ class RealRepository(private val api: AgentApi, private val store: TokenStore,
         authorized { api.cancelReminder(it, id, ReminderCancelRequest(rev)) }
     override suspend fun completeReminder(id: String, rev: Int) =
         authorized { api.completeReminder(it, id, ReminderCompleteRequest(rev)) }
+    override suspend fun snoozeReminder(id: String, rev: Int, minutes: Int) =
+        authorized { api.snoozeReminder(it, id, ReminderSnoozeRequest(rev, minutes)) }
+
 }
 class MockRepository(private val seedOnLogin: Boolean = true, private val organizeAfterReads: Int = 3) : Repository {
     private data class Change(val seq: Long, val kind: String, val id: String)
@@ -393,6 +397,29 @@ class MockRepository(private val seedOnLogin: Boolean = true, private val organi
         actions[action.id] = action
         actionChanges[action.id] = nextSeq()
         return ReminderCompleteResponse(updated, action, workItemId)
+    }
+    override suspend fun snoozeReminder(id: String, rev: Int, minutes: Int): ReminderSnoozeResponse {
+        requireSession()
+        require(minutes in 1..1440) { "贪睡分钟须为 1–1440" }
+        val current = reminders[id] ?: throw IllegalArgumentException("提醒不存在")
+        require(current.rev == rev) { "版本冲突，请刷新后重试" }
+        require(current.status == "suggested" || current.status == "scheduled") { "提醒当前不可贪睡" }
+        val now = Instant.now()
+        val updated = current.copy(status = "scheduled", fire_at = now.plusSeconds(minutes * 60L).toString(),
+            rev = current.rev + 1, updated_at = now.toString())
+        reminders[id] = updated
+        reminderChanges[id] = nextSeq()
+        val workItemId = "work-${updated.note_id}"
+        val payload = mapOf<String, Any?>("reminder_id" to id, "note_id" to updated.note_id,
+            "title" to updated.title, "fire_at" to updated.fire_at,
+            "work_item_id" to workItemId, "rev" to updated.rev)
+        val existing = actions.values.firstOrNull { it.reminder_id == id && it.type == "schedule_reminder" }
+        val action = existing?.copy(payload = payload, work_item_id = workItemId)
+            ?: SyncAction("action-${UUID.randomUUID()}", "schedule_reminder", payload, workItemId, id, now.toString())
+        actions[action.id] = action
+        actionChanges[action.id] = nextSeq()
+        deletedActions.remove(action.id)
+        return ReminderSnoozeResponse(updated, action, workItemId)
     }
     override suspend fun confirmReminder(id: String, rev: Int, fireAt: String?, title: String?): ReminderConfirmResponse {
         requireSession()

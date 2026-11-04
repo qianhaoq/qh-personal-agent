@@ -1,4 +1,4 @@
-# S18 · 通知完成/取消快捷操作
+# S19 · 通知贪睡（稍后提醒）
 
 紧凑的 Kotlin / Compose 客户端：登录、时间线、记事创建/编辑/删除、问答、提醒同步、确认/取消/完成；
 确认后的 `schedule_reminder` Channel action 会落到 AlarmManager，响铃时显示系统通知。
@@ -327,3 +327,16 @@ JAR SHA-256：`cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8`
 - 应用标签与页面标题统一为 S18。JVM 单测覆盖操作路由、sync rev 匹配、会话栅栏、失败不跑成功回调及取消传播。
 
 里程碑 / changelog：S18 通知快捷完成/取消；保留 S17 完成及更早历史。
+
+
+## S19 通知贪睡
+
+- 通知在「完成 / 取消」旁新增「10分钟后」；先 sync 获取当前 rev，再调用 `POST /v1/reminders/{id}/snooze`（`rev` 必填，`minutes` 默认 10，范围 1–1440）。
+- suggested/scheduled → scheduled，fire_at 为锁内 UTC now + minutes，rev+1；经 Subscription → 原 WorkItem → Channel 更新原 `schedule_reminder` payload 与 change_seq，不产生新 action 类型或 schedule 墓碑。
+- Trigger dedupe 为 `reminder_snooze:{id}:r{rev}:m{minutes}`：同一请求重放返回 200 / duplicate=true 及当前 reminder/action，不再次改时间；不同 dedupe 的旧 rev 返回 409。Mock 重复旧 rev 返回冲突，用新 rev 可再次贪睡。
+- API 成功后在 sessionGeneration / invalidateAlarms 栅栏内取消旧闹钟、按响应重设闹钟并 dismiss 通知。失败保留闹钟与通知，Toast 提示，异常日志仅含类名。
+- JVM 测试覆盖 Real 请求/响应、Mock 多次贪睡和 action 更新、通知路由与会话栅栏；服务端覆盖同步、重放、rev、状态、归属、参数边界及 PG 并发。
+
+本刀不做：主列表/详情贪睡按钮、rrule 执行、二次确认、FCM/Room/Hilt/Pipecat、改 ASR/TTS 核心、根路径 `GET /`；不部署。
+
+里程碑 / changelog：S19 通知贪睡闭环；保留 S18 及更早历史。

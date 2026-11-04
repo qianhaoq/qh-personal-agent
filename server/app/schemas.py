@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import AfterValidator, BaseModel, Field, field_validator
 
 from app.models import Note, Reminder
-from app.timeutil import to_iso
+from app.timeutil import to_iso, to_iso_z
 
 # asr 元数据序列化后的体积上限
 _MAX_ASR_JSON_BYTES = 4 * 1024
@@ -152,7 +152,7 @@ def reminder_to_dict(r: Reminder) -> dict:
         "id": r.id,
         "note_id": r.note_id,
         "title": r.title,
-        "fire_at": to_iso(r.fire_at),
+        "fire_at": to_iso_z(r.fire_at),
         "rrule": r.rrule,
         "status": r.status,
         "rev": r.rev,
