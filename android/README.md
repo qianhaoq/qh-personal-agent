@@ -1,4 +1,4 @@
-# S25 · 详情页返回文案
+# S26 · 提醒操作钮文案消歧
 
 紧凑的 Kotlin / Compose 客户端：登录、时间线、记事创建/编辑/删除、问答、提醒同步、确认/取消/完成；
 确认后的 `schedule_reminder` Channel action 会落到 AlarmManager，响铃时显示系统通知。
@@ -408,3 +408,15 @@ JAR SHA-256：`cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8`
 本刀不做：通知栏、完成/取消二次确认逻辑、筛选/空状态、API / server / data、FCM/Room/Hilt/Pipecat、根路径 `GET /`；不部署、不合入。
 
 里程碑 / changelog：S25 恢复详情页顶部导航「返回」文案；保留 S24 及更早历史。
+
+
+## S26 提醒操作钮文案消歧
+
+- 提醒主列表与记事详情页关联提醒的操作按钮：「取消」→「取消提醒」、「完成」→「完成提醒」，避免与对话框 dismiss「取消」混淆。
+- 贪睡 /「10分钟后」保持不变；详情页「返回」与「确认并设闹钟」保持不变。
+- 对话框 dismiss、删除确认、提醒二次确认（ReminderActionConfirmDialog）、编辑页、语音与 ConfirmReminderDialog 的「取消」保持不变；提醒二次确认标题与消息不变。
+- 应用标签更新为「随记 S26」，顶部标题更新为「随记 · S26」；仅 Android 文案调整。
+
+本刀不做：筛选/空状态、二次确认逻辑、通知栏 PendingIntent、API / server / data、FCM/Room/Hilt/Pipecat、根路径 `GET /`；不部署、不合入。
+
+里程碑 / changelog：S26 提醒主列表与详情页操作钮文案消歧；保留 S25 及更早历史。
