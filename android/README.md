@@ -1,4 +1,4 @@
-# S32 · 通知栏完成/取消二次确认
+# S33 · 提醒主列表按状态筛选
 
 紧凑的 Kotlin / Compose 客户端：登录、时间线、记事创建/编辑/删除、问答、提醒同步、确认/取消/完成；
 确认后的 `schedule_reminder` Channel action 会落到 AlarmManager，响铃时显示系统通知。
@@ -482,3 +482,13 @@ JAR SHA-256：`cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8`
 
 - S32 修复：确认页保存加密存储中的持久会话 epoch，登录、清会话及退出时更新；进程重建保留同会话确认能力，换会话或未登录则拒绝。进程内协程仍使用 sessionGeneration 栅栏。
 - 提交后保持 busy，禁用确认、取消及返回，直到 onFinished 在主线程关闭当前页面；旋转保留进行中的请求并连接新 Activity，不重复提交。进程被杀后恢复已提交页直接关闭，不重放结果未知的请求。
+
+
+## S33 提醒主列表按状态筛选与空状态
+
+- 提醒标题旁以 Material3 FilterChip 三选一：「待办」「已结束」「全部」。AgentModel 保存 listFilter，默认 ACTIVE（待办），旋转后保留。
+- 待办严格匹配 suggested/scheduled，已结束严格匹配 done/cancelled，全部不过滤；未知状态仅在全部中展示。筛选保持原始顺序，ViewModel 仍按 fire_at 保存完整同步列表，记事详情「关联提醒」使用完整列表。
+- 完全空或其它空桶显示「暂无提醒。」；待办为空且存在已结束时显示「暂无待办提醒。可切换到「已结束」或「全部」查看。」；已结束为空且存在待办时显示「暂无已结束提醒。可切换到「待办」或「全部」查看。」。仅可见列表为空且非 busy 时展示。
+- ReminderListFilterTest 覆盖三态严格匹配、顺序保持和空状态文案；AppRepositoriesTest 继续交叉验证既有通知动作回归。
+- 应用标签「随记 S33」，顶栏「随记 · S33」。
+- S33 不做：rrule、根路径 GET /、FCM/Room/Hilt/Pipecat、server/data/Mock/API、通知栏、二次确认、贪睡分钟调整、S31 竞态逻辑、部署、合入或 squash routine。

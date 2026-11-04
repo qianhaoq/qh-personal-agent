@@ -2,9 +2,9 @@
 
 个人语音记事与语音助手。说一句话，自动整理成笔记 / 待办 / 提醒，并能用语音问答自己的记忆。
 
-当前里程碑：**S32**，通知栏「完成提醒」「取消提醒」先展示与应用内一致的二次确认，确认后再请求；取消/返回不改变服务端并保留通知。「贪睡10分钟」仍一键执行，成功收尾复用 S31 helper。应用标签「随记 S32」、顶部标题「随记 · S32」。详见 [Android README](android/README.md)。
+当前里程碑：**S33**，提醒主列表以「待办」「已结束」「全部」三枚 FilterChip 按状态筛选，默认待办；空列表提示可切换查看的状态。筛选仅影响主列表展示，完整同步列表与记事详情关联提醒保持原样。应用标签「随记 S33」、顶部标题「随记 · S33」。详见 [Android README](android/README.md)。
 
-S32 不做：rrule、根路径 `GET /`、FCM/Room/Hilt/Pipecat、server API、贪睡分钟调整、大重构、部署、合入。
+S33 不做：rrule、根路径 `GET /`、FCM/Room/Hilt/Pipecat、server/data/Mock/API、通知栏、二次确认、贪睡分钟调整、S31 竞态逻辑、大重构、部署、合入、squash routine。
 
 ## 仓库结构（monorepo）
 
