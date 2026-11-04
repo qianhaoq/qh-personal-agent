@@ -175,21 +175,21 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
     }
     fun cancelReminder(reminder: ReminderDto) = run {
         repo.cancelReminder(reminder.id, reminder.rev)
-        AppRepositories.invalidateAlarms {
+        AppRepositories.invalidateAlarms(reminder.id) {
             alarms.cancelReminder(reminder.id)
         }
         refresh()
     }
     fun completeReminder(reminder: ReminderDto) = run {
         repo.completeReminder(reminder.id, reminder.rev)
-        AppRepositories.invalidateAlarms {
+        AppRepositories.invalidateAlarms(reminder.id) {
             alarms.cancelReminder(reminder.id)
         }
         refresh()
     }
     fun snoozeReminder(reminder: ReminderDto) = run {
         val response = repo.snoozeReminder(reminder.id, reminder.rev, minutes = 10)
-        AppRepositories.invalidateAlarms {
+        AppRepositories.invalidateAlarms(reminder.id) {
             alarms.cancelReminder(reminder.id)
             alarms.snoozed(response)
         }

@@ -12,6 +12,7 @@ object AppRepositories {
     private val lock = Any()
     private val generation = AtomicLong(0)
     private val alarmGeneration = AtomicLong(0)
+    private val reminderAlarmGenerations = mutableMapOf<String, Long>()
     @Volatile private var real: RealRepository? = null
 
     private val remindersMutatedListeners = CopyOnWriteArrayList<(Long) -> Unit>()
@@ -39,11 +40,30 @@ object AppRepositories {
 
     fun alarmGeneration(): Long = alarmGeneration.get()
 
+    /** Register captures so bulk invalidation also fences previously unseen reminders. */
+    fun alarmGeneration(reminderId: String): Long = synchronized(lock) {
+        reminderAlarmGenerations.getOrPut(reminderId) { 0L }
+    }
+
     /** Invalidate stale sync responses and cancel deleted-note alarms under the consume lock. */
     fun invalidateAlarms(block: () -> Unit) = synchronized(lock) {
         alarmGeneration.incrementAndGet()
+        reminderAlarmGenerations.replaceAll { _, value -> value + 1 }
         block()
     }
+
+    /** A reminder mutation fences bulk sync without dropping other reminders' callbacks. */
+    fun invalidateAlarms(reminderId: String, block: () -> Unit) = synchronized(lock) {
+        reminderAlarmGenerations[reminderId] = (reminderAlarmGenerations[reminderId] ?: 0L) + 1
+        alarmGeneration.incrementAndGet()
+        block()
+    }
+
+    fun consumeIfCurrent(session: Long, reminderId: String, alarms: Long, block: () -> Unit) =
+        synchronized(lock) {
+            if (generation.get() == session &&
+                (reminderAlarmGenerations[reminderId] ?: 0L) == alarms) block()
+        }
 
     fun consumeIfCurrent(session: Long, alarms: Long, block: () -> Unit) = synchronized(lock) {
         if (generation.get() == session && alarmGeneration.get() == alarms) block()
