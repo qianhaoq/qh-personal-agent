@@ -11,6 +11,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.util.Log
 import android.widget.Toast
 import dev.qh.data.ReminderConfirmResponse
 import dev.qh.data.ReminderDto
@@ -25,6 +26,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 
 private const val ALARM_PREFS = "pending_reminder_alarms"
@@ -153,7 +155,9 @@ class ReminderAlarmReceiver : BroadcastReceiver() {
         val notification = Notification.Builder(context, NOTIFICATION_CHANNEL)
             .setSmallIcon(android.R.drawable.ic_dialog_alert).setContentTitle("随记提醒")
             .setContentText(title).setStyle(Notification.BigTextStyle().bigText(title))
-            .setContentIntent(contentIntent).setAutoCancel(true).build()
+            .setContentIntent(contentIntent).setAutoCancel(true)
+            .addAction(notificationAction(context, reminderId, ReminderNotificationAction.COMPLETE))
+            .addAction(notificationAction(context, reminderId, ReminderNotificationAction.CANCEL)).build()
         notifications.notify(reminderId.hashCode(), notification)
     }
 }
@@ -184,5 +188,65 @@ class ReminderBootReceiver : BroadcastReceiver() {
                 // A boot without connectivity must not discard alarms already persisted on device.
             }
         }
+    }
+}
+
+private fun notificationAction(context: Context, id: String, action: ReminderNotificationAction): Notification.Action {
+    val intent = Intent(context, ReminderNotificationActionReceiver::class.java).setAction(action.intentAction)
+        .setData(Uri.Builder().scheme("qh-agent").authority("reminder-action")
+            .appendPath(id).appendPath(action.name).build())
+        .putExtra(EXTRA_REMINDER_ID, id)
+    // Distinct request codes so complete/cancel PendingIntents never collide.
+    val requestCode = 31 * id.hashCode() + action.ordinal
+    val pending = PendingIntent.getBroadcast(context, requestCode, intent,
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+    return Notification.Action.Builder(null, action.label, pending).build()
+}
+
+class ReminderNotificationActionReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        val action = ReminderNotificationAction.fromIntentAction(intent.action) ?: return
+        val id = intent.getStringExtra(EXTRA_REMINDER_ID)?.takeIf { it.isNotBlank() } ?: return
+        val appContext = context.applicationContext
+        if (SecureTokens(appContext).read() == null) return
+        val generation = AppRepositories.sessionGeneration()
+        val repository = AppRepositories.real(appContext)
+        if (!repository.signedIn) return
+        val pending = goAsync()
+        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            try {
+                val completed = withTimeoutOrNull(8_000L) {
+                    performReminderNotificationAction(action, id, repository,
+                        sessionCurrent = {
+                            repository.signedIn && generation == AppRepositories.sessionGeneration()
+                        }, onSuccess = {
+                            // Match MainActivity: only clear local alarm after a successful mutation.
+                            AppRepositories.ifCurrent(generation) {
+                                if (repository.signedIn) {
+                                    AppRepositories.invalidateAlarms {
+                                        ReminderAlarmScheduler(appContext).cancelReminder(id)
+                                    }
+                                    appContext.getSystemService(NotificationManager::class.java)
+                                        .cancel(id.hashCode())
+                                }
+                            }
+                        })
+                    true
+                }
+                if (completed == null) showFailure(appContext, "操作超时，请重试")
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                // Never log exception messages: they may contain server/user data.
+                Log.w("ReminderAction", "Notification action failed: ${error.javaClass.simpleName}")
+                showFailure(appContext, "操作失败，请重试或打开应用同步")
+            } finally {
+                pending.finish()
+            }
+        }
+    }
+    private suspend fun showFailure(context: Context, message: String) {
+        Log.w("ReminderAction", message)
+        withContext(Dispatchers.Main) { Toast.makeText(context, message, Toast.LENGTH_LONG).show() }
     }
 }

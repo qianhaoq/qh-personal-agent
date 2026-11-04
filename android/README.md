@@ -1,4 +1,4 @@
-# S17 · 提醒完成
+# S18 · 通知完成/取消快捷操作
 
 紧凑的 Kotlin / Compose 客户端：登录、时间线、记事创建/编辑/删除、问答、提醒同步、确认/取消/完成；
 确认后的 `schedule_reminder` Channel action 会落到 AlarmManager，响铃时显示系统通知。
@@ -316,3 +316,14 @@ JAR SHA-256：`cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8`
 - 完成后经 `AppRepositories.invalidateAlarms { alarms.cancelReminder(id) }` 栅栏取消本地闹钟，再刷新；sync 消费 `complete_reminder` 同样取消闹钟。
 
 里程碑 / changelog：S17 补齐提醒完成闭环；保留 S16 取消及更早历史。
+
+## S18 通知操作
+
+- 提醒响铃通知提供「完成」「取消」，使用独立、不导出的 `ReminderNotificationActionReceiver`；
+  不同提醒和操作通过 action + URI + 独立 requestCode 区分 PendingIntent。
+- 会话有效时先 sync 取当前 rev，再调用既有 complete/cancel API；同步前后与成功回调检查登录状态与 sessionGeneration。
+- 仅 API 成功后经 `AppRepositories.invalidateAlarms { alarms.cancelReminder(id) }` 清除本地闹钟并 dismiss 该通知（对齐主界面完成/取消）。
+- 网络失败、版本冲突或约 8 秒超时只记安全错误类型并 Toast，保留通知供重试；失败不误清闹钟。广播 `goAsync` + IO 协程，结束时 `finish`。
+- 应用标签与页面标题统一为 S18。JVM 单测覆盖操作路由、sync rev 匹配、会话栅栏、失败不跑成功回调及取消传播。
+
+里程碑 / changelog：S18 通知快捷完成/取消；保留 S17 完成及更早历史。
