@@ -1,4 +1,4 @@
-# S28 · 通知栏贪睡文案
+# S29 · 通知栏完成/取消文案
 
 紧凑的 Kotlin / Compose 客户端：登录、时间线、记事创建/编辑/删除、问答、提醒同步、确认/取消/完成；
 确认后的 `schedule_reminder` Channel action 会落到 AlarmManager，响铃时显示系统通知。
@@ -442,3 +442,14 @@ JAR SHA-256：`cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8`
 本刀不做：不改应用内贪睡按钮、取消/完成逻辑、对话框 dismiss「取消」、二次确认逻辑、通知栏 intentAction / PendingIntent、API / server / data、snooze 分钟、FCM/Room/Hilt/Pipecat、筛选/空状态、根路径 `GET /`、rrule；不部署、不合入。
 
 里程碑 / changelog：S28 通知栏贪睡文案明确为「贪睡10分钟」，应用标签与顶部标题升至 S28；保留 S27 及更早历史。
+
+
+## S29 通知栏完成/取消文案
+
+- 通知栏 `ReminderNotificationAction.COMPLETE`：「完成」→「完成提醒」；`CANCEL`：「取消」→「取消提醒」；`intentAction`、PendingIntent、SNOOZE「贪睡10分钟」保持不变，仅改文案、行为不变。
+- 应用标签更新为「随记 S29」，顶部标题更新为「随记 · S29」。
+- 应用内主列表与详情页完成/取消按钮已是「完成提醒」「取消提醒」，保持不变。
+
+本刀不做：不改 intentAction / PendingIntent / 动作分发 / minutes / snooze 文案；不改应用内按钮、二次确认逻辑、对话框 dismiss「取消」；不改 API / server / data、FCM/Room/Hilt/Pipecat、筛选/空状态、根路径 `GET /`、rrule；不部署、不合入。
+
+里程碑 / changelog：S29 通知栏完成/取消文案对齐应用内「完成提醒」「取消提醒」，应用标签与顶部标题升至 S29；保留 S28 及更早历史。
