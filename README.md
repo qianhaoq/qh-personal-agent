@@ -2,9 +2,9 @@
 
 个人语音记事与语音助手。说一句话，自动整理成笔记 / 待办 / 提醒，并能用语音问答自己的记忆。
 
-当前 Android 里程碑：**S22**，提醒主列表默认只显示进行中提醒（suggested / scheduled），开启「显示已结束」可查看全部状态。开关保存在 ViewModel，旋转后保留；记事详情「关联提醒」继续显示完整历史。详见 [Android README](android/README.md)。
+当前 Android 里程碑：**S23**，提醒主列表在隐藏已结束提醒后为空时显示「暂无进行中提醒。可开启「显示已结束」查看。」；没有任何提醒时仍显示「暂无提醒。」。仅调整空状态文案与纯函数，保留 S22 筛选规则和开关行为。详见 [Android README](android/README.md)。
 
-S22 不做：FCM/Room/Hilt/Pipecat、rrule、根路径 `GET /`、二次确认、data / Mock / API / server 改动、ASR/TTS 改动、routine；不改通知按钮集合或 API 语义，不部署、不合入。
+S23 不做：FCM/Room/Hilt/Pipecat、rrule、根路径 `GET /`、二次确认、data / Mock / API / server 改动、ASR/TTS 改动、routine；不改筛选规则、FilterChip、通知按钮集合或 API 语义，不部署、不合入。
 
 ## 仓库结构（monorepo）
 
