@@ -44,6 +44,9 @@ data class ReminderCancelResponse(val reminder: ReminderDto, val action: SyncAct
 data class ReminderCompleteRequest(val rev: Int)
 data class ReminderCompleteResponse(val reminder: ReminderDto, val action: SyncAction? = null,
     val work_item_id: String? = null, val duplicate: Boolean = false)
+data class ReminderSnoozeRequest(val rev: Int, val minutes: Int = 10)
+data class ReminderSnoozeResponse(val reminder: ReminderDto, val action: SyncAction? = null,
+    val work_item_id: String? = null, val duplicate: Boolean = false)
 data class ApiError(val code: String, val message: String)
 data class ErrorEnvelope(val error: ApiError?)
 
@@ -70,4 +73,6 @@ interface AgentApi {
         @Path("id") id: String, @Body body: ReminderCancelRequest): ReminderCancelResponse
     @POST("v1/reminders/{id}/complete") suspend fun completeReminder(@Header("Authorization") bearer: String,
         @Path("id") id: String, @Body body: ReminderCompleteRequest): ReminderCompleteResponse
+    @POST("v1/reminders/{id}/snooze") suspend fun snoozeReminder(@Header("Authorization") bearer: String,
+        @Path("id") id: String, @Body body: ReminderSnoozeRequest): ReminderSnoozeResponse
 }

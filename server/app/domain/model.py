@@ -20,6 +20,7 @@ TRIGGER_ASK_REQUESTED = "ask_requested"
 TRIGGER_USER_CONFIRMED_REMINDER = "user_confirmed_reminder"
 TRIGGER_USER_CANCELLED_REMINDER = "user_cancelled_reminder"
 TRIGGER_USER_COMPLETED_REMINDER = "user_completed_reminder"
+TRIGGER_USER_SNOOZED_REMINDER = "user_snoozed_reminder"
 
 # WorkItem kind（授权工作单元类型）
 WORK_ITEM_ORGANIZE_NOTE = "organize_note"

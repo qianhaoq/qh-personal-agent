@@ -1,7 +1,7 @@
 """Subscription + Channel: propose → subscribe → confirm → schedule action."""
 import json
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import pytest
 from sqlalchemy import func, select
@@ -11,7 +11,7 @@ from app.db import get_sessionmaker
 from app.domain.engine import Engine
 from app.domain.model import CHANNEL_ACTION_SCHEDULE_REMINDER
 from app.models import Reminder, SaChannelAction, SaSubscription, SaTrigger, SaWorkItem
-from app.timeutil import to_iso, utcnow
+from app.timeutil import to_iso, to_iso_z, utcnow
 from app.workers import OrganizeNoteWorker
 from tests.conftest import auth_headers
 
@@ -153,7 +153,7 @@ async def test_confirm_future_override_json_round_trip(client, user):
                              headers=auth_headers(user), json={"rev": rev, "fire_at": fire_at})
     assert resp.status_code == 200, resp.text
     assert resp.json()["reminder"]["status"] == "scheduled"
-    assert resp.json()["action"]["payload"]["fire_at"] == fire_at
+    assert resp.json()["action"]["payload"]["fire_at"] == to_iso_z(datetime.fromisoformat(fire_at))
     async with get_sessionmaker()() as session:
         trigger = (await session.scalars(select(SaTrigger).where(
             SaTrigger.kind == "user_confirmed_reminder",
@@ -471,3 +471,132 @@ async def test_complete_requires_bounded_rev(client, user, body):
     response = await client.post(f"/v1/reminders/{reminder_id}/complete",
                                  headers=auth_headers(user), json=body)
     assert response.status_code == 422
+
+
+@pytest.mark.parametrize("status", ["done", "cancelled", "unknown"])
+async def test_snooze_unavailable_status_and_stale_rev(client, user, status):
+    _, reminder_id, rev = await _suggested(client, user)
+    async with get_sessionmaker()() as session, session.begin():
+        reminder = await session.get(Reminder, reminder_id)
+        reminder.status = status
+    url = f"/v1/reminders/{reminder_id}/snooze"
+    stale = await client.post(url, headers=auth_headers(user), json={"rev": rev + 1})
+    assert stale.status_code == 409
+    assert stale.json()["error"]["message"] == "版本冲突，请拉取最新版本后重试"
+    response = await client.post(url, headers=auth_headers(user), json={"rev": rev})
+    assert response.status_code == 409
+    async with get_sessionmaker()() as session:
+        reminder = await session.get(Reminder, reminder_id)
+        assert reminder.rev == rev and reminder.status == status
+        assert await session.scalar(select(func.count()).select_from(SaChannelAction)) == 0
+
+
+@pytest.mark.parametrize("kind", ["missing", "deleted", "other_user"])
+async def test_snooze_not_found_or_not_owned(client, user, kind):
+    note_id, reminder_id, rev = await _suggested(client, user)
+    if kind == "missing":
+        reminder_id = new_id("rmd")
+    elif kind == "deleted":
+        assert (await client.delete(f"/v1/notes/{note_id}", headers=auth_headers(user))).status_code == 204
+    else:
+        from tests.conftest import make_invite
+        invite = await make_invite(get_sessionmaker())
+        other = await client.post("/v1/auth/login", json={"invite_code": invite, "device_id": "other"})
+        user = other.json()
+    response = await client.post(f"/v1/reminders/{reminder_id}/snooze",
+                                 headers=auth_headers(user), json={"rev": rev})
+    assert response.status_code == 404
+
+
+@pytest.mark.parametrize("body", [{}, {"rev": 0}, {"rev": 2_147_483_648}, {"rev": 1, "minutes": 0},
+                                  {"rev": 1, "minutes": 1441}])
+async def test_snooze_requires_bounded_rev(client, user, body):
+    _, reminder_id, _ = await _suggested(client, user)
+    response = await client.post(f"/v1/reminders/{reminder_id}/snooze",
+                                 headers=auth_headers(user), json=body)
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize("scheduled", [False, True])
+@pytest.mark.parametrize("minutes", [None, 1, 1440])
+async def test_snooze_updates_schedule_and_intake_duplicate(client, user, scheduled, minutes):
+    _, reminder_id, rev = await _suggested(client, user)
+    headers = auth_headers(user)
+    original_action = None
+    if scheduled:
+        confirmed = await client.post(f"/v1/reminders/{reminder_id}/confirm",
+                                      headers=headers, json={"rev": rev})
+        assert confirmed.status_code == 200
+        rev = confirmed.json()["reminder"]["rev"]
+        original_action = confirmed.json()["action"]["id"]
+    before = (await client.get("/v1/sync", headers=headers)).json()
+    body = {"rev": rev}
+    if minutes is not None:
+        body["minutes"] = minutes
+    url = f"/v1/reminders/{reminder_id}/snooze"
+    started = utcnow()
+    from tests.test_sql_order import _first_seq_write, _SqlTrace
+    with _SqlTrace(("reminders", "sa_channel_actions", "sequences")) as trace:
+        response = await client.post(url, headers=headers, json=body)
+    seq_write = _first_seq_write(trace)
+    assert trace.indices("reminders", "UPDATE")[0] < trace.indices("sa_channel_actions")[0] < seq_write
+    assert response.status_code == 200, response.text
+    result = response.json()
+    fire = datetime.fromisoformat(result["reminder"]["fire_at"])
+    assert started + timedelta(minutes=minutes or 10) <= fire <= utcnow() + timedelta(minutes=minutes or 10)
+    assert result["reminder"]["fire_at"].endswith("Z")
+    assert result["reminder"]["status"] == "scheduled"
+    assert result["reminder"]["rev"] == rev + 1
+    assert result["duplicate"] is False
+    action = result["action"]
+    assert action["type"] == "schedule_reminder"
+    assert action["payload"]["fire_at"] == result["reminder"]["fire_at"]
+    assert action["payload"]["rev"] == rev + 1
+    assert action["work_item_id"] == result["work_item_id"]
+    async with get_sessionmaker()() as session:
+        trigger = (await session.scalars(select(SaTrigger).where(
+            SaTrigger.dedupe_key == f"reminder_snooze:{reminder_id}:r{rev}:m{minutes or 10}",
+        ))).one()
+        assert trigger.kind == "user_snoozed_reminder"
+        assert trigger.decision["reason"] == "subscription fan-out reminder snooze"
+        assert await session.scalar(select(func.count()).select_from(SaWorkItem).where(
+            SaWorkItem.note_id == result["reminder"]["note_id"],
+        )) == 1
+    if original_action:
+        assert action["id"] == original_action
+    delta = (await client.get("/v1/sync", headers=headers, params={"since": before["cursor"]})).json()
+    assert next(a for a in delta["actions"] if a["id"] == action["id"]) == action
+    assert next(r for r in delta["reminders"] if r["id"] == reminder_id) == result["reminder"]
+    assert delta["deleted"]["actions"] == []
+    retry = await client.post(url, headers=headers, json=body)
+    assert retry.status_code == 200
+    assert retry.json() == dict(result, duplicate=True)
+    unchanged = (await client.get("/v1/sync", headers=headers, params={"since": delta["cursor"]})).json()
+    assert unchanged["actions"] == unchanged["reminders"] == []
+    stale = await client.post(url, headers=headers, json={"rev": rev, "minutes": 2})
+    assert stale.status_code == 409
+    assert stale.json()["error"]["message"] == "版本冲突，请拉取最新版本后重试"
+    again = await client.post(url, headers=headers, json={"rev": rev + 1, "minutes": 3})
+    assert again.status_code == 200
+    assert again.json()["reminder"]["rev"] == rev + 2
+    assert again.json()["action"]["id"] == action["id"]
+    # Replay returns current state/action even after another successful snooze.
+    replay = await client.post(url, headers=headers, json=body)
+    assert replay.status_code == 200
+    assert replay.json() == dict(again.json(), duplicate=True)
+
+
+async def test_snooze_duplicate_after_complete_returns_current_reminder(client, user):
+    _, reminder_id, rev = await _suggested(client, user)
+    headers = auth_headers(user)
+    url = f"/v1/reminders/{reminder_id}/snooze"
+    first = await client.post(url, headers=headers, json={"rev": rev})
+    assert first.status_code == 200
+    done = await client.post(f"/v1/reminders/{reminder_id}/complete", headers=headers,
+                            json={"rev": first.json()["reminder"]["rev"]})
+    assert done.status_code == 200
+    replay = await client.post(url, headers=headers, json={"rev": rev})
+    assert replay.status_code == 200
+    assert replay.json()["duplicate"] is True
+    assert replay.json()["reminder"] == done.json()["reminder"]
+    assert replay.json()["action"] is None

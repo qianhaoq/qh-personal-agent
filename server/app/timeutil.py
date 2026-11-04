@@ -39,3 +39,9 @@ def to_utc(dt: datetime | None, tzname: str) -> datetime | None:
 
 def to_iso(dt: datetime | None) -> str | None:
     return as_utc(dt).isoformat() if dt is not None else None
+
+
+def to_iso_z(dt: datetime | None) -> str | None:
+    """Canonical UTC wire time for reminder scheduling (API and sync agree)."""
+    value = to_iso(dt)
+    return value.removesuffix("+00:00") + "Z" if value is not None else None

@@ -2,7 +2,9 @@
 
 个人语音记事与语音助手。说一句话，自动整理成笔记 / 待办 / 提醒，并能用语音问答自己的记忆。
 
-当前 Android 里程碑：**S18**，提醒响铃通知支持「完成 / 取消」快捷操作；成功后清除闹钟并移除通知，失败保留通知供重试。详见 [Android README](android/README.md)。
+当前 Android 里程碑：**S19**，提醒响铃通知支持「完成 / 取消 / 10分钟后」快捷操作；贪睡成功后重设本地闹钟并移除通知，失败保留通知供重试。详见 [Android README](android/README.md)。
+
+S19 不做：主列表/详情贪睡按钮、rrule 执行、二次确认、FCM/Room/Hilt/Pipecat、ASR/TTS 核心改动、根路径 `GET /`；不部署。
 
 ## 仓库结构（monorepo）
 
