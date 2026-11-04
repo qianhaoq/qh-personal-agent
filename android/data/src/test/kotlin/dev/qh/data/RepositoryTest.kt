@@ -20,14 +20,15 @@ class RepositoryTest {
         assertFalse(fire.isAfter(java.time.Instant.now().plusSeconds(600)))
         assertEquals("scheduled", first.reminder.status)
         assertEquals(seeded.rev + 1, first.reminder.rev)
-        assertEquals("schedule_reminder", first.action!!.type)
-        assertEquals(first.reminder.fire_at, first.action.payload["fire_at"])
+        val firstAction = first.action!!
+        assertEquals("schedule_reminder", firstAction.type)
+        assertEquals(first.reminder.fire_at, firstAction.payload["fire_at"])
         val before = repo.sync()
         try { repo.snoozeReminder(seeded.id, seeded.rev); fail("Expected stale revision") }
         catch (_: IllegalArgumentException) { }
         assertEquals(before, repo.sync())
         val again = repo.snoozeReminder(seeded.id, first.reminder.rev, 20)
-        assertEquals(first.action.id, again.action!!.id)
+        assertEquals(firstAction.id, again.action!!.id)
         assertEquals(first.reminder.rev + 1, again.reminder.rev)
         assertNotEquals(first.reminder.fire_at, again.reminder.fire_at)
         val delta = repo.sync(before.cursor)
@@ -75,8 +76,9 @@ class RepositoryTest {
             responses.add(200 to """{"reminder":{"id":"r1","title":"吃药","status":"scheduled","rev":4,"fire_at":"2099-01-01T00:10:00Z"},"action":{"id":"a1","type":"schedule_reminder","reminder_id":"r1","payload":{"rev":4,"fire_at":"2099-01-01T00:10:00Z"}},"work_item_id":"w1","duplicate":$duplicate}""")
             val result = repo.snoozeReminder("r1", 3)
             assertEquals(duplicate, result.duplicate)
-            assertEquals("schedule_reminder", result.action!!.type)
-            assertEquals(result.reminder.fire_at, result.action.payload["fire_at"])
+            val resultAction = result.action!!
+            assertEquals("schedule_reminder", resultAction.type)
+            assertEquals(result.reminder.fire_at, resultAction.payload["fire_at"])
             assertEquals("w1", result.work_item_id)
             val request = requests.last()
             assertEquals("POST", request.method)
