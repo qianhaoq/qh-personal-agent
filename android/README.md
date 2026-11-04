@@ -1,4 +1,4 @@
-# S26 · 提醒操作钮文案消歧
+# S27 · 贪睡按钮文案
 
 紧凑的 Kotlin / Compose 客户端：登录、时间线、记事创建/编辑/删除、问答、提醒同步、确认/取消/完成；
 确认后的 `schedule_reminder` Channel action 会落到 AlarmManager，响铃时显示系统通知。
@@ -420,3 +420,14 @@ JAR SHA-256：`cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8`
 本刀不做：筛选/空状态、二次确认逻辑、通知栏 PendingIntent、API / server / data、FCM/Room/Hilt/Pipecat、根路径 `GET /`；不部署、不合入。
 
 里程碑 / changelog：S26 提醒主列表与详情页操作钮文案消歧；保留 S25 及更早历史。
+
+
+## S27 贪睡按钮文案
+
+- 提醒主列表与记事详情页关联提醒的贪睡按钮：「10分钟后」→「贪睡10分钟」；仍调用 `model.snoozeReminder`，贪睡分钟数保持 10，仅改文案、行为不变。
+- 应用标签更新为「随记 S27」，顶部标题更新为「随记 · S27」。
+- 通知栏 `ReminderNotificationAction` 仍为「10分钟后」，保持不变。
+
+本刀不做：不改通知栏 PendingIntent、「取消提醒」/「完成提醒」、对话框 dismiss「取消」、二次确认逻辑、snooze 分钟、API / server / data、FCM/Room/Hilt/Pipecat、筛选/空状态、根路径 `GET /`、rrule；不部署、不合入。
+
+里程碑 / changelog：S27 提醒主列表与详情页贪睡按钮文案明确为「贪睡10分钟」；保留 S26 及更早历史。
