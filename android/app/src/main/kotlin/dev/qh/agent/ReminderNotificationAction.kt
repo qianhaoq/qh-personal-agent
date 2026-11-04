@@ -4,8 +4,8 @@ import dev.qh.data.Repository
 import dev.qh.data.ReminderSnoozeResponse
 
 internal enum class ReminderNotificationAction(val intentAction: String, val label: String) {
-    COMPLETE("dev.qh.agent.action.REMINDER_COMPLETE", "完成"),
-    CANCEL("dev.qh.agent.action.REMINDER_CANCEL", "取消"),
+    COMPLETE("dev.qh.agent.action.REMINDER_COMPLETE", "完成提醒"),
+    CANCEL("dev.qh.agent.action.REMINDER_CANCEL", "取消提醒"),
     SNOOZE("dev.qh.agent.action.REMINDER_SNOOZE", "贪睡10分钟");
 
     companion object {
