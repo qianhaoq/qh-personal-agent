@@ -1,4 +1,4 @@
-# Android S14 · 提醒 status 中文徽章
+# Android S15 · 应用标签与 README 文案对齐
 
 紧凑的 Kotlin / Compose 客户端：登录、时间线、记事创建/编辑/删除、问答、提醒同步与确认；
 确认后的 `schedule_reminder` Channel action 会落到 AlarmManager，响铃时显示系统通知。
@@ -50,6 +50,14 @@ api.useMock=false
 默认地址为生产占位 `https://agent.pinhaoyun.com/`；debug 默认 mock 不访问该地址。
 切回 mock：删除 `api.useMock=false` 或改为 `api.useMock=true`。
 `local.properties` 在构建时读取，改动后需重新构建安装。
+
+## S15 应用标签与 README 文案对齐
+
+本刀仅做文案对齐：应用标签、UI 标题与 README 验证节中的旧版本残留统一更新为 S15，
+与 README 主标题一致。历史章节与模块列表中的版本号保留，继续表示对应的历史能力。
+
+不做：ASR、AlarmManager/boot、confirm 协议、server、网络、FCM、Room、Hilt；
+不新增依赖或权限；不改业务逻辑。
 
 ## S14 提醒 status 中文徽章
 
@@ -280,12 +288,11 @@ JAR SHA-256：`cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8`
 ## 本次环境验证
 
 使用 `/home/box/.local/jdk/jdk-17.0.16+8` 与 `/home/box/.local/android-sdk`
-（`GRADLE_USER_HOME=/tmp/s13-gradle`）。
+（`GRADLE_USER_HOME=/tmp/s15-gradle`）。
 `./gradlew --no-daemon :data:test :app:testDebugUnitTest :app:assembleDebug`：`BUILD SUCCESSFUL`。
 `:data` RepositoryTest：**26** + OrganizePollTest：**9**（共 35），0 failures / 0 errors / 0 skipped；
-`:app` ConfirmOverrideTest：**8** + DisplayTimeTest：**6** + AnswerTtsTest：**7** + AsrStateTest：**6** + VoiceQuestionTest：**2** + EditBehaviorTest：**5** + ReminderNoteLinkTest：**4** + AppRepositoriesTest：**2**（共 40），0 failures / 0 errors / 0 skipped；
+`:app` ConfirmOverrideTest：**8** + DisplayTimeTest：**6** + AnswerTtsTest：**7** + AsrStateTest：**6** + VoiceQuestionTest：**2** + EditBehaviorTest：**5** + ReminderNoteLinkTest：**4** + AppRepositoriesTest：**2** + ReminderStatusTest：**3**（共 43），0 failures / 0 errors / 0 skipped；
 `:core-security` unit tests：`NO-SOURCE`。
 `python3 scripts/check-invariants.py`：`0 error(s), 0 warning(s)`。
-应用标签与标题更新为 S13；confirm 草稿迁入 `AgentModel`，旋转后对话框与草稿可保留。
-未运行模拟器/真机或连接实际服务的端到端测试；
-确认对话框旋转保留与闹钟触发仍需真机验收。
+应用标签与标题更新为 S15；README 主标题与验证节文案对齐；历史章节与模块列表能力名保留。
+未运行模拟器/真机或连接实际服务的端到端测试。
