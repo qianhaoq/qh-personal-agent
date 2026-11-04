@@ -1,4 +1,4 @@
-# Android S13 · confirm 对话框草稿进 ViewModel
+# Android S14 · 提醒 status 中文徽章
 
 紧凑的 Kotlin / Compose 客户端：登录、时间线、记事创建/编辑/删除、问答、提醒同步与确认；
 确认后的 `schedule_reminder` Channel action 会落到 AlarmManager，响铃时显示系统通知。
@@ -50,6 +50,18 @@ api.useMock=false
 默认地址为生产占位 `https://agent.pinhaoyun.com/`；debug 默认 mock 不访问该地址。
 切回 mock：删除 `api.useMock=false` 或改为 `api.useMock=true`。
 `local.properties` 在构建时读取，改动后需重新构建安装。
+
+## S14 提醒 status 中文徽章
+
+提醒主列表与记事详情「关联提醒」在标题下方共用 Material3 Surface 徽章：
+suggested →「待确认」（tertiaryContainer）、scheduled →「已排程」（primaryContainer）、
+done →「已完成」（surfaceVariant）、cancelled →「已取消」（errorContainer）。
+未知状态使用 surfaceVariant，文案保留 trim 后的原值，null / 空白兜底「未知」。
+颜色均搭配对应的内容文字色；状态同时以文字表达。
+`ReminderStatus.kt` 提供可测纯函数，`ReminderStatusTest.kt` 覆盖已知、未知与空值映射。
+
+不做：ASR、AlarmManager/boot、confirm 协议、server、网络、FCM、Room、Hilt；
+不新增依赖或权限。保留原始 status 与提醒操作逻辑。
 
 ## S13 confirm 对话框草稿进 ViewModel
 
