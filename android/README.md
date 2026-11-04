@@ -1,4 +1,4 @@
-# S33 · 提醒主列表按状态筛选
+# S34 · 未知状态空桶提示切换到「全部」
 
 紧凑的 Kotlin / Compose 客户端：登录、时间线、记事创建/编辑/删除、问答、提醒同步、确认/取消/完成；
 确认后的 `schedule_reminder` Channel action 会落到 AlarmManager，响铃时显示系统通知。
@@ -492,3 +492,12 @@ JAR SHA-256：`cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8`
 - ReminderListFilterTest 覆盖三态严格匹配、顺序保持和空状态文案；AppRepositoriesTest 继续交叉验证既有通知动作回归。
 - 应用标签「随记 S33」，顶栏「随记 · S33」。
 - S33 不做：rrule、根路径 GET /、FCM/Room/Hilt/Pipecat、server/data/Mock/API、通知栏、二次确认、贪睡分钟调整、S31 竞态逻辑、部署、合入或 squash routine。
+
+
+## S34 未知状态空桶提示切换到「全部」
+
+- 完整同步列表仅有未知/异常状态时，待办空桶显示「暂无待办提醒。可切换到「全部」查看。」；已结束空桶显示「暂无已结束提醒。可切换到「全部」查看。」。
+- 对面已知桶有内容时，保留 S33 的切换提示；真正全空、ALL 空或可见桶非空时，纯函数仍回落「暂无提醒。」。
+- ReminderListFilterTest 更新未知状态提示断言，保留已知桶提示与可见桶防御回落覆盖；筛选规则与记事详情使用完整同步列表的行为保持原样。
+- 应用标签「随记 S34」，顶栏「随记 · S34」。
+- S34 不做：rrule、根路径 `GET /`、FCM/Room/Hilt/Pipecat、server/data/Mock/API、通知栏、二次确认、贪睡分钟调整、S31 竞态逻辑、大重构、部署、合入、squash routine。
