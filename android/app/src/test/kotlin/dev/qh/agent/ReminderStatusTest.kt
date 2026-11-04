@@ -4,6 +4,14 @@ import org.junit.Assert.assertEquals
 import org.junit.Test
 
 class ReminderStatusTest {
+    @Test fun confirmAlarmRequiresExactSuggestedStatus() {
+        assertEquals(true, reminderCanConfirmAlarm("suggested"))
+        listOf(null, "", " ", "\t\r\n", "scheduled", "done", "cancelled", "unknown",
+            "SUGGESTED", "Suggested", " suggested", "suggested ").forEach {
+            assertEquals("status=$it", false, reminderCanConfirmAlarm(it))
+        }
+    }
+
     @Test fun snoozeRequiresAnActionableStatus() {
         listOf("suggested", "scheduled").forEach {
             assertEquals(true, reminderCanSnooze(it))

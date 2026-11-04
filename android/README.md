@@ -1,4 +1,4 @@
-# S37 · 通知栏主标题对齐提醒标题
+# S38 · 详情关联提醒补确认并设闹钟
 
 紧凑的 Kotlin / Compose 客户端：登录、时间线、记事创建/编辑/删除、问答、提醒同步、确认/取消/完成；
 确认后的 `schedule_reminder` Channel action 会落到 AlarmManager，响铃时显示系统通知。
@@ -528,3 +528,13 @@ JAR SHA-256：`cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8`
 - `ReminderActionConfirmTest` 覆盖标题、副文和缺省/空白回落，保留既有确认与通知操作顺序回归。
 - 应用标签「随记 S37」，顶栏「随记 · S37」；保留 S36 及更早历史。
 - S37 不做：rrule、根路径 `GET /`、FCM/Room/Hilt/Pipecat、server/data/Mock/API、贪睡分钟调整、S31 竞态逻辑、大重构、部署、合入、squash；不改 action 顺序、intentAction、label、PendingIntent、确认正文模板、EXTRA_TITLE 语义、筛选空态。
+
+
+## S38 详情关联提醒补确认并设闹钟
+
+- 记事详情「关联提醒」在贪睡按钮之后，对 suggested 提醒显示「确认并设闹钟」，调用既有 `model.beginConfirm(reminder)`；busy 时禁用，与主列表一致。
+- 确认对话框挂在 `NavHost` 外，详情与时间线共用。
+- 主列表与详情共用 `reminderCanConfirmAlarm`，仅严格相等于 `suggested` 时可确认，不去空白、不忽略大小写；其它按钮顺序与筛选保持原样。
+- `ReminderStatusTest` 覆盖 suggested 可确认，以及 scheduled/done/cancelled/null/空白/大小写变体和带空白状态不可确认。
+- 应用标签「随记 S38」，顶栏「随记 · S38」；保留 S37 及更早历史。
+- S38 不做：rrule、根路径 `GET /`、FCM/Room/Hilt/Pipecat、server/data/Mock/API、贪睡分钟调整、S31 竞态逻辑、通知栏、大重构、部署、合入、squash；不改确认对话框文案、筛选空态、通知标题或顺序。

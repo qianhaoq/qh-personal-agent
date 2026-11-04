@@ -46,3 +46,6 @@ fun reminderStatus(status: String?): String = when (val value = status?.trim().o
 
 /** Match the actionable states accepted by both Mock and Real snooze requests. */
 fun reminderCanSnooze(status: String?): Boolean = status == "suggested" || status == "scheduled"
+
+/** Only an exact suggested status can enter alarm confirmation. */
+fun reminderCanConfirmAlarm(status: String?): Boolean = status == "suggested"

@@ -335,7 +335,7 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
 fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> VoiceAsr, requestMicrophone: () -> Unit, cancelVoice: () -> Unit) {
     Surface(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().imePadding().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("随记 · S37" + if (BuildConfig.USE_MOCK_API) " / 本地演示" else " / 服务器", style = MaterialTheme.typography.headlineSmall)
+            Text("随记 · S38" + if (BuildConfig.USE_MOCK_API) " / 本地演示" else " / 服务器", style = MaterialTheme.typography.headlineSmall)
             if (model.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
             model.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             if (!model.signedIn) {
@@ -349,6 +349,15 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     TextButton({ cancelVoice(); nav.navigate("timeline") { popUpTo("timeline") { inclusive = true } } }, enabled = !model.busy) { Text("时间线") }
                     TextButton({ cancelVoice(); model.logout() }, enabled = !model.busy) { Text("退出") }
+                }
+                model.confirming?.let { reminder ->
+                    ConfirmReminderDialog(reminder, model.busy,
+                        title = model.confirmTitle, fireAt = model.confirmFireAt,
+                        submitError = model.error,
+                        onTitleChange = model::updateConfirmTitle,
+                        onFireAtChange = model::updateConfirmFireAt,
+                        onDismiss = model::cancelConfirm,
+                        onConfirm = { overrides -> model.confirmReminder(reminder, overrides) })
                 }
                 NavHost(nav, startDestination = "timeline", modifier = Modifier.weight(1f)) {
                     composable("timeline") {
@@ -365,15 +374,6 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                                 })
                         }
                         val visibleReminders = filterRemindersForList(model.reminders, model.listFilter)
-                        model.confirming?.let { reminder ->
-                            ConfirmReminderDialog(reminder, model.busy,
-                                title = model.confirmTitle, fireAt = model.confirmFireAt,
-                                submitError = model.error,
-                                onTitleChange = model::updateConfirmTitle,
-                                onFireAtChange = model::updateConfirmFireAt,
-                                onDismiss = model::cancelConfirm,
-                                onConfirm = { overrides -> model.confirmReminder(reminder, overrides) })
-                        }
                         var deleting by remember { mutableStateOf<Note?>(null) }
                         deleting?.let { note ->
                             AlertDialog(onDismissRequest = { if (!model.busy) deleting = null },
@@ -426,7 +426,7 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                                                 TextButton({ model.snoozeReminder(reminder) },
                                                     enabled = !model.busy) { Text("贪睡10分钟") }
                                             }
-                                            if (reminder.status == "suggested") {
+                                            if (reminderCanConfirmAlarm(reminder.status)) {
                                                 Button({ model.beginConfirm(reminder) },
                                                     enabled = !model.busy) { Text("确认并设闹钟") }
                                             }
@@ -555,6 +555,10 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                                                 if (reminderCanSnooze(reminder.status)) {
                                                     TextButton({ model.snoozeReminder(reminder) },
                                                         enabled = !model.busy) { Text("贪睡10分钟") }
+                                                }
+                                                if (reminderCanConfirmAlarm(reminder.status)) {
+                                                    Button({ model.beginConfirm(reminder) },
+                                                        enabled = !model.busy) { Text("确认并设闹钟") }
                                                 }
                                             }
                                         }
