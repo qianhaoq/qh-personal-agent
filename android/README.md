@@ -1,4 +1,4 @@
-# S23 · 提醒列表筛选空状态文案
+# S24 · 提醒完成与取消二次确认
 
 紧凑的 Kotlin / Compose 客户端：登录、时间线、记事创建/编辑/删除、问答、提醒同步、确认/取消/完成；
 确认后的 `schedule_reminder` Channel action 会落到 AlarmManager，响铃时显示系统通知。
@@ -388,3 +388,13 @@ JAR SHA-256：`cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8`
 本刀不做：FCM/Room/Hilt/Pipecat、rrule、根路径 `GET /`、二次确认、data / Mock / API / server、ASR/TTS、部署；不改通知栏操作或贪睡。
 
 里程碑 / changelog：S23 区分无提醒与已结束提醒被筛选隐藏的空状态；保留 S22 及更早历史。
+
+## S24 提醒完成与取消二次确认
+
+- 行为：主列表及详情页关联提醒中，suggested/scheduled 的「完成」「取消」先打开 AlertDialog，点击「确认」后才调用现有 completeReminder / cancelReminder；「取消」或关闭不执行动作。
+- busy 时禁用确认与取消按钮，并阻止对话框关闭；确认后先清除待确认动作，再执行现有状态更新。应用标签与顶部标题更新为 S24。
+- 测试：`ReminderActionConfirmTest` 覆盖两种动作的中文标题、正文及 busy 确认/关闭门禁；运行 `python3 scripts/check-invariants.py` 和 `cd android && ./gradlew --no-daemon :data:test :app:testDebugUnitTest :app:assembleDebug`。
+
+本刀不做：通知栏操作、snooze 分钟、筛选/空状态、确认并设闹钟流程、data / Mock / API / status 规则 / server、FCM/Room/Hilt/Pipecat、rrule、根路径 `GET /`、ASR/TTS；不部署、不合入。
+
+里程碑 / changelog：S24 为列表与详情页的完成/取消增加二次确认，降低误触；保留 S23 及更早历史。

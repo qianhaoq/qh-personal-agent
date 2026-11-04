@@ -335,7 +335,7 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
 fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> VoiceAsr, requestMicrophone: () -> Unit, cancelVoice: () -> Unit) {
     Surface(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().imePadding().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("随记 · S23" + if (BuildConfig.USE_MOCK_API) " / 本地演示" else " / 服务器", style = MaterialTheme.typography.headlineSmall)
+            Text("随记 · S24" + if (BuildConfig.USE_MOCK_API) " / 本地演示" else " / 服务器", style = MaterialTheme.typography.headlineSmall)
             if (model.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
             model.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             if (!model.signedIn) {
@@ -352,6 +352,18 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                 }
                 NavHost(nav, startDestination = "timeline", modifier = Modifier.weight(1f)) {
                     composable("timeline") {
+                        var pendingReminderAction by remember { mutableStateOf<Pair<ReminderAction, ReminderDto>?>(null) }
+                        pendingReminderAction?.let { (action, reminder) ->
+                            ReminderActionConfirmDialog(action, model.busy,
+                                onDismiss = { pendingReminderAction = null },
+                                onConfirm = {
+                                    pendingReminderAction = null
+                                    when (action) {
+                                        ReminderAction.COMPLETE -> model.completeReminder(reminder)
+                                        ReminderAction.CANCEL -> model.cancelReminder(reminder)
+                                    }
+                                })
+                        }
                         val visibleReminders = filterRemindersForList(model.reminders, model.showEnded)
                         model.confirming?.let { reminder ->
                             ConfirmReminderDialog(reminder, model.busy,
@@ -403,9 +415,9 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                                                 TextButton({ openDetail(id) }, enabled = !model.busy) { Text("打开记事") }
                                             }
                                             if (reminder.status in listOf("suggested", "scheduled")) {
-                                                TextButton({ model.cancelReminder(reminder) },
+                                                TextButton({ pendingReminderAction = ReminderAction.CANCEL to reminder },
                                                     enabled = !model.busy) { Text("取消") }
-                                                TextButton({ model.completeReminder(reminder) },
+                                                TextButton({ pendingReminderAction = ReminderAction.COMPLETE to reminder },
                                                     enabled = !model.busy) { Text("完成") }
                                             }
                                             if (reminderCanSnooze(reminder.status)) {
@@ -471,6 +483,18 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                         }
                     }
                     composable("detail") {
+                        var pendingReminderAction by remember { mutableStateOf<Pair<ReminderAction, ReminderDto>?>(null) }
+                        pendingReminderAction?.let { (action, reminder) ->
+                            ReminderActionConfirmDialog(action, model.busy,
+                                onDismiss = { pendingReminderAction = null },
+                                onConfirm = {
+                                    pendingReminderAction = null
+                                    when (action) {
+                                        ReminderAction.COMPLETE -> model.completeReminder(reminder)
+                                        ReminderAction.CANCEL -> model.cancelReminder(reminder)
+                                    }
+                                })
+                        }
                         BackHandler(enabled = model.busy) { }
                         var deleting by remember { mutableStateOf(false) }
                         val note = model.detailNote
@@ -490,7 +514,7 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                         }
                         LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                             item {
-                                TextButton({ model.clearDetail(); nav.popBackStack() }, enabled = !model.busy) { Text("返回") }
+                                TextButton({ model.clearDetail(); nav.popBackStack() }, enabled = !model.busy) { Text("取消") }
                             }
                             if (note != null) {
                                 item {
@@ -521,9 +545,9 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                                                 ReminderStatusBadge(reminder.status)
                                                 Text("时间：${formatDisplayTimeOrUnset(reminder.fire_at)}")
                                                 if (reminder.status in listOf("suggested", "scheduled")) {
-                                                    TextButton({ model.cancelReminder(reminder) },
+                                                    TextButton({ pendingReminderAction = ReminderAction.CANCEL to reminder },
                                                         enabled = !model.busy) { Text("取消") }
-                                                    TextButton({ model.completeReminder(reminder) },
+                                                    TextButton({ pendingReminderAction = ReminderAction.COMPLETE to reminder },
                                                         enabled = !model.busy) { Text("完成") }
                                                 }
                                                 if (reminderCanSnooze(reminder.status)) {
@@ -703,4 +727,17 @@ private fun ConfirmReminderDialog(
         },
         dismissButton = { TextButton(onDismiss, enabled = !busy) { Text("取消") } }
     )
+}
+
+@Composable
+private fun ReminderActionConfirmDialog(action: ReminderAction, busy: Boolean, onDismiss: () -> Unit, onConfirm: () -> Unit) {
+    val enabled = shouldAcceptReminderActionConfirm(busy)
+    AlertDialog(onDismissRequest = { if (enabled) onDismiss() },
+        title = { Text(reminderActionConfirmTitle(action)) },
+        text = { Text(reminderActionConfirmMessage(action)) },
+        confirmButton = {
+            TextButton({ if (enabled) onConfirm() }, enabled = enabled) { Text("确认") }
+        }, dismissButton = {
+            TextButton({ if (enabled) onDismiss() }, enabled = enabled) { Text("取消") }
+        })
 }
