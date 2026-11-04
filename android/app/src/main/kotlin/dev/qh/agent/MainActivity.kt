@@ -335,7 +335,7 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
 fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> VoiceAsr, requestMicrophone: () -> Unit, cancelVoice: () -> Unit) {
     Surface(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().imePadding().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("随记 · S25" + if (BuildConfig.USE_MOCK_API) " / 本地演示" else " / 服务器", style = MaterialTheme.typography.headlineSmall)
+            Text("随记 · S26" + if (BuildConfig.USE_MOCK_API) " / 本地演示" else " / 服务器", style = MaterialTheme.typography.headlineSmall)
             if (model.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
             model.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             if (!model.signedIn) {
@@ -416,9 +416,9 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                                             }
                                             if (reminder.status in listOf("suggested", "scheduled")) {
                                                 TextButton({ pendingReminderAction = ReminderAction.CANCEL to reminder },
-                                                    enabled = !model.busy) { Text("取消") }
+                                                    enabled = !model.busy) { Text("取消提醒") }
                                                 TextButton({ pendingReminderAction = ReminderAction.COMPLETE to reminder },
-                                                    enabled = !model.busy) { Text("完成") }
+                                                    enabled = !model.busy) { Text("完成提醒") }
                                             }
                                             if (reminderCanSnooze(reminder.status)) {
                                                 TextButton({ model.snoozeReminder(reminder) },
@@ -546,9 +546,9 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                                                 Text("时间：${formatDisplayTimeOrUnset(reminder.fire_at)}")
                                                 if (reminder.status in listOf("suggested", "scheduled")) {
                                                     TextButton({ pendingReminderAction = ReminderAction.CANCEL to reminder },
-                                                        enabled = !model.busy) { Text("取消") }
+                                                        enabled = !model.busy) { Text("取消提醒") }
                                                     TextButton({ pendingReminderAction = ReminderAction.COMPLETE to reminder },
-                                                        enabled = !model.busy) { Text("完成") }
+                                                        enabled = !model.busy) { Text("完成提醒") }
                                                 }
                                                 if (reminderCanSnooze(reminder.status)) {
                                                     TextButton({ model.snoozeReminder(reminder) },
