@@ -66,6 +66,25 @@ class AppRepositoriesTest {
         assertEquals(session, AppRepositories.sessionGeneration())
     }
 
+    @Test fun notificationSnoozeSuccessRejectsCapturedAlarmGenerationAfterCancellation() {
+        for (action in listOf("cancel", "complete")) {
+            val session = AppRepositories.sessionGeneration()
+            val alarms = AppRepositories.alarmGeneration()
+            val effects = mutableListOf<String>()
+            val delayedSnoozeSuccess = {
+                AppRepositories.consumeIfCurrent(session, alarms) {
+                    AppRepositories.invalidateAlarms { effects += "reinstall alarm" }
+                    effects += "dismiss notification"
+                    AppRepositories.notifyRemindersMutated()
+                }
+            }
+            AppRepositories.invalidateAlarms { effects += action }
+            delayedSnoozeSuccess()
+            assertEquals(listOf(action), effects)
+            assertEquals(session, AppRepositories.sessionGeneration())
+        }
+    }
+
     @Test fun delayedBootResponseCannotConsumeDuringOrAfterDeleteCancellation() {
         val session = AppRepositories.sessionGeneration()
         val alarms = AppRepositories.alarmGeneration()

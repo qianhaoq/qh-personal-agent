@@ -233,7 +233,7 @@ async def snooze_reminder(
         payload={"reminder_id": reminder_id, "note_id": note_id, "rev": body.rev, "minutes": body.minutes},
         occurred_at=utcnow(), thread_key=f"note:{note_id}",
     ))
-    if not receipt.duplicate and (receipt.decision is None or receipt.decision.outcome != "accept"):
+    if receipt.decision is None or receipt.decision.outcome != "accept":
         raise ApiError(409, "conflict", "提醒当前不可贪睡")
     async with maker() as read:
         fresh = await read.get(Reminder, reminder_id)

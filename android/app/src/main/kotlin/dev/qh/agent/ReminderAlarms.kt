@@ -217,6 +217,7 @@ class ReminderNotificationActionReceiver : BroadcastReceiver() {
         val appContext = context.applicationContext
         if (SecureTokens(appContext).read() == null) return
         val generation = AppRepositories.sessionGeneration()
+        val alarmGeneration = AppRepositories.alarmGeneration()
         val repository = AppRepositories.real(appContext)
         if (!repository.signedIn) return
         val pending = goAsync()
@@ -228,7 +229,7 @@ class ReminderNotificationActionReceiver : BroadcastReceiver() {
                             repository.signedIn && generation == AppRepositories.sessionGeneration()
                         }, onSuccess = { snoozed ->
                             // Match MainActivity: only clear local alarm after a successful mutation.
-                            AppRepositories.ifCurrent(generation) {
+                            AppRepositories.consumeIfCurrent(generation, alarmGeneration) {
                                 if (repository.signedIn) {
                                     AppRepositories.invalidateAlarms {
                                         val scheduler = ReminderAlarmScheduler(appContext)
