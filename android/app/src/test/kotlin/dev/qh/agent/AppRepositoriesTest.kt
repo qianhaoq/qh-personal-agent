@@ -73,16 +73,68 @@ class AppRepositoriesTest {
             val alarms = AppRepositories.alarmGeneration(id)
             val effects = mutableListOf<String>()
             val delayedSnoozeSuccess = {
-                AppRepositories.consumeIfCurrent(session, id, alarms) {
-                    AppRepositories.invalidateAlarms(id) { effects += "reinstall alarm" }
-                    effects += "dismiss notification"
-                    AppRepositories.notifyRemindersMutated()
-                }
+                AppRepositories.applyNotificationActionLocalEffects(
+                    session, id, alarms, signedIn = { true },
+                    cancelAlarm = { effects += "cancel alarm" },
+                    reinstallAlarm = { effects += "reinstall alarm" },
+                    dismissNotification = { effects += "dismiss notification" }
+                )
             }
             AppRepositories.invalidateAlarms(id) { effects += action }
             delayedSnoozeSuccess()
             assertEquals(listOf(action), effects)
             assertEquals(session, AppRepositories.sessionGeneration())
+        }
+    }
+
+    @Test fun sameReminderTerminalSuccessCleansUpAfterSnoozeInvalidatesCapturedGeneration() {
+        for (action in listOf("complete", "cancel")) {
+            val session = AppRepositories.sessionGeneration()
+            val id = "s31-$action"
+            val captured = AppRepositories.alarmGeneration(id)
+            val effects = mutableListOf<String>()
+            var signals = 0
+            val unsubscribe = AppRepositories.subscribeRemindersMutated { signals++ }
+            try {
+                AppRepositories.applyNotificationActionLocalEffects(
+                    session, id, captured, signedIn = { true },
+                    cancelAlarm = { effects += "snooze cancel" },
+                    reinstallAlarm = { effects += "snooze reinstall" },
+                    dismissNotification = { effects += "snooze dismiss" }
+                )
+                assertNotEquals(captured, AppRepositories.alarmGeneration(id))
+                AppRepositories.applyNotificationActionLocalEffects(
+                    session, id, captured, signedIn = { true },
+                    cancelAlarm = { effects += "$action cancel" }, reinstallAlarm = null,
+                    dismissNotification = { effects += "$action dismiss" }
+                )
+                assertEquals(listOf("snooze cancel", "snooze reinstall", "snooze dismiss",
+                    "$action cancel", "$action dismiss"), effects)
+                assertEquals(2, signals)
+                assertEquals(session, AppRepositories.sessionGeneration())
+            } finally { unsubscribe() }
+        }
+    }
+
+    @Test fun staleTerminalSuccessStillRequiresCurrentSignedInSession() {
+        for (loggedOut in listOf(false, true)) {
+            val session = AppRepositories.sessionGeneration()
+            val id = "s31-session-$loggedOut"
+            val captured = AppRepositories.alarmGeneration(id)
+            AppRepositories.invalidateAlarms(id) {}
+            if (!loggedOut) AppRepositories.bumpSession()
+            val before = AppRepositories.alarmGeneration(id)
+            var signals = 0
+            val unsubscribe = AppRepositories.subscribeRemindersMutated { signals++ }
+            try {
+                AppRepositories.applyNotificationActionLocalEffects(
+                    session, id, captured, signedIn = { !loggedOut },
+                    cancelAlarm = { fail("Must not cancel") }, reinstallAlarm = null,
+                    dismissNotification = { fail("Must not dismiss") }
+                )
+                assertEquals(before, AppRepositories.alarmGeneration(id))
+                assertEquals(0, signals)
+            } finally { unsubscribe() }
         }
     }
 
@@ -96,14 +148,12 @@ class AppRepositoriesTest {
         val unsubscribe = AppRepositories.subscribeRemindersMutated { refreshes++ }
         try {
             for (id in ids) {
-                AppRepositories.consumeIfCurrent(session, id, captured.getValue(id)) {
-                    AppRepositories.invalidateAlarms(id) {
-                        effects += "$id cancel"
-                        effects += "$id reschedule"
-                    }
-                    effects += "$id dismiss"
-                    AppRepositories.notifyRemindersMutated()
-                }
+                AppRepositories.applyNotificationActionLocalEffects(
+                    session, id, captured.getValue(id), signedIn = { true },
+                    cancelAlarm = { effects += "$id cancel" },
+                    reinstallAlarm = { effects += "$id reschedule" },
+                    dismissNotification = { effects += "$id dismiss" }
+                )
             }
             assertEquals(ids.flatMap { listOf("$it cancel", "$it reschedule", "$it dismiss") }, effects)
             assertEquals(2, refreshes)

@@ -228,19 +228,19 @@ class ReminderNotificationActionReceiver : BroadcastReceiver() {
                         sessionCurrent = {
                             repository.signedIn && generation == AppRepositories.sessionGeneration()
                         }, onSuccess = { snoozed ->
-                            // Match MainActivity: only clear local alarm after a successful mutation.
-                            AppRepositories.consumeIfCurrent(generation, id, alarmGeneration) {
-                                if (repository.signedIn) {
-                                    AppRepositories.invalidateAlarms(id) {
-                                        val scheduler = ReminderAlarmScheduler(appContext)
-                                        scheduler.cancelReminder(id)
-                                        snoozed?.let(scheduler::snoozed)
-                                    }
+                            val scheduler = ReminderAlarmScheduler(appContext)
+                            AppRepositories.applyNotificationActionLocalEffects(
+                                generation, id, alarmGeneration,
+                                signedIn = { repository.signedIn },
+                                cancelAlarm = { scheduler.cancelReminder(id) },
+                                reinstallAlarm = snoozed?.let { response ->
+                                    { scheduler.snoozed(response) }
+                                },
+                                dismissNotification = {
                                     appContext.getSystemService(NotificationManager::class.java)
                                         .cancel(id.hashCode())
-                                    AppRepositories.notifyRemindersMutated()
                                 }
-                            }
+                            )
                         })
                     true
                 }

@@ -69,6 +69,25 @@ object AppRepositories {
         if (generation.get() == session && alarmGeneration.get() == alarms) block()
     }
 
+    /** A successful terminal mutation must clear local state even after a same-reminder snooze.
+     * A non-null [reinstallAlarm] denotes snooze and still requires the captured alarm fence.
+     * Keep session/sign-in validation and all effects under the same consume lock.
+     */
+    internal fun applyNotificationActionLocalEffects(
+        session: Long, reminderId: String, alarms: Long, signedIn: () -> Boolean,
+        cancelAlarm: () -> Unit, reinstallAlarm: (() -> Unit)?, dismissNotification: () -> Unit
+    ) = synchronized(lock) {
+        if (generation.get() != session || !signedIn()) return@synchronized
+        if (reinstallAlarm != null &&
+            (reminderAlarmGenerations[reminderId] ?: 0L) != alarms) return@synchronized
+        invalidateAlarms(reminderId) {
+            cancelAlarm()
+            reinstallAlarm?.invoke()
+        }
+        dismissNotification()
+        notifyRemindersMutated()
+    }
+
     fun real(context: Context): RealRepository {
         real?.let { return it }
         synchronized(this) {
