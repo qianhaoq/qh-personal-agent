@@ -2,9 +2,9 @@
 
 个人语音记事与语音助手。说一句话，自动整理成笔记 / 待办 / 提醒，并能用语音问答自己的记忆。
 
-当前 Android 里程碑：**S27**，提醒主列表与详情页贪睡按钮「10分钟后」→「贪睡10分钟」，应用标签与顶部标题升至 S27；仅改文案，行为不变。详见 [Android README](android/README.md)。
+当前 Android 里程碑：**S28**，通知栏贪睡文案「10分钟后」→「贪睡10分钟」，应用标签「随记 S28」、顶部标题「随记 · S28」；仅改文案，行为不变。详见 [Android README](android/README.md)。
 
-S27 不做：不改通知栏 PendingIntent、「取消提醒」/「完成提醒」、对话框 dismiss「取消」、二次确认逻辑、snooze 分钟、API / server / data、FCM/Room/Hilt/Pipecat、筛选/空状态、根路径 `GET /`、rrule；不部署、不合入。
+S28 不做：不改应用内贪睡按钮（已是「贪睡10分钟」）、通知栏 intentAction / PendingIntent、「取消提醒」/「完成提醒」、对话框 dismiss「取消」、二次确认逻辑、snooze 分钟、API / server / data、FCM/Room/Hilt/Pipecat、筛选/空状态、根路径 `GET /`、rrule；不部署、不合入。
 
 ## 仓库结构（monorepo）
 
