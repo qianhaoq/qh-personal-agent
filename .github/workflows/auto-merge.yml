@@ -46,6 +46,7 @@ permissions:
   contents: write
   pull-requests: write
   checks: read
+  # Cancelled checks block merge; independent cancel-heal workflows own recovery.
   actions: read
 
 concurrency:
@@ -64,7 +65,7 @@ jobs:
       (github.event_name != 'pull_request_review' ||
       github.event.review.state == 'approved' ||
       github.event.review.user.login == 'copilot-pull-request-reviewer[bot]')
-    uses: qianhaoq/devflow-gates/.github/workflows/auto-merge.yml@fe7cf651ef515f165041738dc285b03ce3817bb9 # devflow-gates main @ fe7cf65
+    uses: qianhaoq/devflow-gates/.github/workflows/auto-merge-readonly.yml@cd6710de1e5660d339ec7c59d53e1edb28292aaa # merged devflow-gates #32
     with:
       runs_on: '["self-hosted", "linux", "x64"]'
       # Exact check-run names = "<caller job name> / <called job name>"
