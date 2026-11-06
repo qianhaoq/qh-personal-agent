@@ -658,6 +658,13 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                                 speaker.message?.let { Text(it, color = MaterialTheme.colorScheme.error) }
                                 if (speaker.state == AnswerTtsState.Speaking) {
                                     OutlinedButton(speaker::stop) { Text("停止播报") }
+                                } else if (speakTextForAnswer(model.answer?.answer) != null) {
+                                    OutlinedButton({
+                                        answerReplayText(model.answer?.answer, model.busy, voice.state, speaker.state)
+                                            ?.let(speaker::speak)
+                                    }, enabled = answerReplayText(model.answer?.answer, model.busy, voice.state, speaker.state) != null) {
+                                        Text("播报答案")
+                                    }
                                 }
                                 Button(model::ask, enabled = !model.busy && voice.state == AsrUiState.Idle && model.question.isNotBlank()) { Text("提问") }
                             }

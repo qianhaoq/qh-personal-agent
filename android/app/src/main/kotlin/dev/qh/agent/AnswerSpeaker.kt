@@ -10,8 +10,6 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import java.util.Locale
 
-enum class AnswerTtsState { Idle, Speaking, Unavailable }
-
 /** Main-thread API; engine callbacks are marshalled to main and fenced after stop/destroy. */
 class AnswerSpeaker(context: Context) {
     var state by mutableStateOf(AnswerTtsState.Idle); private set
