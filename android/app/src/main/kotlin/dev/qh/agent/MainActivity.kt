@@ -351,7 +351,7 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                     TextButton({ cancelVoice(); model.logout() }, enabled = !model.busy) { Text("退出") }
                 }
                 model.confirming?.let { reminder ->
-                    ConfirmReminderDialog(reminder, model.busy,
+                    ReminderConfirmationDialog(reminder, model.busy,
                         title = model.confirmTitle, fireAt = model.confirmFireAt,
                         submitError = model.error,
                         onTitleChange = model::updateConfirmTitle,
@@ -707,50 +707,4 @@ private fun noteStatus(status: String) = when (status) {
     "organized" -> "已整理"
     "failed" -> "整理失败"
     else -> status
-}
-
-@Composable
-private fun ConfirmReminderDialog(
-    reminder: ReminderDto, busy: Boolean, title: String, fireAt: String,
-    submitError: String?,
-    onTitleChange: (String) -> Unit, onFireAtChange: (String) -> Unit,
-    onDismiss: () -> Unit, onConfirm: (ConfirmOverrides) -> Unit
-) {
-    var error by remember(reminder) { mutableStateOf<String?>(null) }
-    AlertDialog(
-        onDismissRequest = { if (!busy) onDismiss() },
-        title = { Text("确认并设闹钟") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedTextField(title, { onTitleChange(it); error = null }, label = { Text("标题") },
-                    enabled = !busy, modifier = Modifier.fillMaxWidth())
-                OutlinedTextField(fireAt, { onFireAtChange(it); error = null }, label = { Text("提醒时间（ISO）") },
-                    enabled = !busy, modifier = Modifier.fillMaxWidth())
-                Text("例如 2026-11-04T12:00:00Z；留空沿用原值。时间须在未来。")
-                (error ?: submitError)?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-            }
-        },
-        confirmButton = {
-            TextButton({
-                try {
-                    val overrides = confirmOverrides(reminder.title, reminder.fire_at, title, fireAt)
-                    onConfirm(overrides)
-                } catch (e: IllegalArgumentException) { error = readableError(e) }
-            }, enabled = !busy) { Text("确认") }
-        },
-        dismissButton = { TextButton(onDismiss, enabled = !busy) { Text("取消") } }
-    )
-}
-
-@Composable
-internal fun ReminderActionConfirmDialog(action: ReminderAction, reminderTitle: String, busy: Boolean, onDismiss: () -> Unit, onConfirm: () -> Unit) {
-    val enabled = shouldAcceptReminderActionConfirm(busy)
-    AlertDialog(onDismissRequest = { if (enabled) onDismiss() },
-        title = { Text(reminderActionConfirmTitle(action)) },
-        text = { Text(reminderActionConfirmMessage(action, reminderTitle)) },
-        confirmButton = {
-            TextButton({ if (enabled) onConfirm() }, enabled = enabled) { Text("确认") }
-        }, dismissButton = {
-            TextButton({ if (enabled) onDismiss() }, enabled = enabled) { Text("取消") }
-        })
 }
