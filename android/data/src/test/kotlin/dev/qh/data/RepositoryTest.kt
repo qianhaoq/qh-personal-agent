@@ -580,6 +580,10 @@ class RepositoryTest {
         assertEquals(note, gson.fromJson("""{"items":[$json]}""", NotePage::class.java).items.single())
     }
     private class Store : TokenStore {
+        var epoch = 0
+        override fun identity() = tokens?.let { SessionIdentity(it.user_id, epoch.toString()) }
+        override fun closeSession() { }
+        override fun bumpLoginEpoch() { epoch++ }
         var tokens: Tokens? = null
         override fun read() = tokens
         override fun write(tokens: Tokens?) { this.tokens = tokens }

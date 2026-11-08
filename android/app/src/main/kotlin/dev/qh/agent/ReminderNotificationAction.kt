@@ -23,14 +23,15 @@ internal suspend fun performReminderNotificationAction(
     sessionCurrent: () -> Boolean, onSuccess: (ReminderSnoozeResponse?) -> Unit
 ) {
     if (!sessionCurrent()) return
-    val response = repository.sync()
+    val owner = repository.captureOwner()
+    val response = repository.sync(owner = owner)
     if (!sessionCurrent()) return
     val reminder = response.reminders.find { it.id == id && it.id !in response.deleted.reminders }
         ?: error("Reminder unavailable")
     val snoozed = when (action) {
-        ReminderNotificationAction.COMPLETE -> { repository.completeReminder(id, reminder.rev); null }
-        ReminderNotificationAction.CANCEL -> { repository.cancelReminder(id, reminder.rev); null }
-        ReminderNotificationAction.SNOOZE -> repository.snoozeReminder(id, reminder.rev, 10)
+        ReminderNotificationAction.COMPLETE -> { repository.completeReminder(id, reminder.rev, owner); null }
+        ReminderNotificationAction.CANCEL -> { repository.cancelReminder(id, reminder.rev, owner); null }
+        ReminderNotificationAction.SNOOZE -> repository.snoozeReminder(id, reminder.rev, 10, owner)
     }
     if (sessionCurrent()) onSuccess(snoozed)
 }

@@ -15,7 +15,7 @@ data class Created(val note_id: String, val status: String, val rev: Int)
 data class NoteTodo(val text: String, val due: String? = null)
 data class Note(val id: String, val text: String, val status: String,
     val rev: Int, val title: String? = null, val recorded_at: String? = null,
-    val tags: List<String>? = null, val todos: List<NoteTodo>? = null, val category: String? = null)
+    val tags: List<String>? = null, val todos: List<NoteTodo>? = null, val category: String? = null, val client_note_id: String? = null)
 data class NotePatch(val rev: Int, val text: String? = null)
 data class NotePatchResponse(val note: Note, val rev: Int)
 data class NotePage(val items: List<Note>, val next_cursor: Long?)
