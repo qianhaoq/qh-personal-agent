@@ -78,6 +78,5 @@ jobs:
         qa / QA Gate
         understand / Diff Quiz Gate
       merge_method: squash
-      # Copilot quota is exhausted (2026-10): no Copilot dependency. Same switch as
-      # ai-devflow-weekly: set repo var DISABLE_COPILOT_REVIEW=false to require it again.
-      require_copilot: ${{ vars.DISABLE_COPILOT_REVIEW == 'false' }}
+      # Copilot is retired as a merge gate; do not re-enable via DISABLE_COPILOT_REVIEW=false.
+      require_copilot: false

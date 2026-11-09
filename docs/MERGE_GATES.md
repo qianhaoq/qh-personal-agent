@@ -21,7 +21,7 @@
 
 `auto-merge.yml` 在上述检查全绿后 squash 合入，以下情况不合：draft、标签 `no-auto-merge`、`skip-codex-gate`。
 
-**Copilot**：配额已用完，`require_copilot` 默认关闭（仓库变量 `DISABLE_COPILOT_REVIEW` 未设置或不为 `false` 时不要求 Copilot review）；配额恢复后把变量设为 `false` 即可重新要求。仓库没有任何必需检查依赖 Copilot。
+**Copilot**：不再作为必需合并门禁，配置固定为 `require_copilot: false`，不得通过 `DISABLE_COPILOT_REVIEW=false` 重新启用。独立评审由 Codex / Claude / 人工完成；其他门禁保持不变。
 
 ## 评审严重度
 
