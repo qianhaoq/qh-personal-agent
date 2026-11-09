@@ -3,6 +3,9 @@ import SwiftUI
 @main
 struct PersonalAgentApp: App {
     var body: some Scene {
-        WindowGroup { ContentView() }
+        WindowGroup {
+            ContentView()
+                .preferredColorScheme(.light)
+        }
     }
 }
