@@ -89,6 +89,7 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
     private val composerStore: ComposerStore) : ViewModel() {
     private val creates = CreateRecoveryFlow(repo, composerStore)
     private var draftVersion = 0L
+    private var unpersistedDraftOwner: RequestOwner? = null
     var inputMode by mutableStateOf("note"); private set
     fun setMode(mode: String) { inputMode = mode; updateDraft(draft) }
     var audioInputState by mutableStateOf(AsrUiState.Idle)
@@ -109,8 +110,14 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
     private var navigationId = 0L
     private fun restoreComposer(owner: RequestOwner) {
         val state = creates.load(owner)
-        draft = state.draft.text; draftVersion = state.draft.version
-        draftSource = state.draft.source; inputMode = state.draft.mode; recovery = state.recovery
+        // Failed local writes must survive reload and late create/ask responses in this session.
+        val dirty = unpersistedDraftOwner
+        if (dirty == null || !repo.isCurrent(dirty)) {
+            unpersistedDraftOwner = null
+            draft = state.draft.text; draftVersion = state.draft.version
+            draftSource = state.draft.source; inputMode = state.draft.mode
+        }
+        recovery = state.recovery
         if (state.draft.askOutcomeUnknown) error = "上次提问结果无法恢复；问题草稿仍保留，可手动重新提问"
     }
     var signedIn by mutableStateOf(repo.signedIn); private set
@@ -189,6 +196,7 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
     var onAnswer: ((String) -> Unit)? = null
     var stopAnswerSpeech: (() -> Unit)? = null
     private fun clearUi() {
+        unpersistedDraftOwner = null
         projection.clear()
         stopAnswerSpeech?.invoke()
         organizeJobs.values.toList().forEach { it.cancel() }; organizeJobs.clear()
@@ -244,7 +252,9 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
         recovery = creates.load(owner).recovery
         AppRepositories.consumeIfCurrent(generation, alarmGeneration) {
             if (repo.signedIn) {
-                localSchedules = localSchedules + alarms.consume(sync)
+                val installed = alarms.consume(sync)
+                localSchedules = localSchedules + installed
+                if (installed.values.any { it.submitted }) requestNotifications = true
                 reminders = sync.reminders.sortedWith(compareBy(nullsLast()) { it.fire_at })
             }
         }
@@ -310,8 +320,15 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
         draft = value; draftSource = source; draftVersion++
         try {
             val owner = repo.captureOwner()
-            creates.edit(owner, ComposerDraft(draft, draftVersion, mode = inputMode, source = draftSource))
+            unpersistedDraftOwner = owner
+            persistDraft(owner, ComposerDraft(draft, draftVersion, mode = inputMode, source = draftSource))
         } catch (_: Exception) { error = "无法保存本机草稿；文字仍在，尚未发送" }
+    }
+    private fun persistDraft(owner: RequestOwner, value: ComposerDraft): ComposerState {
+        val state = creates.edit(owner, value)
+        if (value.text == draft && value.version == draftVersion && value.mode == inputMode && value.source == draftSource)
+            unpersistedDraftOwner = null
+        return state
     }
     fun createFromVoice(text: String, done: () -> Unit) {
         if (busy) return
@@ -321,7 +338,7 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
     }
     fun save(done: () -> Unit) = run { owner ->
         validText(draft, 5000)
-        creates.edit(owner, ComposerDraft(draft, draftVersion, mode = inputMode, source = draftSource))
+        persistDraft(owner, ComposerDraft(draft, draftVersion, mode = inputMode, source = draftSource))
         val original = creates.prepare(owner) // disk failure throws before HTTP
         restoreComposer(owner)
         refreshMutex.withLock {
@@ -370,8 +387,9 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
     fun saveCopy() = run { owner ->
         refreshMutex.withLock {
             check(recovery?.state == "live" && recoveredNote?.id == recovery?.discoveredNoteId) { "请先核对原记事" }
-            creates.edit(owner, ComposerDraft(draft, draftVersion, mode = "note", source = draftSource))
+            persistDraft(owner, ComposerDraft(draft, draftVersion, mode = "note", source = draftSource))
             val original = creates.prepare(owner, replaceLive = true)
+            unpersistedDraftOwner = null
             recoveredNote = null
             restoreComposer(owner)
             try { applyCreated(owner, creates.send(owner, original)) }
@@ -386,7 +404,10 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
                 val updated = repo.patch(original.id, original.rev, draft, owner)
                 repo.withCurrentOwner(owner) {
                     creates.removeLocalRecovery(owner)
-                    if (version == draftVersion) creates.edit(owner, ComposerDraft(version = version + 1))
+                    if (version == draftVersion) {
+                        persistDraft(owner, ComposerDraft(version = version + 1))
+                        unpersistedDraftOwner = null // Explicitly consumed by this successful update.
+                    }
                     applyCreated(owner, updated)
                 }
             } catch (e: retrofit2.HttpException) {
@@ -527,13 +548,13 @@ class AgentModel(private val repo: Repository, private val alarms: ReminderAlarm
         answers = listOf(item) + answers
         answer = null
         try {
-            creates.edit(owner, ComposerDraft(draft, draftVersion, inputMode, askOutcomeUnknown = true))
+            persistDraft(owner, ComposerDraft(draft, draftVersion, inputMode, askOutcomeUnknown = true))
             val result = repo.ask(asked, owner)
             repo.withCurrentOwner(owner) {
                 answer = result
                 answers = answers.map { if (it.id == item.id) item.copy(answer = result) else it }
                 val current = creates.load(owner).draft
-                creates.edit(owner, if (current.version == submittedVersion && current.mode == "ask" && current.text == asked)
+                persistDraft(owner, if (current.version == submittedVersion && current.mode == "ask" && current.text == asked)
                     current.copy(text = "", version = current.version + 1, askOutcomeUnknown = false)
                     else current.copy(askOutcomeUnknown = false))
                 restoreComposer(owner)
@@ -708,8 +729,8 @@ fun AgentApp(model: AgentModel, voiceFactory: (String, (String) -> Unit) -> Voic
                                         }
                                     }
                                 }
-                                item { UnifiedComposer(model, voiceFactory, requestMicrophone) }
                             }
+                            UnifiedComposer(model, voiceFactory, requestMicrophone)
                         }
                     }
                     composable("status") { SystemStatus(model) }

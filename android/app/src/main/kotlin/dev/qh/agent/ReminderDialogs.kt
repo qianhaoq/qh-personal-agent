@@ -44,7 +44,9 @@ internal fun ReminderConfirmationDialog(
             Text("时区：${zone.id}")
         }
     }
-    AlertDialog(
+    // Keep a single modal window: the confirmation dialog otherwise covers the picker
+    // body and intercepts scrolling even though its semantics remain discoverable.
+    if (!choosing) AlertDialog(
         onDismissRequest = { if (!busy) onDismiss() },
         title = { Text("确认提醒 / 修改未来时间") },
         text = {

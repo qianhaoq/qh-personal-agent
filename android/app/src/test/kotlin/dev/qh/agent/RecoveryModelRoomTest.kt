@@ -18,6 +18,41 @@ class RecoveryModelRoomTest {
         val server = ReviewServer(session)
         return server to ModelFixture(server)
     }
+    @Test fun failedRoomWriteKeepsInMemoryTextAndModeAcrossReloadUntilRetrySucceeds() = runTest {
+        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
+        try {
+            val (server, f) = fixture()
+            f.use {
+                var failWrites = false
+                val store = object : ComposerStore by f.disk {
+                    override fun save(owner: RequestOwner, state: ComposerState) {
+                        if (failWrites) throw java.io.IOException("disk unavailable")
+                        f.disk.save(owner, state)
+                    }
+                }
+                val models = androidx.lifecycle.ViewModelStore()
+                val model = AgentModel(server, ReminderAlarmScheduler(f.context), store)
+                models.put("dirty", model)
+                try {
+                    model.updateDraft("old")
+                    failWrites = true
+                    model.setMode("ask")
+                    model.updateDraft("new unsaved text")
+                    model.reload(); advanceUntilIdle()
+                    assertEquals("new unsaved text", model.draft)
+                    assertEquals("ask", model.inputMode)
+                    assertEquals("old", f.disk.load(server.captureOwner()).draft.text)
+                    failWrites = false
+                    model.updateDraft("retry saved")
+                    model.reload(); advanceUntilIdle()
+                    assertEquals("retry saved", model.draft)
+                    assertEquals("ask", f.disk.load(server.captureOwner()).draft.mode)
+                    assertEquals("retry saved", f.disk.load(server.captureOwner()).draft.text)
+                    assertTrue(server.posts.isEmpty())
+                } finally { models.clear() }
+            }
+        } finally { Dispatchers.resetMain() }
+    }
     @Test fun liveRecovery404AndSyncTombstoneRemoveProjectionAndUpdateAffordanceKeepB() = runTest {
         Dispatchers.setMain(StandardTestDispatcher(testScheduler))
         try {
