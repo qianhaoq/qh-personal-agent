@@ -22,9 +22,10 @@ class ReminderStatusTest {
         }
     }
 
+    // Corrected: scheduled is server confirmation, not a local AlarmManager success receipt.
     @Test fun knownStatusesUseChineseLabels() {
         mapOf(
-            "suggested" to "待确认", "scheduled" to "已排程",
+            "suggested" to "待确认", "scheduled" to "服务端已确认",
             "done" to "已完成", "cancelled" to "已取消"
         ).forEach { (status, label) ->
             assertEquals(label, reminderStatus(status))

@@ -23,19 +23,19 @@ class ReminderNotificationActionTest {
         var failure: Exception? = null
         var afterSync: () -> Unit = {}
         var afterMutation: () -> Unit = {}
-        override suspend fun sync(since: Long, limit: Int): SyncResponse {
+        override suspend fun sync(since: Long, limit: Int, owner: RequestOwner): SyncResponse {
             syncs++; afterSync(); return response
         }
-        override suspend fun completeReminder(id: String, rev: Int): ReminderCompleteResponse {
+        override suspend fun completeReminder(id: String, rev: Int, owner: RequestOwner): ReminderCompleteResponse {
             failure?.let { throw it }; mutation = id to rev; completed = true; afterMutation()
             return ReminderCompleteResponse(response.reminders.last())
         }
-        override suspend fun snoozeReminder(id: String, rev: Int, minutes: Int): ReminderSnoozeResponse {
+        override suspend fun snoozeReminder(id: String, rev: Int, minutes: Int, owner: RequestOwner): ReminderSnoozeResponse {
             failure?.let { throw it }; mutation = id to rev; snoozeMinutes = minutes; afterMutation()
             return ReminderSnoozeResponse(response.reminders.last().copy(rev = rev + 1,
                 fire_at = "2099-01-01T00:10:00Z"))
         }
-        override suspend fun cancelReminder(id: String, rev: Int): ReminderCancelResponse {
+        override suspend fun cancelReminder(id: String, rev: Int, owner: RequestOwner): ReminderCancelResponse {
             failure?.let { throw it }; mutation = id to rev; afterMutation()
             return ReminderCancelResponse(response.reminders.last())
         }

@@ -5,6 +5,7 @@ import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import dev.qh.data.TokenStore
 import dev.qh.data.Tokens
+import dev.qh.data.SessionIdentity
 import java.util.UUID
 
 class SecureTokens(context: Context) : TokenStore {
@@ -12,6 +13,15 @@ class SecureTokens(context: Context) : TokenStore {
         MasterKey.Builder(context).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build(),
         EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
         EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM)
+    @Synchronized override fun identity(): SessionIdentity? {
+        val user = prefs.getString("user", null) ?: return null
+        if (!prefs.contains("access") || !prefs.contains("refresh")) return null
+        return SessionIdentity(user, sessionEpoch(), prefs.getBoolean("closed", false))
+    }
+    @Synchronized override fun closeSession() {
+        check(prefs.edit().putString("epoch", UUID.randomUUID().toString()).putBoolean("closed", true).commit()) { "无法封闭会话" }
+    }
+    @Synchronized override fun bumpLoginEpoch() { bumpSessionEpoch() }
     @Synchronized override fun read(): Tokens? {
         val access = prefs.getString("access", null) ?: return null
         val refresh = prefs.getString("refresh", null) ?: return null
@@ -20,7 +30,7 @@ class SecureTokens(context: Context) : TokenStore {
     @Synchronized override fun write(tokens: Tokens?) {
         val edit = prefs.edit()
         if (tokens == null) listOf("access", "refresh", "ttl", "user").forEach { edit.remove(it) }
-        else edit.putString("access", tokens.access_token).putString("refresh", tokens.refresh_token)
+        else edit.putBoolean("closed", false).putString("access", tokens.access_token).putString("refresh", tokens.refresh_token)
             .putLong("ttl", tokens.expires_in).putString("user", tokens.user_id)
         check(edit.commit()) { "无法保存安全会话" }
     }

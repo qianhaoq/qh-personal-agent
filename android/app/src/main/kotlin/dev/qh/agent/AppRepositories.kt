@@ -33,7 +33,6 @@ object AppRepositories {
 
     /** Invalidate in-flight boot side effects (e.g. on logout). */
     fun bumpSession(): Long = synchronized(lock) {
-        appContext?.let { SecureTokens(it).bumpSessionEpoch() }
         generation.incrementAndGet()
     }
 
@@ -98,7 +97,7 @@ object AppRepositories {
             real?.let { return it }
             val app = context.applicationContext
             appContext = app
-            return RealRepository(realApi(BuildConfig.API_BASE_URL), SecureTokens(app)).also { real = it }
+            return RealRepository(realApi(BuildConfig.API_BASE_URL), SecureTokens(app), runtimeKey = "real:${BuildConfig.API_BASE_URL}").also { real = it }
         }
     }
 }

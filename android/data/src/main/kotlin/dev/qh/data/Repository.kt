@@ -17,26 +17,37 @@ import java.util.concurrent.TimeUnit
 interface TokenStore {
     fun read(): Tokens?
     fun write(tokens: Tokens?)
+    fun identity(): SessionIdentity?
+    /** Atomically persist a new login epoch and closed=true before returning. */
+    fun closeSession()
+    fun bumpLoginEpoch()
     fun deviceId(): String
 }
 class SessionExpired : IOException("会话已失效，请重新登录")
 interface Repository {
-    suspend fun snoozeReminder(id: String, rev: Int, minutes: Int = 10): ReminderSnoozeResponse
-    suspend fun cancelReminder(id: String, rev: Int): ReminderCancelResponse
-    suspend fun completeReminder(id: String, rev: Int): ReminderCompleteResponse
+    fun captureOwner(): RequestOwner
+    fun isCurrent(owner: RequestOwner): Boolean
+    fun <T> withCurrentOwner(owner: RequestOwner, block: () -> T): T
+    suspend fun snoozeReminder(id: String, rev: Int, minutes: Int = 10, owner: RequestOwner = captureOwner()): ReminderSnoozeResponse
+    suspend fun cancelReminder(id: String, rev: Int, owner: RequestOwner = captureOwner()): ReminderCancelResponse
+    suspend fun completeReminder(id: String, rev: Int, owner: RequestOwner = captureOwner()): ReminderCompleteResponse
     val signedIn: Boolean
     suspend fun login(invite: String)
-    suspend fun logout()
-    suspend fun note(noteId: String): Note
-    suspend fun notes(): List<Note>
-    suspend fun create(body: NoteCreate): Created
-    suspend fun patch(noteId: String, rev: Int, text: String?): Note
-    suspend fun delete(noteId: String)
-    suspend fun search(query: String, topK: Int = 10): List<SearchHit>
-    suspend fun ask(text: String): Answer
-    suspend fun sync(since: Long = 0, limit: Int = 100): SyncResponse
+    fun beginLogout(owner: RequestOwner): LogoutSession
+    fun withClosingSession(session: LogoutSession, block: () -> Unit)
+    suspend fun finishLogout(session: LogoutSession)
+    suspend fun logout(owner: RequestOwner = captureOwner()) { finishLogout(beginLogout(owner)) }
+    fun validatedOwner(validate: () -> Unit): RequestOwner { validate(); return captureOwner() }
+    suspend fun note(noteId: String, owner: RequestOwner = validatedOwner { require(noteId.isNotBlank()) { "记事 ID 不能为空" } }): Note
+    suspend fun notes(owner: RequestOwner = captureOwner()): List<Note>
+    suspend fun create(body: NoteCreate, owner: RequestOwner = validatedOwner { validText(body.text, 5000) }): Created
+    suspend fun patch(noteId: String, rev: Int, text: String?, owner: RequestOwner = validatedOwner { if (text != null) validText(text, 5000) }): Note
+    suspend fun delete(noteId: String, owner: RequestOwner = captureOwner())
+    suspend fun search(query: String, topK: Int = 10, owner: RequestOwner = validatedOwner { validText(query.trim(), 500); require(topK in 1..50) { "搜索条数须为 1–50" } }): List<SearchHit>
+    suspend fun ask(text: String, owner: RequestOwner = validatedOwner { validText(text, 2000) }): Answer
+    suspend fun sync(since: Long = 0, limit: Int = 100, owner: RequestOwner = validatedOwner { require(since >= 0 && limit in 1..500) { "同步参数无效" } }): SyncResponse
     suspend fun confirmReminder(id: String, rev: Int, fireAt: String? = null,
-        title: String? = null): ReminderConfirmResponse
+        title: String? = null, owner: RequestOwner = captureOwner()): ReminderConfirmResponse
 }
 fun noteDraft(text: String, id: String = UUID.randomUUID().toString(), source: String = "app") = NoteCreate(
     id, text.trim(), Instant.now().toString(), ZoneId.systemDefault().id, source)
@@ -72,42 +83,110 @@ object SessionMutex {
 }
 
 class RealRepository(private val api: AgentApi, private val store: TokenStore,
-    private val mutex: Mutex = SessionMutex.lock) : Repository {
-    // Serialize session operations process-wide: a rotated refresh token must never be replayed concurrently.
-    override val signedIn get() = store.read() != null
-    override suspend fun login(invite: String) = mutex.withLock {
-        validText(invite.trim(), 64)
-        store.write(api.login(LoginRequest(invite.trim(), store.deviceId())))
+    private val mutex: Mutex = SessionMutex.lock,
+    private val runtimeKey: String = "real") : Repository {
+    private val sessionLock = Any()
+    private var processGeneration = UUID.randomUUID().toString()
+    @Volatile private var closing = false
+    override fun captureOwner(): RequestOwner = synchronized(sessionLock) {
+        if (closing) throw StaleRequestOwner()
+        val identity = store.identity()?.takeUnless { it.closed } ?: throw SessionExpired()
+        RequestOwner(runtimeKey, identity.userId, identity.loginEpoch, processGeneration)
     }
-    private suspend fun <T> authorized(block: suspend (String) -> T): T = mutex.withLock {
-        val tokens = store.read() ?: throw SessionExpired()
-        try { block("Bearer ${tokens.access_token}") }
-        catch (error: HttpException) {
-            if (error.code() != 401) throw error
-            // An ambiguous refresh failure cannot safely be retried (server replay detection).
-            val fresh = try { api.refresh(RefreshRequest(tokens.refresh_token)).also(store::write) }
-            catch (error: CancellationException) { store.write(null); throw error }
-            catch (error: Exception) { store.write(null); throw SessionExpired() }
-            try { block("Bearer ${fresh.access_token}") }
-            catch (error: HttpException) {
-                if (error.code() == 401) { store.write(null); throw SessionExpired() }
-                throw error
+    override fun isCurrent(owner: RequestOwner): Boolean = synchronized(sessionLock) {
+        val identity = store.identity()
+        !closing && identity?.closed == false && owner.runtimeKey == runtimeKey && owner.processGeneration == processGeneration &&
+            identity?.userId == owner.userId && identity.loginEpoch == owner.loginEpoch
+    }
+    override fun <T> withCurrentOwner(owner: RequestOwner, block: () -> T): T = synchronized(sessionLock) {
+        requireCurrent(owner)
+        block()
+    }
+    private fun requireCurrent(owner: RequestOwner) { if (!isCurrent(owner)) throw StaleRequestOwner() }
+    private fun clearIfCurrent(owner: RequestOwner) = synchronized(sessionLock) {
+        if (isCurrent(owner)) { store.bumpLoginEpoch(); store.write(null) }
+    }
+    // Serialize session operations process-wide: a rotated refresh token must never be replayed concurrently.
+    override val signedIn get() = !closing && store.identity()?.closed == false
+    override suspend fun login(invite: String) {
+        validText(invite.trim(), 64)
+        val attempt = synchronized(sessionLock) {
+            closing = true
+            store.bumpLoginEpoch()
+            store.write(null)
+            UUID.randomUUID().toString().also { processGeneration = it }
+        }
+        mutex.withLock {
+            synchronized(sessionLock) { if (processGeneration != attempt) throw StaleRequestOwner() }
+            val tokens = api.login(LoginRequest(invite.trim(), store.deviceId()))
+            synchronized(sessionLock) {
+                if (processGeneration != attempt) throw StaleRequestOwner()
+                store.bumpLoginEpoch()
+                store.write(tokens)
+                closing = false
             }
         }
     }
-    override suspend fun logout() = mutex.withLock {
-        try { store.read()?.let { api.logout("Bearer ${it.access_token}") } }
-        finally { store.write(null) }
+    private suspend fun <T> authorized(owner: RequestOwner, block: suspend (String) -> T): T = mutex.withLock {
+        val tokens = synchronized(sessionLock) {
+            requireCurrent(owner) // Must precede credential read, including after mutex waiting.
+            store.read() ?: throw SessionExpired()
+        }
+        val result = try { block("Bearer ${tokens.access_token}") }
+        catch (error: HttpException) {
+            if (error.code() != 401) throw error
+            requireCurrent(owner)
+            val fresh = try { api.refresh(RefreshRequest(tokens.refresh_token)) }
+            catch (error: CancellationException) { clearIfCurrent(owner); throw error }
+            catch (error: Exception) { clearIfCurrent(owner); throw SessionExpired() }
+            synchronized(sessionLock) {
+                requireCurrent(owner)
+                if (fresh.user_id != owner.userId) { clearIfCurrent(owner); throw SessionExpired() }
+                store.write(fresh) // Ordinary refresh retains the login epoch.
+            }
+            requireCurrent(owner)
+            try { block("Bearer ${fresh.access_token}") }
+            catch (error: HttpException) {
+                if (error.code() == 401) { clearIfCurrent(owner); throw SessionExpired() }
+                throw error
+            }
+        }
+        requireCurrent(owner)
+        result
+    }
+    override fun beginLogout(owner: RequestOwner): LogoutSession = synchronized(sessionLock) {
+        requireCurrent(owner)
+        store.closeSession()
+        closing = true
+        processGeneration = UUID.randomUUID().toString()
+        LogoutSession(processGeneration, store.identity())
+    }
+    private fun stillClosing(session: LogoutSession) = closing &&
+        processGeneration == session.generation && store.identity() == session.identity
+    override fun withClosingSession(session: LogoutSession, block: () -> Unit) = synchronized(sessionLock) {
+        if (!stillClosing(session)) throw StaleRequestOwner()
+        block()
+    }
+    override suspend fun finishLogout(session: LogoutSession): Unit = mutex.withLock {
+        val tokens = synchronized(sessionLock) {
+            if (!stillClosing(session)) throw StaleRequestOwner()
+            store.read()
+        }
+        try { tokens?.let { api.logout("Bearer ${it.access_token}") } }
+        finally { synchronized(sessionLock) {
+            if (stillClosing(session)) { store.write(null); closing = false }
+        } }
         Unit
     }
-    override suspend fun note(noteId: String): Note {
+    override suspend fun note(noteId: String, owner: RequestOwner): Note {
         require(noteId.isNotBlank()) { "记事 ID 不能为空" }
-        return authorized { api.getNote(it, noteId) }
+        return authorized(owner) { api.getNote(it, noteId) }
     }
-    override suspend fun notes(): List<Note> = authorized { bearer ->
+    override suspend fun notes(owner: RequestOwner): List<Note> = authorized(owner) { bearer ->
         val result = mutableListOf<Note>()
         var cursor = 0L
         do {
+            requireCurrent(owner)
             val page = api.notes(bearer, cursor)
             result.addAll(page.items)
             val next = page.next_cursor ?: break
@@ -116,30 +195,30 @@ class RealRepository(private val api: AgentApi, private val store: TokenStore,
         } while (true)
         result.distinctBy { it.id }.reversed()
     }
-    override suspend fun create(body: NoteCreate): Created {
+    override suspend fun create(body: NoteCreate, owner: RequestOwner): Created {
         validText(body.text, 5000)
-        return authorized { api.create(it, body) }
+        return authorized(owner) { api.create(it, body) }
     }
-    override suspend fun patch(noteId: String, rev: Int, text: String?): Note {
+    override suspend fun patch(noteId: String, rev: Int, text: String?, owner: RequestOwner): Note {
         if (text != null) validText(text, 5000)
-        return authorized { api.patchNote(it, noteId, NotePatch(rev, text)).note }
+        return authorized(owner) { api.patchNote(it, noteId, NotePatch(rev, text)).note }
     }
-    override suspend fun delete(noteId: String) {
-        try { authorized { api.deleteNote(it, noteId) } }
+    override suspend fun delete(noteId: String, owner: RequestOwner) {
+        try { authorized(owner) { api.deleteNote(it, noteId) } }
         catch (error: HttpException) { if (error.code() != 404) throw error }
     }
-    override suspend fun search(query: String, topK: Int): List<SearchHit> {
+    override suspend fun search(query: String, topK: Int, owner: RequestOwner): List<SearchHit> {
         val q = query.trim(); validText(q, 500)
         require(topK in 1..50) { "搜索条数须为 1–50" }
-        return authorized { api.search(it, q, topK).items }
+        return authorized(owner) { api.search(it, q, topK).items }
     }
-    override suspend fun ask(text: String): Answer {
+    override suspend fun ask(text: String, owner: RequestOwner): Answer {
         validText(text, 2000)
-        return authorized { api.ask(it, askBody(text)) }
+        return authorized(owner) { api.ask(it, askBody(text)) }
     }
-    override suspend fun sync(since: Long, limit: Int): SyncResponse {
+    override suspend fun sync(since: Long, limit: Int, owner: RequestOwner): SyncResponse {
         require(since >= 0 && limit in 1..500) { "同步参数无效" }
-        return authorized { bearer ->
+        return authorized(owner) { bearer ->
             val notes = linkedMapOf<String, Note>()
             val reminders = linkedMapOf<String, ReminderDto>()
             val actions = linkedMapOf<String, SyncAction>()
@@ -148,6 +227,7 @@ class RealRepository(private val api: AgentApi, private val store: TokenStore,
             val deletedActions = linkedSetOf<String>()
             var cursor = since
             while (true) {
+                requireCurrent(owner)
                 val page = api.sync(bearer, cursor, limit)
                 page.notes.forEach { notes[it.id] = it }
                 page.reminders.forEach { reminders[it.id] = it }
@@ -166,19 +246,26 @@ class RealRepository(private val api: AgentApi, private val store: TokenStore,
                 SyncDeleted(deletedNotes.toList(), deletedReminders.toList(), deletedActions.toList()), has_more = false)
         }
     }
-    override suspend fun confirmReminder(id: String, rev: Int, fireAt: String?, title: String?) =
-        authorized { api.confirmReminder(it, id, ReminderConfirmRequest(rev, fireAt, title)) }
-    override suspend fun cancelReminder(id: String, rev: Int) =
-        authorized { api.cancelReminder(it, id, ReminderCancelRequest(rev)) }
-    override suspend fun completeReminder(id: String, rev: Int) =
-        authorized { api.completeReminder(it, id, ReminderCompleteRequest(rev)) }
-    override suspend fun snoozeReminder(id: String, rev: Int, minutes: Int) =
-        authorized { api.snoozeReminder(it, id, ReminderSnoozeRequest(rev, minutes)) }
+    override suspend fun confirmReminder(id: String, rev: Int, fireAt: String?, title: String?, owner: RequestOwner) =
+        authorized(owner) { api.confirmReminder(it, id, ReminderConfirmRequest(rev, fireAt, title)) }
+    override suspend fun cancelReminder(id: String, rev: Int, owner: RequestOwner) =
+        authorized(owner) { api.cancelReminder(it, id, ReminderCancelRequest(rev)) }
+    override suspend fun completeReminder(id: String, rev: Int, owner: RequestOwner) =
+        authorized(owner) { api.completeReminder(it, id, ReminderCompleteRequest(rev)) }
+    override suspend fun snoozeReminder(id: String, rev: Int, minutes: Int, owner: RequestOwner) =
+        authorized(owner) { api.snoozeReminder(it, id, ReminderSnoozeRequest(rev, minutes)) }
 
 }
 class MockRepository(private val seedOnLogin: Boolean = true, private val organizeAfterReads: Int = 3) : Repository {
     private data class Change(val seq: Long, val kind: String, val id: String)
     private val organizeReads = mutableMapOf<String, Int>()
+    private var mockEpoch = UUID.randomUUID().toString()
+    override fun captureOwner() = RequestOwner("mock", "demo", mockEpoch, mockEpoch)
+    override fun isCurrent(owner: RequestOwner) = active && owner.runtimeKey == "mock" && owner.loginEpoch == mockEpoch
+    override fun <T> withCurrentOwner(owner: RequestOwner, block: () -> T): T {
+        if (!isCurrent(owner)) throw StaleRequestOwner()
+        return block()
+    }
     private var active = false
     private var cursor = 0L
     private val memories = linkedMapOf<String, SearchHit>()
@@ -198,6 +285,7 @@ class MockRepository(private val seedOnLogin: Boolean = true, private val organi
     override val signedIn get() = active
     override suspend fun login(invite: String) {
         require(invite.isNotBlank()) { "请输入邀请码" }
+        mockEpoch = UUID.randomUUID().toString()
         active = true
         if (seedOnLogin && reminders.isEmpty()) {
             listOf(
@@ -212,21 +300,37 @@ class MockRepository(private val seedOnLogin: Boolean = true, private val organi
             seedReminder("整理周报", Instant.now().plusSeconds(7200).toString())
         }
     }
-    override suspend fun logout() {
+    override fun beginLogout(owner: RequestOwner): LogoutSession {
+        if (!isCurrent(owner)) throw StaleRequestOwner()
+        active = false
+        mockEpoch = UUID.randomUUID().toString()
+        return LogoutSession(mockEpoch, null)
+    }
+    override fun withClosingSession(session: LogoutSession, block: () -> Unit) {
+        if (active || session.generation != mockEpoch) throw StaleRequestOwner()
+        block()
+    }
+    override suspend fun finishLogout(session: LogoutSession) {
+        withClosingSession(session) {
         active = false; cursor = 0
         memories.clear(); organizeReads.clear()
         entries.clear(); noteChanges.clear(); deletedNotes.clear(); reminders.clear(); reminderChanges.clear()
         deletedReminders.clear(); actions.clear(); actionChanges.clear(); deletedActions.clear()
+        }
     }
     private fun requireSession() { if (!active) throw SessionExpired() }
-    private fun nextSeq() = ++cursor
-    override suspend fun note(noteId: String): Note {
+    private fun requireSession(owner: RequestOwner) {
         requireSession()
+        if (!isCurrent(owner)) throw StaleRequestOwner()
+    }
+    private fun nextSeq() = ++cursor
+    override suspend fun note(noteId: String, owner: RequestOwner): Note {
+        requireSession(owner)
         require(noteId.isNotBlank()) { "记事 ID 不能为空" }
         return entries[noteId] ?: throw IllegalArgumentException("记事不存在（404）")
     }
-    override suspend fun notes(): List<Note> {
-        requireSession()
+    override suspend fun notes(owner: RequestOwner): List<Note> {
+        requireSession(owner)
         organizeReads.keys.toList().forEach { id ->
             val reads = organizeReads.getValue(id) + 1
             organizeReads[id] = reads
@@ -247,9 +351,9 @@ class MockRepository(private val seedOnLogin: Boolean = true, private val organi
         organizeReads.remove(id)
         noteChanges[id] = nextSeq()
     }
-    override suspend fun create(body: NoteCreate): Created {
-        requireSession(); validText(body.text, 5000)
-        val note = Note(body.client_note_id, body.text, "uploaded", 1, recorded_at = body.recorded_at)
+    override suspend fun create(body: NoteCreate, owner: RequestOwner): Created {
+        requireSession(owner); validText(body.text, 5000)
+        val note = Note(body.client_note_id, body.text, "uploaded", 1, recorded_at = body.recorded_at, client_note_id = body.client_note_id)
         if (entries.putIfAbsent(body.client_note_id, note) == null) {
             remember(note)
             noteChanges[note.id] = nextSeq()
@@ -258,8 +362,8 @@ class MockRepository(private val seedOnLogin: Boolean = true, private val organi
         val current = entries.getValue(body.client_note_id)
         return Created(current.id, current.status, current.rev)
     }
-    override suspend fun patch(noteId: String, rev: Int, text: String?): Note {
-        requireSession()
+    override suspend fun patch(noteId: String, rev: Int, text: String?, owner: RequestOwner): Note {
+        requireSession(owner)
         if (text != null) validText(text, 5000)
         val current = entries[noteId] ?: throw IllegalArgumentException("记事不存在（404）")
         require(rev >= 1 && current.rev == rev) { "版本冲突，请同步后重试" }
@@ -274,8 +378,8 @@ class MockRepository(private val seedOnLogin: Boolean = true, private val organi
         noteChanges[noteId] = nextSeq()
         return updated
     }
-    override suspend fun delete(noteId: String) {
-        requireSession()
+    override suspend fun delete(noteId: String, owner: RequestOwner) {
+        requireSession(owner)
         if (entries.remove(noteId) == null) return
         memories.remove(noteId)
         organizeReads.remove(noteId); noteChanges.remove(noteId)
@@ -285,14 +389,14 @@ class MockRepository(private val seedOnLogin: Boolean = true, private val organi
         related.forEach(::deleteReminder)
         deletedNotes[noteId] = nextSeq()
     }
-    override suspend fun search(query: String, topK: Int): List<SearchHit> {
-        requireSession()
+    override suspend fun search(query: String, topK: Int, owner: RequestOwner): List<SearchHit> {
+        requireSession(owner)
         val q = query.trim(); validText(q, 500)
         require(topK in 1..50) { "搜索条数须为 1–50" }
         return memories.values.filter { it.text.contains(q, ignoreCase = true) }.take(topK)
     }
-    override suspend fun ask(text: String): Answer {
-        requireSession(); validText(text, 2000)
+    override suspend fun ask(text: String, owner: RequestOwner): Answer {
+        requireSession(owner); validText(text, 2000)
         return Answer("这是本地演示回答：你的记事已保存在本次会话中。接入服务器后可根据相关记录回答。", emptyList())
     }
     fun seedReminder(title: String, fireAt: String,
@@ -320,8 +424,8 @@ class MockRepository(private val seedOnLogin: Boolean = true, private val organi
             deletedActions[id] = nextSeq()
         }
     }
-    override suspend fun sync(since: Long, limit: Int): SyncResponse {
-        requireSession(); require(since >= 0 && limit in 1..500) { "同步参数无效" }
+    override suspend fun sync(since: Long, limit: Int, owner: RequestOwner): SyncResponse {
+        requireSession(owner); require(since >= 0 && limit in 1..500) { "同步参数无效" }
         val changes = mutableListOf<Change>()
         noteChanges.forEach { (id, seq) -> if (seq > since) changes += Change(seq, "note", id) }
         deletedNotes.forEach { (id, seq) -> if (seq > since) changes += Change(seq, "deleted_note", id) }
@@ -350,8 +454,8 @@ class MockRepository(private val seedOnLogin: Boolean = true, private val organi
         return SyncResponse(page.lastOrNull()?.seq ?: since, notes, liveReminders, liveActions,
             SyncDeleted(notes = removedNotes, reminders = removedReminders, actions = removedActions), changes.size > limit)
     }
-    override suspend fun cancelReminder(id: String, rev: Int): ReminderCancelResponse {
-        requireSession()
+    override suspend fun cancelReminder(id: String, rev: Int, owner: RequestOwner): ReminderCancelResponse {
+        requireSession(owner)
         val current = reminders[id] ?: throw IllegalArgumentException("提醒不存在")
         require(current.rev == rev) { "版本冲突，请刷新后重试" }
         val existing = actions.values.firstOrNull { it.reminder_id == id && it.type == "cancel_reminder" }
@@ -374,8 +478,8 @@ class MockRepository(private val seedOnLogin: Boolean = true, private val organi
         actionChanges[action.id] = nextSeq()
         return ReminderCancelResponse(updated, action, workItemId)
     }
-    override suspend fun completeReminder(id: String, rev: Int): ReminderCompleteResponse {
-        requireSession()
+    override suspend fun completeReminder(id: String, rev: Int, owner: RequestOwner): ReminderCompleteResponse {
+        requireSession(owner)
         val current = reminders[id] ?: throw IllegalArgumentException("提醒不存在")
         require(current.rev == rev) { "版本冲突，请刷新后重试" }
         val existing = actions.values.firstOrNull { it.reminder_id == id && it.type == "complete_reminder" }
@@ -398,8 +502,8 @@ class MockRepository(private val seedOnLogin: Boolean = true, private val organi
         actionChanges[action.id] = nextSeq()
         return ReminderCompleteResponse(updated, action, workItemId)
     }
-    override suspend fun snoozeReminder(id: String, rev: Int, minutes: Int): ReminderSnoozeResponse {
-        requireSession()
+    override suspend fun snoozeReminder(id: String, rev: Int, minutes: Int, owner: RequestOwner): ReminderSnoozeResponse {
+        requireSession(owner)
         require(minutes in 1..1440) { "贪睡分钟须为 1–1440" }
         val current = reminders[id] ?: throw IllegalArgumentException("提醒不存在")
         require(current.rev == rev) { "版本冲突，请刷新后重试" }
@@ -421,8 +525,8 @@ class MockRepository(private val seedOnLogin: Boolean = true, private val organi
         deletedActions.remove(action.id)
         return ReminderSnoozeResponse(updated, action, workItemId)
     }
-    override suspend fun confirmReminder(id: String, rev: Int, fireAt: String?, title: String?): ReminderConfirmResponse {
-        requireSession()
+    override suspend fun confirmReminder(id: String, rev: Int, fireAt: String?, title: String?, owner: RequestOwner): ReminderConfirmResponse {
+        requireSession(owner)
         val current = reminders[id] ?: throw IllegalArgumentException("提醒不存在")
         require(current.rev == rev) { "版本冲突，请刷新后重试" }
         require(current.status == "suggested" || current.status == "scheduled") { "提醒当前不可确认" }

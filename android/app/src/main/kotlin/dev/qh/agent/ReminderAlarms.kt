@@ -45,8 +45,13 @@ class ReminderAlarmScheduler(context: Context) {
     private val alarms = appContext.getSystemService(AlarmManager::class.java)
     private val prefs = appContext.getSharedPreferences(ALARM_PREFS, Context.MODE_PRIVATE)
 
-    fun consume(response: SyncResponse) {
-        response.actions.filter { it.type == "schedule_reminder" }.forEach(::schedule)
+    fun consume(response: SyncResponse): Map<String, LocalScheduleResult> {
+        val results = linkedMapOf<String, LocalScheduleResult>()
+        response.reminders.filter { it.status == "scheduled" }.forEach { reminder ->
+            val action = response.actions.find { it.type == "schedule_reminder" &&
+                (it.reminder_id ?: it.payload["reminder_id"]) == reminder.id }
+            results[reminder.id] = action?.let(::schedule) ?: schedule(reminder)
+        }
         response.actions.filter { it.type in listOf("cancel_reminder", "complete_reminder") }.forEach { action ->
             (action.reminder_id ?: action.payload["reminder_id"] as? String)?.let(::cancelReminder)
         }
@@ -55,60 +60,59 @@ class ReminderAlarmScheduler(context: Context) {
         response.deleted.reminders.forEach(::cancelReminder)
         response.reminders.filter { it.status == "done" || it.status == "cancelled" }
             .forEach { cancelReminder(it.id) }
+        return results
     }
-    fun confirmed(response: ReminderConfirmResponse) {
-        response.action?.let(::schedule) ?: schedule(response.reminder)
-    }
-    fun snoozed(response: ReminderSnoozeResponse) {
+    fun confirmed(response: ReminderConfirmResponse): LocalScheduleResult =
+        schedule(response.reminder)
+    fun retryLocal(reminder: ReminderDto): LocalScheduleResult = schedule(reminder)
+    fun snoozed(response: ReminderSnoozeResponse): LocalScheduleResult {
         // Intake replay can return a reminder completed/cancelled since the original snooze.
-        if (response.reminder.status != "scheduled") return
-        response.action?.let(::schedule) ?: schedule(response.reminder)
+        if (response.reminder.status != "scheduled") return LocalScheduleResult.NOT_APPLICABLE
+        return schedule(response.reminder)
     }
-    fun restore() = pending().forEach(::setAlarm)
+    fun restore() = pending().forEach { setAlarm(it, allowLate = true) }
     fun fired(reminderId: String) { cancelReminder(reminderId) }
     fun clear() {
         pending().forEach(::cancel)
         prefs.edit().clear().apply()
     }
-    private fun schedule(action: SyncAction) {
-        val reminderId = action.reminder_id ?: action.payload["reminder_id"] as? String ?: return
-        if (reminderId.isBlank()) return
-        val fireAt = action.payload["fire_at"] as? String ?: return
+    private fun schedule(action: SyncAction): LocalScheduleResult {
+        val reminderId = action.reminder_id ?: action.payload["reminder_id"] as? String ?: return LocalScheduleResult.FAILED
+        if (reminderId.isBlank()) return LocalScheduleResult.FAILED
+        val fireAt = action.payload["fire_at"] as? String ?: return LocalScheduleResult.FAILED
         val title = (action.payload["title"] as? String).orEmpty().ifBlank { "随记提醒" }
         val triggerAt = try { Instant.parse(fireAt).toEpochMilli() }
-        catch (_: DateTimeParseException) { return }
-        setAlarm(PendingReminder(action.id, reminderId, title, triggerAt,
+        catch (_: Exception) { return LocalScheduleResult.FAILED }
+        return setAlarm(PendingReminder(action.id, reminderId, title, triggerAt,
             action.payload["note_id"] as? String))
     }
-    private fun schedule(reminder: ReminderDto) {
-        if (reminder.status != "scheduled") return
-        val fireAt = reminder.fire_at ?: return
+    private fun schedule(reminder: ReminderDto): LocalScheduleResult {
+        if (reminder.status != "scheduled") return LocalScheduleResult.NOT_APPLICABLE
+        val fireAt = reminder.fire_at ?: return LocalScheduleResult.FAILED
         val triggerAt = try { Instant.parse(fireAt).toEpochMilli() }
-        catch (_: DateTimeParseException) { return }
-        setAlarm(PendingReminder("", reminder.id, reminder.title.ifBlank { "随记提醒" }, triggerAt, reminder.note_id))
+        catch (_: Exception) { return LocalScheduleResult.FAILED }
+        return setAlarm(PendingReminder("", reminder.id, reminder.title.ifBlank { "随记提醒" }, triggerAt, reminder.note_id))
     }
-    private fun setAlarm(reminder: PendingReminder) {
+    private fun setAlarm(reminder: PendingReminder, allowLate: Boolean = false): LocalScheduleResult {
         val now = System.currentTimeMillis()
         // Historical sync actions must not create alarms, but a locally persisted pending
         // alarm may still be waiting for inexact/Doze delivery even after triggerAt.
-        if (reminder.triggerAt <= now && !prefs.contains(key(reminder.reminderId))) return
+        if (reminder.triggerAt <= now && !allowLate) return LocalScheduleResult.EXPIRED
         val triggerAt = maxOf(reminder.triggerAt, now)
         val payload = JSONObject()
             .put("action_id", reminder.actionId).put("reminder_id", reminder.reminderId)
             .put("title", reminder.title).put("trigger_at", reminder.triggerAt)
         reminder.noteId?.let { payload.put("note_id", it) }
-        prefs.edit().putString(key(reminder.reminderId), payload.toString()).apply()
-        val intent = alarmIntent(reminder)
-        try {
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S || alarms.canScheduleExactAlarms()) {
-                alarms.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, intent)
-            } else {
-                alarms.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, intent)
-            }
-        } catch (_: SecurityException) {
-            // Exact-alarm access can be revoked between the check and scheduling.
-            alarms.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, intent)
-        }
+        // Pending intent is recovery intent, not a receipt of AlarmManager acceptance.
+        return try {
+            if (!prefs.edit().putString(key(reminder.reminderId), payload.toString()).commit())
+                return LocalScheduleResult.FAILED
+            val intent = alarmIntent(reminder)
+            submitLocalAlarm(false,
+                exactAllowed = { Build.VERSION.SDK_INT < Build.VERSION_CODES.S || alarms.canScheduleExactAlarms() },
+                exact = { alarms.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, intent) },
+                inexact = { alarms.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, intent) })
+        } catch (_: Exception) { LocalScheduleResult.FAILED }
     }
     private fun cancelAction(actionId: String) = pending().filter { it.actionId == actionId }.forEach(::cancel)
     fun cancelForNote(noteId: String) = pending().filter { it.noteId == noteId }.forEach(::cancel)
@@ -141,7 +145,7 @@ class ReminderAlarmScheduler(context: Context) {
 class ReminderAlarmReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         // Drop delivery if the user already signed out (session fence).
-        if (SecureTokens(context.applicationContext).read() == null) return
+        if (SecureTokens(context.applicationContext).identity()?.closed != false) return
         val reminderId = intent.getStringExtra(EXTRA_REMINDER_ID) ?: return
         val title = intent.getStringExtra(EXTRA_TITLE).orEmpty().ifBlank { "随记提醒" }
         ReminderAlarmScheduler(context).fired(reminderId)
@@ -234,7 +238,7 @@ internal fun executeReminderNotificationAction(
     onFinished: () -> Unit = {}
 ) {
     val appContext = context.applicationContext
-    if (SecureTokens(appContext).read() == null) { onFinished(); return }
+    if (SecureTokens(appContext).identity()?.closed != false) { onFinished(); return }
     val generation = AppRepositories.sessionGeneration()
     val alarmGeneration = AppRepositories.alarmGeneration(id)
     val repository = AppRepositories.real(appContext)
@@ -252,7 +256,7 @@ internal fun executeReminderNotificationAction(
                             signedIn = { repository.signedIn },
                             cancelAlarm = { scheduler.cancelReminder(id) },
                             reinstallAlarm = snoozed?.let { response ->
-                                { scheduler.snoozed(response) }
+                                { scheduler.snoozed(response); Unit }
                             },
                             dismissNotification = {
                                 appContext.getSystemService(NotificationManager::class.java)

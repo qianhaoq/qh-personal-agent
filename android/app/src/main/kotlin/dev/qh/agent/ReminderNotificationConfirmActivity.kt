@@ -54,7 +54,7 @@ class ReminderNotificationConfirmActivity : ComponentActivity() {
                     onDismiss = { if (state.canDismiss) finish() },
                     onConfirm = {
                         val current = confirmationSessionCurrent(confirmationSession,
-                            tokens.sessionEpoch(), tokens.read() != null)
+                            tokens.sessionEpoch(), tokens.identity()?.closed == false)
                         val app = applicationContext
                         val accepted = state.submit(current) { done ->
                             busy.value = true
