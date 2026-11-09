@@ -393,8 +393,8 @@ private struct NoteCard: View {
                 }
                 .foregroundStyle(Palette.accent)
             }
-            ForEach(note.todos.prefix(2), id: \.self) { todo in
-                Label(todo, systemImage: "circle")
+            ForEach(Array(note.todos.prefix(2).enumerated()), id: \.offset) { entry in
+                Label(entry.element.text, systemImage: "circle")
                     .font(.footnote)
                     .foregroundStyle(Palette.secondary)
             }

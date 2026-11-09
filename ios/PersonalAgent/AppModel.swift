@@ -295,7 +295,7 @@ extension AppModel {
         model.notes = [Note(
             id: "sample-note", title: "周末去植物园", text: "周六上午去植物园，记得带上相机和水瓶。",
             status: "organized", recorded_at: "2026-11-09T09:30:00+08:00",
-            tags: ["周末"], todos: ["带上相机和水瓶"]
+            tags: ["周末"], todos: [NoteTodo(text: "带上相机和水瓶")]
         )]
         model.askItems = [AskItem(
             question: "周末出门要准备什么？",

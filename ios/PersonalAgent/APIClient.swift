@@ -5,6 +5,10 @@ struct Tokens: Codable {
     let refresh_token: String
 }
 
+struct NoteTodo: Decodable {
+    let text: String
+}
+
 struct Note: Decodable, Identifiable {
     let id: String
     let title: String?
@@ -12,7 +16,7 @@ struct Note: Decodable, Identifiable {
     let status: String
     let recorded_at: String
     let tags: [String]
-    let todos: [String]
+    let todos: [NoteTodo]
 
     var displayTitle: String? {
         guard let value = title?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
