@@ -5,6 +5,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import dev.qh.data.ReminderDto
@@ -27,21 +29,27 @@ internal fun ReminderConfirmationDialog(
     val date = rememberDatePickerState(initialSelectedDateMillis = initial.toLocalDate()
         .atStartOfDay(java.time.ZoneOffset.UTC).toInstant().toEpochMilli())
     val time = rememberTimePickerState(initial.hour, initial.minute, is24Hour = true)
-    if (choosing) DatePickerDialog(onDismissRequest = { choosing = false },
-        confirmButton = { TextButton({
-            date.selectedDateMillis?.let { millis ->
-                val day = java.time.Instant.ofEpochMilli(millis).atZone(java.time.ZoneOffset.UTC).toLocalDate()
-                onFireAtChange(day.atTime(time.hour, time.minute).atZone(zone).toInstant().toString())
+    if (choosing) Dialog(onDismissRequest = { choosing = false }) {
+        Surface(shape = MaterialTheme.shapes.extraLarge, color = MaterialTheme.colorScheme.surface) {
+            // The window bounds the whole column. Reserve the footer before measuring
+            // the scroll viewport, so its bottom is also the body's visible bottom.
+            Column(Modifier.heightIn(max = 600.dp)) {
+                Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState())) {
+                    DatePicker(date)
+                    TimeInput(time)
+                    Text("时区：${zone.id}", modifier = Modifier.padding(16.dp))
+                }
+                Column(Modifier.fillMaxWidth().padding(8.dp), horizontalAlignment = Alignment.End) {
+                    TextButton({
+                        date.selectedDateMillis?.let { millis ->
+                            val day = java.time.Instant.ofEpochMilli(millis).atZone(java.time.ZoneOffset.UTC).toLocalDate()
+                            onFireAtChange(day.atTime(time.hour, time.minute).atZone(zone).toInstant().toString())
+                        }
+                        choosing = false
+                    }, modifier = Modifier.touchTarget()) { Text("使用所选本地时间") }
+                    TextButton({ choosing = false }, modifier = Modifier.touchTarget()) { Text("取消") }
+                }
             }
-            choosing = false
-        }, modifier = Modifier.touchTarget()) { Text("使用所选本地时间") } },
-        dismissButton = { TextButton({ choosing = false }, modifier = Modifier.touchTarget()) { Text("取消") } }) {
-        // Material caps the dialog height. Measure its unweighted action row first;
-        // only the date/time body may shrink and scroll at large fonts or short windows.
-        Column(Modifier.weight(1f, fill = false).heightIn(max = 600.dp).verticalScroll(rememberScrollState())) {
-            DatePicker(date)
-            TimeInput(time)
-            Text("时区：${zone.id}")
         }
     }
     // Keep a single modal window: the confirmation dialog otherwise covers the picker
