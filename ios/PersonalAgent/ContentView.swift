@@ -1,26 +1,17 @@
 import SwiftUI
 
+// 云端账户（可选）：沿用既有登录 / 笔记 / 提问实现，配色改为随深浅色自适应的系统语义色。
 private enum Palette {
-    static let canvas = Color(paperHex: 0xF7F3EA)
-    static let surface = Color(paperHex: 0xFFFDF8)
-    static let soft = Color(paperHex: 0xE7EEE6)
-    static let ink = Color(paperHex: 0x20332D)
-    static let secondary = Color(paperHex: 0x596B62)
-    static let accent = Color(paperHex: 0x0E6858)
-    static let accentSoft = Color(paperHex: 0xD5E8DE)
-    static let attention = Color(paperHex: 0x984B35)
-    static let danger = Color(paperHex: 0x9D4141)
-    static let line = Color(paperHex: 0xD9D8CC)
-}
-
-private extension Color {
-    init(paperHex: UInt32) {
-        self.init(.sRGB,
-                  red: Double((paperHex >> 16) & 0xFF) / 255,
-                  green: Double((paperHex >> 8) & 0xFF) / 255,
-                  blue: Double(paperHex & 0xFF) / 255,
-                  opacity: 1)
-    }
+    static let canvas = Color(.systemGroupedBackground)
+    static let surface = Color(.secondarySystemGroupedBackground)
+    static let soft = Color(.tertiarySystemFill)
+    static let ink = Color.primary
+    static let secondary = Color.secondary
+    static let accent = Color.blue
+    static let accentSoft = Color.blue.opacity(0.15)
+    static let attention = Color.orange
+    static let danger = Color.red
+    static let line = Color(.separator)
 }
 
 private struct PaperCard<Content: View>: View {
@@ -93,8 +84,11 @@ private enum FlowEntry: Identifiable {
     }
 }
 
-struct ContentView: View {
-    @StateObject private var model = AppModel()
+/// 由 RootView 持有 AppModel 并传入：关闭 Sheet 不丢失进行中的保存、未完成记事与问答重试。
+/// 本视图与 AppModel 均不引用本机存储，连接云端不会上传本机内容。
+struct CloudAccountView: View {
+    @ObservedObject var model: AppModel
+    @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         Group {
@@ -104,11 +98,31 @@ struct ContentView: View {
                 LoginView(model: model)
             }
         }
+        .safeAreaInset(edge: .top, spacing: 0) {
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("云端账户 · 可选").font(.headline)
+                    Text("需要邀请码，内容保存在账户服务器。本机对话、任务和记忆不会上传。")
+                        .font(.caption)
+                        .foregroundStyle(Palette.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer()
+                Button("完成") { dismiss() }
+                    .font(.body.weight(.semibold))
+                    .frame(minHeight: 44)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 8)
+            .background(.bar)
+        }
         .background(Palette.canvas.ignoresSafeArea())
         .tint(Palette.accent)
         .task(id: model.isAuthenticated) {
-            if model.isAuthenticated { await model.loadNotes() }
+            // 用非结构化任务读取：关闭 Sheet 取消 .task 时不应把读取伪装成网络失败。
+            if model.isAuthenticated { await Task { await model.loadNotes() }.value }
         }
+        .accessibilityIdentifier("cloud-account")
     }
 }
 
@@ -124,28 +138,16 @@ private struct LoginView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 28) {
-                HStack(spacing: 10) {
-                    Image(systemName: "square.and.pencil")
-                        .font(.title3.weight(.semibold))
-                        .foregroundStyle(.white)
-                        .frame(width: 40, height: 40)
-                        .background(Palette.accent)
-                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                    Text("随记")
-                        .font(.title2.weight(.semibold))
-                        .foregroundStyle(Palette.ink)
-                }
-
                 VStack(alignment: .leading, spacing: 12) {
-                    Text("把一闪而过的事，\n留在纸上。")
+                    Text("连接云端账户")
                         .font(.largeTitle.weight(.semibold))
                         .foregroundStyle(Palette.ink)
-                        .lineSpacing(6)
-                    Text("记下此刻，也可以在需要时问回来。")
+                    Text("可选。用邀请码登录已有服务，使用云端笔记与提问。不登录也能在本机对话里记事、存任务和记忆。")
                         .font(.body)
                         .foregroundStyle(Palette.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                .padding(.top, 28)
+                .padding(.top, 12)
 
                 PaperCard {
                     Text("使用邀请码登录")
@@ -171,7 +173,7 @@ private struct LoginView: View {
                     Button(action: submit) {
                         HStack {
                             if model.activity == .loggingIn { ProgressView().tint(.white) }
-                            Text(model.activity == .loggingIn ? "正在登录…" : "进入随记")
+                            Text(model.activity == .loggingIn ? "正在登录…" : "登录云端账户")
                             Image(systemName: "arrow.right")
                         }
                     }
@@ -179,7 +181,7 @@ private struct LoginView: View {
                     .disabled(!canSubmit)
                 }
 
-                Label("当前支持文字记事与提问；语音、提醒和闹钟尚未接入。",
+                Label("云端支持文字记事与提问；云端语音、提醒和闹钟尚未接入。本机内容不会因登录而上传。",
                       systemImage: "info.circle")
                     .font(.footnote)
                     .foregroundStyle(Palette.secondary)
@@ -224,9 +226,9 @@ private struct PersonalFlowView: View {
         VStack(spacing: 0) {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("随记")
+                    Text("云端笔记")
                         .font(.title2.weight(.semibold))
-                    Text("我的个人流")
+                    Text("已登录账户")
                         .font(.caption)
                         .foregroundStyle(Palette.secondary)
                 }
@@ -577,15 +579,6 @@ private struct ComposerView: View {
             }
 
             HStack(spacing: 12) {
-                Button {} label: {
-                    Label("语音", systemImage: "mic")
-                        .frame(minWidth: 72, minHeight: 44)
-                }
-                .disabled(true)
-                .foregroundStyle(Palette.secondary)
-                .accessibilityIdentifier("voice-disabled")
-                .accessibilityHint("语音输入尚未接入，请使用文字")
-
                 Button { Task { await model.submit() } } label: {
                     HStack {
                         Spacer()
@@ -603,7 +596,7 @@ private struct ComposerView: View {
             }
 
             Text(model.activity.map { "\($0.label) 可继续写，结束后请手动发送。" }
-                 ?? "语音输入尚未接入，请使用文字。")
+                 ?? "发送到云端账户；本机对话的内容不会被一并上传。")
                 .font(.caption)
                 .foregroundStyle(Palette.secondary)
                 .frame(maxWidth: .infinity, alignment: .center)
@@ -629,12 +622,12 @@ private struct SettingsView: View {
                         Text("当前能力").font(.headline)
                         CapabilityRow(icon: "square.and.pencil", title: "文字记事", available: true)
                         CapabilityRow(icon: "bubble.left.and.text", title: "文字提问", available: true)
-                        CapabilityRow(icon: "mic", title: "语音输入", available: false)
+                        CapabilityRow(icon: "mic", title: "云端语音输入", available: false)
                         CapabilityRow(icon: "bell", title: "提醒与闹钟", available: false)
                     }
                     PaperCard {
                         Text("数据与恢复").font(.headline)
-                        Text("笔记保存在服务端。问答和未完成的创建恢复项只保留在当前进程；未发送草稿不持久保存。")
+                        Text("云端笔记保存在服务端。云端问答和未完成的创建恢复项只保留在当前进程；云端未发送草稿不持久保存。本机对话的数据与此分开。")
                             .font(.footnote).foregroundStyle(Palette.secondary).lineSpacing(4)
                         Text("当前不自动刷新登录凭证，过期后需要重新登录。")
                             .font(.footnote).foregroundStyle(Palette.secondary).lineSpacing(4)
@@ -658,7 +651,7 @@ private struct SettingsView: View {
                     Task { await model.logout(); dismiss() }
                 }
             } message: {
-                Text("本机将清除登录凭证、草稿与当前问答；服务器笔记不会删除。")
+                Text("将清除云端登录凭证、云端草稿与当前问答；服务器笔记不会删除。本机对话、任务和记忆不受影响。")
             }
         }
         .presentationDetents([.medium, .large])
