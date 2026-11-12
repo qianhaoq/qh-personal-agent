@@ -12,6 +12,7 @@ S38 不做：rrule、根路径 `GET /`、FCM/Room/Hilt/Pipecat、server/data/Moc
 
 | 目录 | 内容 |
 | --- | --- |
+| [`ios/`](ios/README.md) | SwiftUI 本机验证壳（登录、笔记列表、文本提问），非完整 Android 移植 |
 | `android/` | Android 客户端（Kotlin）：录音、语音识别、离线队列、提醒 |
 | `server/` | 服务端（FastAPI）：鉴权、笔记整理（LLM）、记忆检索、问答 |
 | `docs/` | 设计文档：调研、产品原型、技术架构、合并门禁 |

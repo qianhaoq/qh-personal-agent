@@ -1,0 +1,35 @@
+// !$*UTF8*$!
+{ archiveVersion = 1; classes = {}; objectVersion = 56; objects = {
+00000000000000000000000A = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PersonalAgentApp.swift; sourceTree = "<group>"; };
+000000000000000000000014 = { isa = PBXBuildFile; fileRef = 00000000000000000000000A; };
+00000000000000000000000B = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIClient.swift; sourceTree = "<group>"; };
+000000000000000000000015 = { isa = PBXBuildFile; fileRef = 00000000000000000000000B; };
+00000000000000000000000C = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
+000000000000000000000016 = { isa = PBXBuildFile; fileRef = 00000000000000000000000C; };
+00000000000000000000000D = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+000000000000000000000017 = { isa = PBXBuildFile; fileRef = 00000000000000000000000D; };
+00000000000000000000000E = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalStore.swift; sourceTree = "<group>"; };
+000000000000000000000018 = { isa = PBXBuildFile; fileRef = 00000000000000000000000E; };
+00000000000000000000000F = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalModel.swift; sourceTree = "<group>"; };
+000000000000000000000019 = { isa = PBXBuildFile; fileRef = 00000000000000000000000F; };
+000000000000000000000010 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HomeView.swift; sourceTree = "<group>"; };
+00000000000000000000001A = { isa = PBXBuildFile; fileRef = 000000000000000000000010; };
+000000000000000000000011 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibraryView.swift; sourceTree = "<group>"; };
+00000000000000000000001B = { isa = PBXBuildFile; fileRef = 000000000000000000000011; };
+00000000000000000000001E = { isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+00000000000000000000001F = { isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PersonalAgent.app; sourceTree = BUILT_PRODUCTS_DIR; };
+000000000000000000000001 = { isa = PBXProject; attributes = { BuildIndependentTargetsInParallel = YES; LastUpgradeCheck = 1500; TargetAttributes = { 000000000000000000000002 = { CreatedOnToolsVersion = 15.0; DevelopmentTeam = 3KWH9L7X2T; ProvisioningStyle = Automatic; }; }; }; buildConfigurationList = 000000000000000000000028; compatibilityVersion = "Xcode 14.0"; developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en, Base); mainGroup = 000000000000000000000003; productRefGroup = 000000000000000000000005; projectDirPath = ""; projectRoot = ""; targets = (000000000000000000000002); };
+000000000000000000000002 = { isa = PBXNativeTarget; buildConfigurationList = 000000000000000000000029; buildPhases = (000000000000000000000006, 000000000000000000000007, 000000000000000000000008); buildRules = (); dependencies = (); name = PersonalAgent; productName = PersonalAgent; productReference = 00000000000000000000001F; productType = "com.apple.product-type.application"; };
+000000000000000000000003 = { isa = PBXGroup; children = (000000000000000000000004, 000000000000000000000005); sourceTree = "<group>"; };
+000000000000000000000004 = { isa = PBXGroup; children = (00000000000000000000000A, 00000000000000000000000B, 00000000000000000000000C, 00000000000000000000000D, 00000000000000000000000E, 00000000000000000000000F, 000000000000000000000010, 000000000000000000000011, 00000000000000000000001E); path = PersonalAgent; sourceTree = "<group>"; };
+000000000000000000000005 = { isa = PBXGroup; children = (00000000000000000000001F); name = Products; sourceTree = "<group>"; };
+000000000000000000000006 = { isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (000000000000000000000014, 000000000000000000000015, 000000000000000000000016, 000000000000000000000017, 000000000000000000000018, 000000000000000000000019, 00000000000000000000001A, 00000000000000000000001B); runOnlyForDeploymentPostprocessing = 0; };
+000000000000000000000007 = { isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+000000000000000000000008 = { isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+000000000000000000000028 = { isa = XCConfigurationList; buildConfigurations = (00000000000000000000002A, 00000000000000000000002B); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+000000000000000000000029 = { isa = XCConfigurationList; buildConfigurations = (00000000000000000000002C, 00000000000000000000002D); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+00000000000000000000002A = { isa = XCBuildConfiguration; buildSettings = { CLANG_ENABLE_MODULES = YES; SDKROOT = iphoneos; IPHONEOS_DEPLOYMENT_TARGET = 17.0; SWIFT_VERSION = 5.0; DEBUG_INFORMATION_FORMAT = dwarf; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG; }; name = Debug; };
+00000000000000000000002B = { isa = XCBuildConfiguration; buildSettings = { CLANG_ENABLE_MODULES = YES; SDKROOT = iphoneos; IPHONEOS_DEPLOYMENT_TARGET = 17.0; SWIFT_VERSION = 5.0; DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym"; SWIFT_COMPILATION_MODE = wholemodule; SWIFT_OPTIMIZATION_LEVEL = "-O"; }; name = Release; };
+00000000000000000000002C = { isa = XCBuildConfiguration; buildSettings = { CODE_SIGN_IDENTITY = "Apple Development"; CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = 3KWH9L7X2T; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = PersonalAgent/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; PRODUCT_BUNDLE_IDENTIFIER = ai.qianhao.personalagent; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; }; name = Debug; };
+00000000000000000000002D = { isa = XCBuildConfiguration; buildSettings = { CODE_SIGN_IDENTITY = "Apple Development"; CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = 3KWH9L7X2T; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = PersonalAgent/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; PRODUCT_BUNDLE_IDENTIFIER = ai.qianhao.personalagent; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; }; name = Release; };
+}; rootObject = 000000000000000000000001; }
